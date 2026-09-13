@@ -19,7 +19,7 @@ const defaultServerRepo = process.platform === 'win32'
 
 async function runNode(script, args, env) {
   const child = spawn(process.execPath, [path.join(toolsDir, script), ...args], {
-    cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
   });
   let stdout = '';
   let stderr = '';

@@ -70,7 +70,7 @@ if (instruction) {
     } else {
       const started = Date.now();
       let outputChars = 0;
-      const child = spawn('claude', ['-p', prompt, '--model', model], {
+      const child = spawn('claude', ['-p', prompt, '--model', model], { windowsHide: true,
         cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', ANTHROPIC_AUTH_TOKEN: key },
