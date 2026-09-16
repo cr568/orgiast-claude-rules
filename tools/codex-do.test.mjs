@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, shouldFlagEmptyFallbackDiff, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, shouldFlagEmptyFallbackDiff, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
 
 function run(args, options = {}) {
   return spawnSync(process.execPath, [tool, ...args], {
@@ -26,6 +26,24 @@ function writePrompt(body) {
   fs.writeFileSync(file, body, 'utf8');
   return file;
 }
+
+test('即時の出力ゼロ失敗を1回だけ再試行し、成功と試行回数を台帳に記録する', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-fastfail-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const result = run(['--force-native', '--cwd', home, '--model', 'sol', '説明して'], {
+    home,
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([
+      { status: 1, output: '', stderr: 'failed to lookup address information' },
+      { status: 0, output: 'done', stderr: '' },
+    ]) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /1 回だけ再試行します/);
+  const rows = fs.readFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].attempts, 2);
+  assert.equal(rows[0].status, 0);
+});
 
 test('--prompt-file の中身をそのまま指示として使う', () => {
   const file = writePrompt('# 見出し\n新規ファイルを作る\n');
@@ -679,17 +697,29 @@ test('wslCodexLaunchPlan: codex が在るのに --version だけ失敗したら�
   // 旧実装は --version 失敗を「codex が無い」と誤認し npm i -g(非root の WSL では EACCES で必ず失敗)へ
   // 進み、22秒を消費した末にネイティブ(非git では trust エラーで空出力・即終了)へ落ちて out=0 行を残した。
   assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: true, versionOk: false, installAttempted: false, retried: false }), 'retry');
-  // 再試行も失敗したら、再インストールではなくネイティブ(警告付き・--skip-git-repo-check)へ。
-  assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: true, versionOk: false, installAttempted: false, retried: true }), 'native');
+  // 再試行も失敗したら、再インストールや暗黙のネイティブ移行はせず中断する。
+  assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: true, versionOk: false, installAttempted: false, retried: true }), 'abort');
 });
 
-test('wslCodexLaunchPlan: 本当に codex が無いときだけ1回インストールし、それも失敗ならネイティブへ', () => {
+test('wslCodexLaunchPlan: 本当に codex が無いときだけ1回インストールし、それも失敗なら中断する', () => {
   assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: false, versionOk: false, installAttempted: false, retried: false }), 'install');
-  assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: false, versionOk: false, installAttempted: true, retried: false }), 'native');
+  assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: false, versionOk: false, installAttempted: true, retried: false }), 'abort');
 });
 
-test('wslCodexLaunchPlan: ディストリが見つからなければ最初からネイティブへ', () => {
-  assert.equal(wslCodexLaunchPlan({ distroFound: false, codexPresent: false, versionOk: false, installAttempted: false, retried: false }), 'native');
+test('wslCodexLaunchPlan: ディストリが見つからなければ中断する', () => {
+  assert.equal(wslCodexLaunchPlan({ distroFound: false, codexPresent: false, versionOk: false, installAttempted: false, retried: false }), 'abort');
+  // distro が無いのに codex だけ在る、という矛盾した入力でも 'retry'(=再試行)へ進めない。
+  assert.equal(wslCodexLaunchPlan({ distroFound: false, codexPresent: true, versionOk: false, installAttempted: false, retried: false }), 'abort');
+});
+
+test('wslCodexLaunchPlan: allowNative を明示したときだけネイティブへ移行する', () => {
+  assert.equal(wslCodexLaunchPlan({ distroFound: false, codexPresent: false, versionOk: false, installAttempted: false, retried: false, allowNative: true }), 'native');
+  assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: true, versionOk: false, installAttempted: false, retried: true, allowNative: true }), 'native');
+  assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: false, versionOk: false, installAttempted: true, retried: false, allowNative: true }), 'native');
+});
+
+test('WSL codex のプローブはコールドスタートを待てる', () => {
+  assert.ok(WSL_PROBE_TIMEOUT_MS >= 60000);
 });
 
 const { decideCodexLane, buildCodexExecArgs, normalizeCodexModel } = await import('./codex-do.mjs');
@@ -765,7 +795,7 @@ function runRouting(t, args, mocks, cooldown = null) {
 const quotaResult = { status: 1, stderr: "ERROR: You've hit your usage limit. Try again in 2 hours" };
 
 test('Astra quota retreats to Sol, writes isolated cooldown/history and both ledger rows', (t) => {
-  const result = runRouting(t, ['--model', 'astra', '--no-fallback', '説明して'], [quotaResult, { output: 'done' }]);
+  const result = runRouting(t, ['--model', 'astra', '--no-fallback', '説明して'], [quotaResult, quotaResult, { output: 'done' }]);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /astra usage limit → sol へ退避/);
   assert.deepEqual(result.ledger.map((r) => r.model), [`codex-cli/${ASTRA}`, `codex-cli/${SOL}`]);
@@ -778,7 +808,7 @@ test('Astra quota retreats to Sol, writes isolated cooldown/history and both led
 });
 
 test('Astra and Sol quota proceed to cheap-code once', (t) => {
-  const result = runRouting(t, ['--lane', 'astra', '説明して'], [quotaResult, quotaResult, { output: 'done' }]);
+  const result = runRouting(t, ['--lane', 'astra', '説明して'], [quotaResult, quotaResult, quotaResult, quotaResult, { output: 'done' }]);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
   assert.ok(result.cooldown.codex.until > Date.now());
@@ -792,7 +822,8 @@ for (const [name, first, prompt] of [
   ['empty diff', { output: 'done' }, '実装して'],
 ]) {
   test(`auto Sol escalates once on ${name}`, (t) => {
-    const result = runRouting(t, ['--no-fallback', prompt], [first, { output: 'done' }]);
+    const attempts = name === 'nonzero' ? [first, first, { output: 'done' }] : [first, { output: 'done' }];
+    const result = runRouting(t, ['--no-fallback', prompt], attempts);
     assert.equal(result.status, name === 'empty diff' ? 1 : 0, result.stderr);
     assert.match(result.stdout, /sol 失敗 → astra へ昇格/);
     assert.deepEqual(result.ledger.map((r) => [r.model, r.escalated]), [[`codex-cli/${SOL}`, false], [`codex-cli/${ASTRA}`, true]]);
@@ -801,21 +832,21 @@ for (const [name, first, prompt] of [
 }
 
 test('failed escalation goes to existing fallback without quota cooldown', (t) => {
-  const result = runRouting(t, ['説明して'], [{ status: 9 }, { status: 9 }, { output: 'done' }]);
+  const result = runRouting(t, ['説明して'], [{ status: 9 }, { status: 9 }, { status: 9 }, { status: 9 }, { output: 'done' }]);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
   assert.deepEqual(result.cooldown, {});
 });
 
 test('quota after escalation retreats without escalating again', (t) => {
-  const result = runRouting(t, ['説明して'], [{ status: 9 }, quotaResult, { output: 'done' }]);
+  const result = runRouting(t, ['説明して'], [{ status: 9 }, { status: 9 }, quotaResult, quotaResult, { output: 'done' }]);
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.ledger.map((r) => r.model), [`codex-cli/${SOL}`, `codex-cli/${ASTRA}`, `codex-cli/${SOL}`]);
 });
 
 for (const flags of [['--no-escalate'], ['--model', 'sol'], ['--lane', 'sol']]) {
   test(`escalation disabled by ${flags.join(' ')}`, (t) => {
-    const result = runRouting(t, [...flags, '説明して'], [{ status: 9 }]);
+    const result = runRouting(t, [...flags, '説明して'], [{ status: 9 }, { status: 9 }]);
     assert.equal(result.status, 9, result.stderr);
     assert.equal(result.ledger.length, 1);
   });
@@ -823,11 +854,11 @@ for (const flags of [['--no-escalate'], ['--model', 'sol'], ['--lane', 'sol']]) 
 
 test('Astra cooldown downgrades and suppresses escalation but explicit model bypasses it', (t) => {
   const cooldown = { 'codex-astra': { until: Date.now() + 3600000 } };
-  const result = runRouting(t, ['--lane', 'astra', '説明して'], [{ status: 9 }], cooldown);
+  const result = runRouting(t, ['--lane', 'astra', '説明して'], [{ status: 9 }, { status: 9 }], cooldown);
   assert.equal(result.status, 9, result.stderr);
   assert.match(result.stderr, /astra_cooldown/);
   assert.equal(result.ledger[0].model, `codex-cli/${SOL}`);
-  const automatic = runRouting(t, ['説明して'], [{ status: 9 }], cooldown);
+  const automatic = runRouting(t, ['説明して'], [{ status: 9 }, { status: 9 }], cooldown);
   assert.equal(automatic.ledger.length, 1);
   const explicit = runRouting(t, ['--model', 'astra', '説明して'], [{ output: 'done' }], cooldown);
   assert.equal(explicit.ledger[0].model, `codex-cli/${ASTRA}`);
@@ -870,15 +901,61 @@ console.log('done');
   });
   assert.equal(result.status, 0, result.stderr);
   const calls = fs.readFileSync(capture, 'utf8').trim().split('\n').map(JSON.parse);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   const expectedArgs = (options) => {
     const args = buildCodexExecArgs(options);
     args.splice(-1, 0, '--skip-git-repo-check');
     return args;
   };
   assert.deepEqual(calls[0].args, expectedArgs({ slug: ASTRA, effort: 'high' }));
-  assert.deepEqual(calls[1].args, expectedArgs({ slug: SOL }));
+  assert.deepEqual(calls[1].args, expectedArgs({ slug: ASTRA, effort: 'high' }));
+  assert.deepEqual(calls[2].args, expectedArgs({ slug: SOL }));
   assert.equal(calls[0].input, calls[1].input);
+  assert.equal(calls[1].input, calls[2].input);
   assert.ok(calls[0].input.endsWith(instruction));
   assert.ok(calls.every((call) => !call.args.some((arg) => arg.includes('literal'))));
+});
+
+test('WSL 起動では git リポジトリかどうかに関係なく末尾の - より前に --skip-git-repo-check を渡す', { skip: process.platform === 'win32' }, (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-wsl-args-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const capture = path.join(home, 'capture.jsonl');
+  const preload = path.join(home, 'win32-platform.cjs');
+  fs.writeFileSync(preload, "Object.defineProperty(process, 'platform', { value: 'win32' });\n");
+  const executable = path.join(home, 'wsl');
+  fs.writeFileSync(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] === '-l') {
+  process.stdout.write(Buffer.from('Ubuntu\\n', 'utf16le'));
+} else if (args.includes('--version') || args.includes('command -v codex >/dev/null 2>&1')) {
+  process.stdout.write('codex 1.0\\n');
+} else {
+  fs.appendFileSync(process.env.CAPTURE, JSON.stringify(args) + '\\n');
+  process.stdout.write('done\\n');
+}
+`, { mode: 0o755 });
+
+  for (const isGitRepository of [false, true]) {
+    const cwd = path.join(home, isGitRepository ? 'git-cwd' : 'plain-cwd');
+    fs.mkdirSync(cwd);
+    if (isGitRepository) fs.mkdirSync(path.join(cwd, '.git'));
+    const result = run(['--cwd', cwd, '--model', 'sol', '説明して'], {
+      home,
+      env: {
+        PATH: `${home}${path.delimiter}${process.env.PATH}`,
+        NODE_OPTIONS: `--require=${preload}`,
+        CAPTURE: capture,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr);
+  }
+
+  const calls = fs.readFileSync(capture, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(calls.length, 2);
+  for (const args of calls) {
+    const codexArgs = args.slice(args.indexOf('codex') + 1);
+    assert.ok(codexArgs.includes('--skip-git-repo-check'));
+    assert.ok(codexArgs.indexOf('--skip-git-repo-check') < codexArgs.lastIndexOf('-'));
+  }
 });
