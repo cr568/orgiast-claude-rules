@@ -2,6 +2,7 @@
 // 通常実装は Sol、長時間・高難度・auto の失敗時は Astra（既定 effort high）。
 // --lane sol|astra|auto / --model astra|sol|<slug> / --effort で指定する。
 // 先頭40行の <!-- lane: astra --> でも指定可。Astra 上限時は Sol へ退避する。
+import { recordGeminiUsage } from './gemini-usage-ledger.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -295,13 +296,14 @@ export function isBackendExhausted(output, stderr) {
 // WSL では EACCES で必ず失敗し、時間を消費した末にネイティブ(信頼できないディレクトリ
 // では空出力で即終了)へ落ちる。codex-do の out=0 空出力行の根本原因(2026-09-08 実測)。
 // 戻り値: 'wsl'=そのまま WSL codex で実行 / 'retry'=在るのに起動確認失敗→再試行(再インストールしない)
-//         'install'=本当に無いときだけ1回インストール / 'native'=ネイティブへ(警告付き・trust チェック回避)。
-export function wslCodexLaunchPlan({ distroFound, codexPresent, versionOk, installAttempted, retried }) {
-  if (!distroFound) return 'native';
+//         'install'=本当に無いときだけ1回インストール / 'native'=明示許可時のみネイティブへ / 'abort'=中断。
+export const WSL_PROBE_TIMEOUT_MS = 60000;
+
+export function wslCodexLaunchPlan({ distroFound, codexPresent, versionOk, installAttempted, retried, allowNative = false }) {
   if (versionOk) return 'wsl';
-  if (codexPresent && !retried) return 'retry';
-  if (!codexPresent && !installAttempted) return 'install';
-  return 'native';
+  if (distroFound && codexPresent && !retried) return 'retry';
+  if (distroFound && !codexPresent && !installAttempted) return 'install';
+  return allowNative ? 'native' : 'abort';
 }
 
 if (isEntry(import.meta.url)) {
@@ -309,6 +311,7 @@ if (isEntry(import.meta.url)) {
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
 const forceNative = args.includes('--force-native');
+const allowNative = args.includes('--allow-native');
 const noFallback = args.includes('--no-fallback');
 const review = args.includes('--review');
 const noEscalate = args.includes('--no-escalate');
@@ -326,6 +329,7 @@ const cwd = path.resolve(cwdIndex >= 0 && args[cwdIndex + 1] ? args[cwdIndex + 1
 const omitted = new Set();
 if (dryRun) omitted.add(args.indexOf('--dry-run'));
 if (forceNative) omitted.add(args.indexOf('--force-native'));
+if (allowNative) omitted.add(args.indexOf('--allow-native'));
 if (noFallback) omitted.add(args.indexOf('--no-fallback'));
 if (review) omitted.add(args.indexOf('--review'));
 if (noEscalate) omitted.add(args.indexOf('--no-escalate'));
@@ -335,7 +339,7 @@ for (const index of [modelIndex, effortIndex, laneIndex]) {
 if (cwdIndex >= 0) { omitted.add(cwdIndex); omitted.add(cwdIndex + 1); }
 if (promptFileIndex >= 0) { omitted.add(promptFileIndex); omitted.add(promptFileIndex + 1); }
 if (timeoutIndex >= 0) { omitted.add(timeoutIndex); omitted.add(timeoutIndex + 1); }
-const usage = '使い方: node tools/codex-do.mjs "<指示>" [--cwd <path>] [--prompt-file <file>] [--review] [--timeout <秒>] [--model <slug|astra|sol>] [--effort <low|medium|high|xhigh|max>] [--lane <sol|astra|auto>] [--no-escalate] [--dry-run] [--no-fallback] [--force-native]';
+const usage = '使い方: node tools/codex-do.mjs "<指示>" [--cwd <path>] [--prompt-file <file>] [--review] [--timeout <秒>] [--model <slug|astra|sol>] [--effort <low|medium|high|xhigh|max>] [--lane <sol|astra|auto>] [--no-escalate] [--dry-run] [--no-fallback] [--force-native] [--allow-native]';
 
 if ((modelIndex >= 0 && (!model || !/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(model))) ||
     (effortIndex >= 0 && !['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) ||
@@ -509,28 +513,34 @@ async function executeCodex() {
   let result;
 
   if (process.platform === 'win32' && !forceNative) {
-    const listed = spawnSync('wsl', ['-l', '-q'], { encoding: 'utf16le', timeout: 15000 });
+    const listed = spawnSync('wsl', ['-l', '-q'], { encoding: 'utf16le', timeout: WSL_PROBE_TIMEOUT_MS });
     const distros = listed.status === 0 ? listed.stdout.split(/\r?\n/).map((x) => x.replace(/\0/g, '').trim()).filter(Boolean) : [];
     const distro = distros.find((x) => x.toLowerCase() === 'ubuntu') || distros[0];
     let usable = false;
+    let failureReason = 'WSL ディストリが見つかりませんでした';
+    let finalStep = wslCodexLaunchPlan({ distroFound: Boolean(distro), codexPresent: false, versionOk: false, installAttempted: false, retried: false, allowNative });
     if (distro) {
       const versionProbe = () => {
-        const probe = spawnSync('wsl', ['-d', distro, '--', 'codex', '--version'], { encoding: 'utf8', timeout: 15000 });
+        const probe = spawnSync('wsl', ['-d', distro, '--', 'codex', '--version'], { encoding: 'utf8', timeout: WSL_PROBE_TIMEOUT_MS });
         return { ok: probe.status === 0, stderr: (probe.stderr || '').toString().trim().slice(0, 300) };
       };
-      const present = spawnSync('wsl', ['-d', distro, '--', 'sh', '-lc', 'command -v codex >/dev/null 2>&1'], { timeout: 15000 }).status === 0;
+      const present = spawnSync('wsl', ['-d', distro, '--', 'sh', '-lc', 'command -v codex >/dev/null 2>&1'], { timeout: WSL_PROBE_TIMEOUT_MS }).status === 0;
       const first = versionProbe();
       usable = first.ok;
-      const step = wslCodexLaunchPlan({ distroFound: true, codexPresent: present, versionOk: first.ok, installAttempted: false, retried: false });
+      failureReason = present ? `WSL ${distro} の codex 起動確認に失敗しました` : `WSL ${distro} に codex が見つかりませんでした`;
+      const step = wslCodexLaunchPlan({ distroFound: true, codexPresent: present, versionOk: first.ok, installAttempted: false, retried: false, allowNative });
+      finalStep = step;
       if (step === 'retry') {
         console.error(`WSL ${distro} には codex が在りますが起動確認が失敗しました。一過性の可能性があるため再試行します${first.stderr ? ` (${first.stderr})` : ''}`);
         usable = versionProbe().ok;
+        if (!usable) finalStep = wslCodexLaunchPlan({ distroFound: true, codexPresent: true, versionOk: false, installAttempted: false, retried: true, allowNative });
         if (!usable) console.error(`WSL ${distro} の codex は再試行でも起動確認できませんでした。在るのに失敗しているため npm 再インストールはしません`);
       } else if (step === 'install') {
         console.error(`WSL ${distro} に codex が見つからないため自動インストールを試します`);
         const installed = spawnSync('wsl', ['-d', distro, '--', 'npm', 'i', '-g', '@openai/codex'], { stdio: 'inherit', timeout: 120000 });
         if (installed.status === 0) usable = versionProbe().ok;
         else console.error(`WSL ${distro} への codex 自動インストールが失敗しました(exit ${installed.status})。WSL 内に手動で導入してください`);
+        if (!usable) finalStep = wslCodexLaunchPlan({ distroFound: true, codexPresent: false, versionOk: false, installAttempted: true, retried: false, allowNative });
       }
     }
     if (usable) {
@@ -544,10 +554,19 @@ async function executeCodex() {
       } catch (error) {
         if (error?.code !== 'ENOENT') console.error(`⚠️ worktree の gitdir 確認に失敗しました（処理は続行します）: ${error?.message ?? error}`);
       }
-      result = await execute('wsl', ['-d', distro, '--cd', cwd, '--', 'codex', ...codexArgs]);
+      // WSL 側 codex は cwd を /mnt/c/... で見るため ~/.codex/config.toml の Windows 形式 trust キーと
+      // 構造的に一致せず、常に "Not inside a trusted directory" で exit 1・出力ゼロになる。
+      const wslArgs = [...codexArgs];
+      wslArgs.splice(-1, 0, '--skip-git-repo-check');
+      result = await execute('wsl', ['-d', distro, '--cd', cwd, '--', 'codex', ...wslArgs]);
     }
     else {
-      console.error('⚠️ WSL 経路が使えないためネイティブ Windows codex で実行します。\nWindows 版は read-only サンドボックス固定でファイルを書けない既知の不具合(openai/codex#35428)があり、編集が保存されない可能性が高い。WSL の導入を推奨');
+      console.error(`🚨 ${failureReason}`);
+      if (finalStep !== 'native') {
+        console.error('🚨 WSL の codex 経路が使えないため中断しました（native Windows codex は read-only で編集が保存されない既知の不具合があるため、既定では使いません）。WSL を確認するか、承知の上で native を使うなら --allow-native を付けて再実行してください。');
+        process.exit(3);
+      }
+      console.error('⚠️ WSL 経路が使えないため、--allow-native の指定によりネイティブ Windows codex で実行します。\nWindows 版は read-only サンドボックス固定でファイルを書けない既知の不具合(openai/codex#35428)があり、編集が保存されない可能性が高い。');
       const nativeArgs = [...codexArgs];
       if (!fs.existsSync(path.join(cwd, '.git'))) nativeArgs.splice(-1, 0, '--skip-git-repo-check');
       result = await execute('codex', nativeArgs, { cwd });
@@ -638,6 +657,9 @@ if (quotaCheck.matched || escalationFailed) {
                 shell: process.platform === 'win32',
                 timeoutSecs: backendTimeout
               });
+        if (backend.kind === 'gemini') {
+          try { recordGeminiUsage({ model: backend.model, inTokens: null, outTokens: null, source: 'llm-ask', tool: 'codex-do', status: result.status, timedOut: result.timedOut === true }, { home }); } catch {}
+        }
         if (result.status === null) {
           console.error(`[codex-do] Failed to spawn ${backend.name} fallback:`, result.error);
           result.status = 1;
@@ -687,7 +709,7 @@ if (shouldFlagEmptyFallbackDiff({ executorName, wantedEdit, timedOut: result.tim
 if (quotaCheck.matched && executorName === 'fallback' && result?.status !== 0) {
   try { writeCodexCooldown(quotaResetUntil, undefined, 'usage_limit_no_fallback'); } catch {}
 }
-if (executorName === 'fallback') {
+if (executorName === 'fallback' && reportedFallbackBackend?.kind !== 'gemini') {
   recordUsage(result, `${reportedFallbackBackend?.name ?? 'unknown'}/${reportedFallbackBackend?.model ?? 'unknown'}`, secs, 'fallback');
 }
 
