@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { mergeKnowledge, enqueueTodos, selectTargets, runNightly, readJsonl } from './handoff-audit-nightly.mjs';
 import { parseHandoff } from './auto-session.mjs';
+import { knowledgePath, legacyKnowledgePath, readKnowledge } from './handoff-audit-gate.mjs';
+
 const item = { pattern: 'API 確認', route: 'gh api', confidence: 'high' };
 test('patternキーで重複排除、mediumは候補、別観測でhighへ', () => {
   const first = mergeKnowledge([], [item, item], [], 'one');
@@ -47,4 +49,81 @@ test('夜間実行: candidates永続化・別応答で昇格・再実行冪等�
   assert.equal(JSON.parse(fs.readFileSync(knowledgeFile))[0].confidence, 'high');
   assert.match(fs.readFileSync(path.join(dir, 'next-session.md'), 'utf8'), /gh api/);
   assert.equal((await runNightly(options)).reviewed, 0);
+});
+
+test('seed と「tools を書き換えない」', async t => {
+  const home = fs.mkdtempSync(path.join(import.meta.dirname, '.audit-home-test-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, '.claude');
+  fs.mkdirSync(dir, { recursive: true });
+
+  const before = fs.readFileSync(legacyKnowledgePath(), 'utf8');
+  const now = new Date(2026, 8, 12, 10), yesterday = new Date(2026, 8, 11, 10).toISOString();
+
+  const row = { ts: yesterday, sessionId: 'a', verdict: 'pass', fired: true, evidence: { text: '[手渡し判定]', tools: [] } };
+  fs.writeFileSync(path.join(dir, 'handoff-audit-ledger.jsonl'), JSON.stringify(row) + '\n');
+
+  await runNightly({
+    home,
+    now,
+    ask: async () => ({ verdict: 'pass', violations: [], learned: [] })
+  });
+
+  const expectedPath = path.join(home, '.claude', 'handoff-audit-knowledge.json');
+  assert.equal(knowledgePath(home), expectedPath);
+  assert.ok(fs.existsSync(expectedPath));
+
+  const seededContent = JSON.parse(fs.readFileSync(expectedPath, 'utf8'));
+  assert.deepEqual(seededContent, JSON.parse(before));
+
+  assert.equal(fs.readFileSync(legacyKnowledgePath(), 'utf8'), before);
+});
+
+test('昇格した知識は home 側に入り、tools 側は変わらない', async t => {
+  const home = fs.mkdtempSync(path.join(import.meta.dirname, '.audit-home-test-2-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, '.claude');
+  fs.mkdirSync(dir, { recursive: true });
+
+  const before = fs.readFileSync(legacyKnowledgePath(), 'utf8');
+  const now = new Date(2026, 8, 12, 10), yesterday = new Date(2026, 8, 11, 10).toISOString();
+
+  const row = { ts: yesterday, sessionId: 'a', verdict: 'pass', fired: true, evidence: { text: '[手渡し判定]', tools: [] } };
+  fs.writeFileSync(path.join(dir, 'handoff-audit-ledger.jsonl'), JSON.stringify(row) + '\n');
+
+  const result = await runNightly({
+    home,
+    now,
+    ask: async () => ({
+      verdict: 'block',
+      violations: [],
+      learned: [{ ...item, confidence: 'high' }]
+    })
+  });
+
+  assert.equal(result.added, 1);
+
+  const homeKnowledge = JSON.parse(fs.readFileSync(knowledgePath(home), 'utf8'));
+  assert.ok(homeKnowledge.some(k => k.pattern === 'API 確認'));
+  assert.equal(homeKnowledge.length, JSON.parse(before).length + 1);
+
+  assert.equal(fs.readFileSync(legacyKnowledgePath(), 'utf8'), before);
+});
+
+test('readKnowledge の優先順位', () => {
+  const home = fs.mkdtempSync(path.join(import.meta.dirname, '.audit-read-test-'));
+  try {
+    const fallback = readKnowledge(home);
+    const legacyContent = JSON.parse(fs.readFileSync(legacyKnowledgePath(), 'utf8'));
+    assert.deepEqual(fallback, legacyContent);
+
+    const dir = path.join(home, '.claude');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(knowledgePath(home), JSON.stringify([{ pattern: 'p', route: 'r', confidence: 'high' }]) + '\n');
+
+    const primary = readKnowledge(home);
+    assert.equal(primary[0].pattern, 'p');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

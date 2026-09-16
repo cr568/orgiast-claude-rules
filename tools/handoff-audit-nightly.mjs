@@ -2,9 +2,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { isEntry } from './is-entry.mjs';
-import { auditHome, loadResources, buildPrompt, requestAudit, appendJsonl, fired } from './handoff-audit-gate.mjs';
+import { auditHome, loadResources, buildPrompt, requestAudit, appendJsonl, fired, knowledgePath, readKnowledge } from './handoff-audit-gate.mjs';
 
 export function readJsonl(file) {
   try { return fs.readFileSync(file, 'utf8').split(/\r?\n/).flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } }); }
@@ -70,7 +69,10 @@ export async function runNightly(options = {}) {
     const now = options.now || new Date();
     const until = new Date(now); until.setHours(0, 0, 0, 0);
     const since = new Date(until); since.setDate(since.getDate() - 1);
-    const knowledgeFile = options.knowledgeFile || fileURLToPath(new URL('./handoff-audit-knowledge.json', import.meta.url));
+    const knowledgeFile = options.knowledgeFile || knowledgePath(home);
+    if (!options.knowledgeFile && !fs.existsSync(knowledgeFile)) {
+      fs.writeFileSync(knowledgeFile, JSON.stringify(readKnowledge(home), null, 2) + '\n');
+    }
     let knowledge = JSON.parse(fs.readFileSync(knowledgeFile, 'utf8'));
     const resources = { ...(options.resources || loadResources(home)), knowledge };
     const candidateFile = path.join(dir, 'handoff-audit-candidates.jsonl');

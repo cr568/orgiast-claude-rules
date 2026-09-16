@@ -8,6 +8,23 @@ import { findExternalStateClaim, findOutsourcedVerification } from './external-s
 import { extractAddresses, isInternal, loadLedger } from './internal-recipient-gmail-guard.mjs';
 
 export const auditHome = () => process.env.ORGIAST_HOME || process.env.USERPROFILE || process.cwd().match(/^(\/mnt\/[a-z]\/Users\/[^/]+)/i)?.[1] || os.homedir();
+export const knowledgePath = (home = auditHome()) => path.join(home, '.claude', 'handoff-audit-knowledge.json');
+export const legacyKnowledgePath = () => fileURLToPath(new URL('./handoff-audit-knowledge.json', import.meta.url));
+export function readKnowledge(home = auditHome()) {
+  const primary = knowledgePath(home);
+  try {
+    return JSON.parse(fs.readFileSync(primary, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    const legacy = legacyKnowledgePath();
+    try {
+      return JSON.parse(fs.readFileSync(legacy, 'utf8'));
+    } catch (e2) {
+      if (e2.code !== 'ENOENT') throw e2;
+      return [];
+    }
+  }
+}
 export const PROVIDERS = ['groq', 'openrouter', 'deepseek'];
 export function fired(text = '') {
   return text.includes('[手渡し判定]') || [...text.matchAll(/次に kim がすること[:：][ \t]*([^\r\n]*)/g)].some(m => m[1].trim() !== 'なし')
@@ -43,7 +60,7 @@ export function turnEvidence(raw = '', recipients = { domains: [], addresses: []
 }
 export function loadResources(home = auditHome()) {
   return { rules: fs.readFileSync(new URL('./handoff-audit-rules.md', import.meta.url), 'utf8'),
-    knowledge: JSON.parse(fs.readFileSync(new URL('./handoff-audit-knowledge.json', import.meta.url), 'utf8')),
+    knowledge: readKnowledge(home),
     routes: JSON.parse(fs.readFileSync(new URL('./automation-routes.json', import.meta.url), 'utf8')),
     recipients: loadLedger({ home }) };
 }
