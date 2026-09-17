@@ -125,8 +125,7 @@ export function evaluateNegativeClaimFromRaw({ text, transcriptRaw }) {
 export function configuredMode() {
   let registryMode = 'warn';
   try {
-    const registryPath = process.env.ORGIAST_RULES_REGISTRY || path.join(here, 'rules-registry.json');
-    const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+    const registry = JSON.parse(fs.readFileSync(path.join(here, 'rules-registry.json'), 'utf8'));
     const value = registry.rules?.find(rule => rule.id === ruleId)?.enforcement;
     if (value === 'block' || value === 'warn') registryMode = value;
   } catch {}
