@@ -362,6 +362,9 @@ if (promptFileIndex >= 0) {
   if (!promptFile) { console.error(`--prompt-file にファイルパスが必要です\n${usage}`); process.exit(2); }
   try {
     instruction = fs.readFileSync(promptFile, 'utf8');
+    if (!/(?:DONE_CRITERIA|完了条件|成功条件)/.test(instruction)) {
+      console.error('[codex-do] 警告: 指示ファイルに完了条件がありません（protocols/HANDOFF.md 参照）');
+    }
   } catch (error) {
     console.error(`--prompt-file を読めません: ${promptFile} (${error.code || error.message})`);
     process.exit(2);

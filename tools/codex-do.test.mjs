@@ -12,7 +12,9 @@ const { needsWorktreeRepair, detectQuotaLimit, shouldFlagEmptyFallbackDiff, buil
 function run(args, options = {}) {
   return spawnSync(process.execPath, [tool, ...args], {
     encoding: 'utf8',
-    timeout: 30000,
+    // /mnt/c の大きい worktree では終了時の git read-back が30秒境界に触れる。
+    // 子プロセス自体のタイムアウト検証とは独立なので、test harness側には余裕を持たせる。
+    timeout: 45000,
     env: {
       ...process.env,
       ORGIAST_HOME: options.home ?? fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-home-')),
@@ -50,6 +52,12 @@ test('--prompt-file の中身をそのまま指示として使う', () => {
   const result = run(['--dry-run', '--prompt-file', file]);
   assert.equal(result.status, 0);
   assert.match(result.stdout, /新規ファイルを作る/);
+});
+
+test('--prompt-file に完了条件が無ければ警告するがブロックしない', () => {
+  const result = run(['--dry-run', '--prompt-file', writePrompt('# 指示\n新規ファイルを作る\n')]);
+  assert.equal(result.status, 0);
+  assert.match(result.stderr, /\[codex-do\] 警告: 指示ファイルに完了条件がありません/);
 });
 
 test('バッククォート・$()・改行を含む指示が欠落せず原文のまま届く', () => {

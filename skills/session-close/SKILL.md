@@ -21,6 +21,17 @@ description: セッションを綺麗に閉じて次に引き継ぐ。「終わ�
 - 既存ファイルを先に探し、重複を作らず更新を優先する。書いたら同時に `MEMORY.md` の索引へ1行追加する。
 - 会話固有の一時情報、コード構造、git 履歴が既に記録していることは書かない。
 
+### 学びの台帳（3回ルール）
+
+- 同義の既存feedbackがあれば新規作成せず、`node <repo>/tools/learning-ledger.mjs --bump <file>`を実行する。データ消失・バックアップ不全・セキュリティ・権限事故・誤送信・不可逆操作・金銭損失は`--critical`を付ける。
+- bump後に`node <repo>/tools/learning-ledger.mjs --list --queue-out ~/.claude/promotion-queue.md`を1回実行する。
+- PROMOTEが1件以上なら、成果報告と`next-session.md`の「未決」へ`PROMOTE 待ち N件（先頭: <name>）`を1行入れる。仕組み化を提案しただけで終わらせず、次セッションの目的候補へ載せる。
+
+### 重要判断の記録
+
+- 後から前提が変わり得る判断（方式選定・外部サービス採用・やらないと決めたこと）をしたら、`protocols/DECISION-TEMPLATE.md`から`decisions/DEC-XXXX.md`を作り、`decisions/README.md`の一覧へ1行足す。
+- 単なる実装手順の選択は記録しない。
+
 ## 4. マキモノへ出品（再利用できる知見だけ・全自動）
 
 - 判定: このセッションの成果に「他社・他人の環境でも再現できる汎用手順」が含まれるか。
