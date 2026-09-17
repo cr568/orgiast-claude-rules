@@ -188,6 +188,109 @@ test('sectionsForTodo: 未知TODO・未登録ブロックは空を返す', () =>
   assert.deepEqual(sectionsForTodo(parsed, parsed.todos[1]), {});
 });
 
+test('sectionsForTodo: 同一ブロック内の入れ子ハンドオフから対象・完了条件を借りない', () => {
+  const md = `<!-- NEXT-SESSION v1 -->
+
+## 次の1目的
+現行の目的
+
+## 残TODO
+1. **現行TODO** 何かをやる
+
+## 触る前に読む memory
+- memory_current.md
+
+## 次の1目的
+旧ハンドオフの目的
+
+## 対象
+- orgiast-keyserve PR#3
+
+## 完了条件
+- \`vercel --prod\` が通ること
+`;
+  const parsed = parseHandoff(md);
+  const sections = sectionsForTodo(parsed, parsed.todos[0]);
+  assert.ok(!('対象' in sections));
+  assert.ok(!('完了条件' in sections));
+  assert.match(sections['触る前に読む memory'], /memory_current\.md/);
+  assert.ok(!JSON.stringify(sections).includes('keyserve'));
+  assert.ok(!JSON.stringify(sections).includes('vercel --prod'));
+});
+
+test('sectionsBySegment: 入れ子ハンドオフ側の条件は自分のセグメントに保持する', () => {
+  const md = `<!-- NEXT-SESSION v1 -->
+
+## 次の1目的
+現行の目的
+
+## 残TODO
+1. **現行TODO** 何かをやる
+
+## 触る前に読む memory
+- memory_current.md
+
+## 次の1目的
+旧ハンドオフの目的
+
+## 対象
+- orgiast-keyserve PR#3
+
+## 完了条件
+- \`vercel --prod\` が通ること
+
+## 残TODO
+1. **旧TODO** keyserve を作業する
+`;
+  const parsed = parseHandoff(md);
+  assert.equal(parsed.sectionsBySegment['1:2']['対象'], '## 対象\n- orgiast-keyserve PR#3');
+  assert.equal(parsed.sectionsBySegment['1:2']['完了条件'], '## 完了条件\n- `vercel --prod` が通ること');
+  assert.ok(!JSON.stringify(parsed.sectionsBySegment['1:2']).includes('memory_current.md'));
+});
+
+test('parseHandoff: 1マーカーブロックでは最初の残TODOだけを列挙する', () => {
+  const md = `<!-- NEXT-SESSION v1 -->
+## 次の1目的
+現行の目的
+## 残TODO
+1. 現行TODOを実行する
+
+## 次の1目的
+入れ子の旧ハンドオフ
+## 残TODO
+1. 旧ハンドオフTODOを実行する
+`;
+  const parsed = parseHandoff(md);
+  assert.deepEqual(parsed.todos, ['現行TODOを実行する']);
+  assert.ok(!parsed.todos.some((todo) => todo.includes('旧ハンドオフTODO')));
+  assert.deepEqual(parsed.todoSegments, ['1:1']);
+});
+
+test('sectionsForTodo: 旧ハンドオフの前置きを現行memory節に混ぜない', () => {
+  const md = `<!-- NEXT-SESSION v1 -->
+## 次の1目的
+現行の目的
+## 残TODO
+1. 現行TODO
+## 触る前に読む memory
+- memory_current.md
+
+---
+
+<!-- 旧ハンドオフの前置き -->
+> keyserve の作業を引き継ぐ
+## 次の1目的
+旧の目的
+## 対象
+- orgiast-keyserve PR#3
+## 完了条件
+- 本番デプロイが通ること
+`;
+  const sections = sectionsForTodo(parseHandoff(md), '現行TODO');
+  assert.equal(sections['触る前に読む memory'], '## 触る前に読む memory\n- memory_current.md');
+  assert.ok(!JSON.stringify(sections).includes('keyserve'));
+});
+
 const closedPurposeSample = `<!-- NEXT-SESSION v1 -->\n## 次の1目的\n~~**Growi 直取り同期を Drive へ本番反映する**~~ → ✅ 2026-09-11 完了（夜間バッチ）\n\n## 対象\n- tools/growi-manual.mjs\n\n## 完了条件\n- Part が 14 → 15 本\n\n## 触る前に読む memory\n- [[feedback-x]]\n\n## 残TODO\n1. 別件のバグ修正をする\n`;
 
 test('parseHandoff はクローズ済み目的の対象・完了条件を除外し、memory と残TODOを維持する', () => {
