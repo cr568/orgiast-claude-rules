@@ -131,7 +131,7 @@ try {
   let policyRepaired = 0;
   let costLoopMigrated = 0;
   if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) settings.hooks = {};
-  for (const event of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop']) if (!Array.isArray(settings.hooks[event])) settings.hooks[event] = [];
+  for (const event of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop']) if (!Array.isArray(settings.hooks[event])) settings.hooks[event] = [];
   added += removeDailySessionHooks(settings);
   const command = (name, extra = '') => `node "${path.join(repo, 'tools', name)}"${extra}`;
   // 2026-09-06: 9本を別プロセスで動かすと304 Stop中198回が再Stopになったため、
@@ -214,6 +214,15 @@ try {
   if (add(settings.hooks.PreToolUse, 'pretooluse-headless-background.mjs', { matcher: 'Bash|PowerShell|ScheduleWakeup', hooks: [{ type: 'command', command: command('pretooluse-headless-background.mjs'), timeout: 5 }] })) added += 1;
   // read-only調査の逐次実行を検知し、まとめて調査するよう同期注入する。
   if (add(settings.hooks.PreToolUse, 'pretooluse-serial-investigation.mjs', { hooks: [{ type: 'command', command: command('pretooluse-serial-investigation.mjs'), timeout: 5 }] })) added += 1;
+  // Gemini MCP(gemini-cli) の応答から実トークンを台帳(executor-usage.jsonl)へ記録する。
+  // 応答の structuredContent に usageMetadata が無ければ estimated として記録し、
+  // 「0円=無料」ではなく「0円=未計測」を予算ガードに明示させる(#443 の主旨)。
+  // 2026-09-18: 手動登録が stale なツリーパス(実ファイル無し)を指していると add() の
+  // バス名重複判定で「既に登録済み」となり、ENOENT のまま無音死する。
+  // repo 側実ファイルへ収束させ、matcher も broadcaster 全捕まりの .* から正規表現へ正規化する。
+  added += migrate(settings.hooks.PostToolUse, 'gemini-mcp-usage-hook.mjs', 'gemini-mcp-usage-hook.mjs', command('gemini-mcp-usage-hook.mjs'));
+  added += syncMatcherFor(settings.hooks.PostToolUse, 'gemini-mcp-usage-hook.mjs', 'mcp__gemini-cli__(?:ask-gemini|geminiChat|googleSearch)');
+  if (add(settings.hooks.PostToolUse, 'gemini-mcp-usage-hook.mjs', { matcher: 'mcp__gemini-cli__(?:ask-gemini|geminiChat|googleSearch)', hooks: [{ type: 'command', command: command('gemini-mcp-usage-hook.mjs'), timeout: 10 }] })) added += 1;
   // パイプ等で連結された全ステージが許可済みBashプレフィックスなら自動承認する。
   if (add(settings.hooks.PreToolUse, 'pipe-stage-permissions.mjs', { matcher: 'Bash', hooks: [{ type: 'command', command: command('pipe-stage-permissions.mjs'), timeout: 5 }] })) added += 1;
   // 人に手作業を頼むとき、初見の人でも実行できる手順になっているかを検査する(§1.5.1)。
