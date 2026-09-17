@@ -26,6 +26,7 @@ description: セッションを綺麗に閉じて次に引き継ぐ。「終わ�
 - 同義の既存feedbackがあれば新規作成せず、`node <repo>/tools/learning-ledger.mjs --bump <file>`を実行する。データ消失・バックアップ不全・セキュリティ・権限事故・誤送信・不可逆操作・金銭損失は`--critical`を付ける。
 - bump後に`node <repo>/tools/learning-ledger.mjs --list --queue-out ~/.claude/promotion-queue.md`を1回実行する。
 - PROMOTEが1件以上なら、成果報告と`next-session.md`の「未決」へ`PROMOTE 待ち N件（先頭: <name>）`を1行入れる。仕組み化を提案しただけで終わらせず、次セッションの目的候補へ載せる。
+- `--list`の`掃除候補`が1件以上、または`自動ロード層`が90%超なら、成果報告に1行入れ、`MEMORY.md`の該当行を削除せず`index/`側へ移す。
 
 ### 重要判断の記録
 
@@ -75,7 +76,7 @@ description: セッションを綺麗に閉じて次に引き継ぐ。「終わ�
 
 ```markdown
 <!-- NEXT-SESSION v1 -->
-<!-- 前セッション: <sessionId> / 更新: <YYYY-MM-DD> / cwd: <作業ディレクトリ> -->
+<!-- 前セッション: <sessionId> / 更新: <YYYY-MM-DD> / cwd: <作業ディレクトリ> / model: <sonnet|opus> -->
 
 ## 次の1目的
 <1件のみ。決まっていなければ「未定」>
@@ -98,6 +99,8 @@ description: セッションを綺麗に閉じて次に引き継ぐ。「終わ�
 ## 未決（kim の判断待ち）
 - …
 ```
+
+- `model:`は子セッションをterminal経路で起動する場合だけ`--model`へ変換される。省略時は現状維持、`fable`は指定禁止。
 
 - 書いたら「次のセッションは自動で立ち上がって `/session-start` から始まります」と1行で伝える（手順8 が自動でやる）。
 

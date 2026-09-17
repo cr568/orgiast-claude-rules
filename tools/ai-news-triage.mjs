@@ -138,7 +138,7 @@ export async function runTriage(options = {}) {
   const adopted = [];
   const failures = [];
   let deferred = 0;
-  const system = 'LINE投稿由来の提案を検索結果だけから検証する。検索結果に無いことを書かない。不明なら必ず unclear と書く。verdictは投稿内容が裏取りできたか、adoptはオージャストのコスト削減または品質向上に直結し実際に手を打つ価値があるかで決める。JSONのみを返す。形式: {"verdict":"confirmed|refuted|unclear","finding":"120字以内の日本語","adopt":true|false,"reason":"80字以内"}';
+  const system = 'LINE投稿由来の提案を検索結果だけから検証する。検索結果に無いことを書かない。不明なら必ず unclear と書く。verdictは投稿内容が裏取りできたか、adoptはオージャストのコスト削減または品質向上に直結し実際に手を打つ価値があるかで決める。安全・手順・再発防止だけでなく、B軸のコスト削減・速度・人手削減・売上への効果も必ず検討し、B軸が空なら採用判定を完了しない。JSONのみを返す。形式: {"verdict":"confirmed|refuted|unclear","finding":"120字以内の日本語","adopt":true|false,"reason":"80字以内"}';
   const startedAt = Date.now();
   for (const [index, record] of targets.entries()) {
     if (cli.budgetSeconds > 0 && Date.now() - startedAt >= cli.budgetSeconds * 1000) {

@@ -14,6 +14,10 @@ export function parseHandoffCwd(text) {
   return match?.[1]?.trim() ?? '';
 }
 
+export function parseHandoffModel(text) {
+  return String(text).match(/<!--[^\r\n]*?model:\s*(sonnet|opus)\b[^\r\n]*-->/i)?.[1]?.toLowerCase() ?? '';
+}
+
 export function pickNewestExtensionBinary(names) {
   const candidates = names.flatMap((name) => {
     const match = name.match(/^anthropic\.claude-code-(\d+)\.(\d+)\.(\d+)-/);
@@ -382,14 +386,15 @@ export function applyTrust(config, cwd) {
   return { config: changed ? { ...source, projects } : source, changed };
 }
 
-export function planLaunch({ claudeBin, cwd, prompt, wt }) {
+export function planLaunch({ claudeBin, cwd, prompt, wt, model = '' }) {
   if (!claudeBin || !cwd) return null;
+  const claudeArgs = model ? [claudeBin, '--model', model, prompt] : [claudeBin, prompt];
   if (wt) {
-    return { command: wt, args: ['-w', 'new-window', '-d', cwd, claudeBin, prompt], cwd, detached: true };
+    return { command: wt, args: ['-w', 'new-window', '-d', cwd, ...claudeArgs], cwd, detached: true };
   }
   return {
     command: 'cmd.exe',
-    args: ['/c', 'start', '', '/D', cwd, claudeBin, prompt],
+    args: ['/c', 'start', '', '/D', cwd, ...claudeArgs],
     cwd,
     detached: true,
   };
@@ -573,7 +578,9 @@ export async function launchNextSession(argv = [], io = {}) {
       return 0;
     }
 
-    const handoffCwd = parseHandoffCwd(await readText(handoffPath));
+    const handoffText = await readText(handoffPath);
+    const handoffCwd = parseHandoffCwd(handoffText);
+    const handoffModel = parseHandoffModel(handoffText);
     const current = await readJson(currentPath, {});
     const cwd = flags.cwd || handoffCwd || current.cwd || REPO_ROOT;
     const accountLog = accountLabel({ account, route, accountPath: firstAccountConfigPath });
@@ -751,7 +758,7 @@ export async function launchNextSession(argv = [], io = {}) {
     }
 
     const wt = resolveWt({ env, readdir, homedir: home, flagWt: flags.wt });
-    const plan = planLaunch({ claudeBin, cwd, prompt: `[headless:next-session-launch] ${flags.prompt}`, wt });
+    const plan = planLaunch({ claudeBin, cwd, prompt: `[headless:next-session-launch] ${flags.prompt}`, wt, model: handoffModel });
     if (flags.dryRun) {
       log(JSON.stringify({ ...plan, account, configDir, configDirSource }));
       return 0;

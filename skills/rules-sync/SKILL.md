@@ -33,7 +33,7 @@ Drive ハブ（正本）: `claude-common-rules` folder `1RLYbK6CKyPWRJsG6LY0WB9O
 
 ## merge（管理者 = kim 環境のみ）
 1. knowledge-inbox を parentId 検索 → 最新の `knowledge-merged.json`（台帳）に載っていないファイルを列挙
-2. 各投稿を read → 既存ルールとの重複・矛盾をチェック → 反映先を判定（ONBOARDING §x.x / rules/ / skills/ / 却下）
+2. 各投稿を read → 既存ルールとの重複・矛盾をチェック → 反映先を判定（ONBOARDING §x.x / rules/ / skills/ / 却下）。取り込み可否は`protocols/INTAKE-TWO-AXES.md`の2軸表で判定し、B軸が空なら差し戻す
 3. 反映案を1行/件で user に提示 → 承認後、**ローカル正本を編集**
 4. 正本を Drive に再アップ（同タイトル create_file）→ `manifest.json` を version+1 で再アップ → `knowledge-merged.json` に処理済み（fileId / タイトル / 反映先 / 日付）を追記して再アップ
 5. GitHub ミラー: `orgiast-claude-rules` repo に ONBOARDING / skills / rules を同期して commit + push
