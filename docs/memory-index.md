@@ -7,3 +7,7 @@
 夜間バッチは、ディスク上の `index/*.md` と `MEMORY.md` から割当と pin を導出し、`memory-index-split.mjs --apply` で再生成した後、生成側と独立した `memory-index-split-verify.mjs` で照合する。割当ファイルを事前配置する必要はない。
 
 新規 memory がどの `index/*.md` にも掲載されていない場合、夜間ログの `memory-index-split` は `要手当` になる。この場合は、内容に対応する `index/<domainKey>.md` に `- [表題](../ファイル名.md)` を1行追加する。分類を明示的に決めて一度だけ手動適用する場合は、`memory-index-domains.mjs --fallback <domainKey>` で割当 JSON と pins を生成し、それらを `memory-index-split.mjs --apply` に渡す。夜間バッチ自身は誤分類を避けるため fallback を使わない。
+
+## 学び台帳のfrontmatter
+
+`metadata.type`に加えて任意で`count`（整数、省略時1）、`status`（`ACTIVE|PROMOTE|PROMOTED|ARCHIVED`、省略時`ACTIVE`）、`promoted_to`、`promoted_at`、`critical`（真偽値）を持つ。`count >= 3`または`critical: true`は仕組み化候補とし、完了後は`status: PROMOTED`と昇格先・日付を記録する。操作仕様は`protocols/LEARNING-LEDGER.md`を正本とする。

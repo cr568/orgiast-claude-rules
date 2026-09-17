@@ -12,6 +12,7 @@ description: 新しいセッションを前セッションの引き継ぎから�
 - `~/.claude/next-session.md` を読む。これが前セッションからの引き継ぎ（目的・対象・完了条件・残TODO・読むべき memory）。
 - ファイルが無い / 「次の1目的: 未定」なら 手順2 で目的を確定する。
 - `## 触る前に読む memory` に挙がっているファイルを実際に読む（`MEMORY.md` の索引ではなく本体）。**ここを飛ばすと前セッションの失敗を繰り返す。**
+- `~/.claude/promotion-queue.md`を読む。PROMOTE待ちがあれば手順2の目的候補へ`仕組み化: <name>`として含める。
 
 ## 2. 目的を1件に確定する
 
@@ -20,6 +21,7 @@ description: 新しいセッションを前セッションの引き継ぎから�
   - `~/.claude/next-session.md` の残TODO
   - `~/.claude/session-handoffs.md`（放置セッションの再開一覧。`/session-triage` が生成）
   - 直近の memory の「未決」「次アクション」記述
+  - `~/.claude/promotion-queue.md`のPROMOTE待ち
 - 選ばれなかった候補は `next-session.md` に残す（消さない）。
 
 ## 3. 完了条件を先に決める

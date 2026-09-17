@@ -714,6 +714,14 @@ Bashは1呼び出し1コマンドとし、専用ツールとallow済みの経路
 5. クレデンシャルはkeyserveのみ。マージは `tools/pr-merge.mjs`、通知は `tools/notify-kim.mjs` とし、いずれもallow済みの経路だけを使う。
 6. classifierに拒否されたら言い換え再試行せず、「classifier 拒否: <カテゴリ>」と1行報告して次の作業へ進む。拒否原因がルール側ならそのルールを疑って起票する。
 
+### 1.21 司令塔プロトコルの差分運用
+
+実行役への指示は`protocols/HANDOFF.md`、前提が変わり得る判断は`protocols/DECISION-TEMPLATE.md`を使う。
+同じ学びはmemory frontmatterの`metadata.count`で数え、3回または重大事故1回でPROMOTEする。
+仕組み化は提案で止めず、実装・試験・有効化後に`PROMOTED`と昇格先を記録する。
+バッチ・移行・一括処理は`TOTAL INPUT = SUCCESS + FAILED + EXCLUDED + UNRECOGNIZED`を照合する。
+詳細は`protocols/LEARNING-LEDGER.md`と各skillを正本とする。
+
 ## 2. 重要な運用ルール
 
 ### 2.1 データ・文書・外部ツール（§2.1〜2.7）
