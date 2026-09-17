@@ -252,7 +252,7 @@ export async function runDigest(options = {}) {
   }
   const llm = options.llm || createLlmClient({ home, usageFile: path.join(base, 'executor-usage.jsonl') });
   const kept = [], successfullyClassified = new Set(), held = [];
-  const classificationSystem = '生成AI・LLMのコスト、品質、新モデル、ツール、プロンプト技法について各入力を分類する。JSONオブジェクトのみを返し、前置き・説明・コードフェンスは禁止。形式は {"items":[{"i":<入力と同じ番号>,"category":"cost|quality|model-release|tool|prompt-technique|other","score":<0-3>}]}。入力の全要素に対して必ず1件ずつ同じiで返す。scoreは0=無関係、1=雑談程度、2=有用、3=自社の設定変更を検討すべき。';
+  const classificationSystem = '生成AI・LLMのコスト、品質、新モデル、ツール、プロンプト技法について各入力を分類する。安全・手順・再発防止だけでなく、B軸のコスト削減・速度・人手削減・売上への効果も必ず評価し、B軸を空にしない。JSONオブジェクトのみを返し、前置き・説明・コードフェンスは禁止。形式は {"items":[{"i":<入力と同じ番号>,"category":"cost|quality|model-release|tool|prompt-technique|other","score":<0-3>}]}。入力の全要素に対して必ず1件ずつ同じiで返す。scoreは0=無関係、1=雑談程度、2=有用、3=自社の設定変更を検討すべき。';
   for (let offset = 0; offset < messages.length; offset += 40) {
     const batch = messages.slice(offset, offset + 40);
     const prompt = batch.map((m, i) => ({ i, text: m.text })).map(JSON.stringify).join('\n');
@@ -272,7 +272,7 @@ export async function runDigest(options = {}) {
   const recentKept = kept.filter((m) => Number(m.ts) >= Date.now() - 30 * 24 * 60 * 60 * 1000);
   if (recentKept.length) {
     const grouped = Object.groupBy ? Object.groupBy(recentKept, (m) => m.classification.category) : recentKept.reduce((a, m) => ((a[m.classification.category] ||= []).push(m), a), {});
-    const response = await llm({ provider: cli.provider, messages: [{ role: 'system', content: '発言は伝聞であり裏取りされていない。JSONオブジェクトのみを返す。形式は {"digest":["1行目","2行目",...],"proposals":[{"title":"...","action":"...","evidence":"...","category":"cost|quality|model-release|tool|prompt-technique|other","confidence":"high|medium|low"}]}。digestは日本語で3〜10行、具体的な情報のみを1トピック1行で書き、同じ発言を複数行に分割しない。事実のみとし、「伝聞」「未検証」「要検証」「情報が不足」など注意書きだけの行を作らない。提案は必ず要検証と分かる形にし、evidenceは120字以内。発言者名は出さず「参加者」とする。' }, { role: 'user', content: JSON.stringify(grouped) }], responseFormat: { type: 'json_object' } });
+    const response = await llm({ provider: cli.provider, messages: [{ role: 'system', content: '発言は伝聞であり裏取りされていない。安全・手順・再発防止だけでなく、B軸のコスト削減・速度・人手削減・売上への効果も必ず抽出し、B軸を空にしない。JSONオブジェクトのみを返す。形式は {"digest":["1行目","2行目",...],"proposals":[{"title":"...","action":"...","evidence":"...","category":"cost|quality|model-release|tool|prompt-technique|other","confidence":"high|medium|low"}]}。digestは日本語で3〜10行、具体的な情報のみを1トピック1行で書き、同じ発言を複数行に分割しない。事実のみとし、「伝聞」「未検証」「要検証」「情報が不足」など注意書きだけの行を作らない。提案は必ず要検証と分かる形にし、evidenceは120字以内。発言者名は出さず「参加者」とする。' }, { role: 'user', content: JSON.stringify(grouped) }], responseFormat: { type: 'json_object' } });
     ({ digest: digestLines, proposals } = parseSummary(response.text));
   }
   if (!successfullyClassified.size && candidates.length) throw new Error(`処理できたメッセージがありません（保留 ${held.length}件）`);

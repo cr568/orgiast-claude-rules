@@ -105,6 +105,30 @@ function queueText(targets) {
   return `# Promotion Queue\n\nPROMOTE 待ち: ${targets.length}件\n\n${targets.map((item) => `- ${path.basename(item.file, '.md')} (count: ${item.count}, status: ${item.status}${item.critical ? ', critical: true' : ''})`).join('\n')}\n`;
 }
 
+const MEMORY_LIMIT = 24985;
+
+export function inspectAutoloadLayer(dir) {
+  const memoryFile = path.join(dir, 'MEMORY.md');
+  if (!fs.existsSync(memoryFile)) return { lines: ['自動ロード層: MEMORY.md なし', '掃除候補: 0件'] };
+  const buffer = fs.readFileSync(memoryFile);
+  const text = buffer.toString('utf8');
+  const section = text.match(/^## 常に効くルール\s*$([\s\S]*?)(?=^## |$(?![\s\S]))/mu)?.[1] ?? '';
+  const links = [...section.matchAll(/^\s*-\s+\[[^\]]+\]\(([^)]+\.md)\)\s*$/gmu)];
+  const candidates = [];
+  for (const [, linked] of links) {
+    const file = path.resolve(dir, linked);
+    try {
+      const { status } = parseMemory(fs.readFileSync(file, 'utf8'), file);
+      if (status === 'PROMOTED' || status === 'ARCHIVED') candidates.push(`掃除候補: ${linked}（${status} だが常時ロードに残存）`);
+    } catch { /* 壊れたリンク先は台帳本体の走査で報告する */ }
+  }
+  const pct = Math.round(buffer.byteLength / MEMORY_LIMIT * 100);
+  return { lines: [
+    `自動ロード層: MEMORY.md ${buffer.byteLength}B / 上限 ${MEMORY_LIMIT}B (${pct}%) / 常に効くルール ${links.length}行`,
+    ...(candidates.length ? candidates : ['掃除候補: 0件']),
+  ] };
+}
+
 export function run(argv, io = {}) {
   const args = parseArgs(argv);
   const out = io.out || console.log;
@@ -119,9 +143,11 @@ export function run(argv, io = {}) {
     const dirs = args.memory_dir ? [path.resolve(args.memory_dir)] : defaultMemoryDirs(io.home);
     const result = scanMemory(dirs, { onError: err });
     for (const item of result.targets) out(`${item.file}\tcount=${item.count}\tstatus=${item.status}${item.critical ? '\tcritical=true' : ''}`);
+    const autoloadLines = dirs.flatMap((dir) => inspectAutoloadLayer(dir).lines);
+    for (const line of autoloadLines) out(line);
     if (args.queue_out && !args.dry) {
       fs.mkdirSync(path.dirname(path.resolve(args.queue_out)), { recursive: true });
-      fs.writeFileSync(args.queue_out, queueText(result.targets), 'utf8');
+      fs.writeFileSync(args.queue_out, `${queueText(result.targets).trimEnd()}\n\n${autoloadLines.join('\n')}\n`, 'utf8');
     }
     out(`走査 ${result.scanned} = 対象 ${result.targets.length} + 対象外 ${result.excluded} + 解析不能 ${result.invalid}`);
     return result;

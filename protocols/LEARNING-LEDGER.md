@@ -41,6 +41,12 @@
 
 「提案した」は完了ではない。DESIGN → IMPLEMENT → TEST → REVIEW → ACTIVATEまで実行する。実装できない時だけ理由と次アクションを返す。
 
+## 自動ロード層の規律
+常時ロードされる`## 常に効くルール`は20行以内を目安とし、増やす時は1行減らす。
+`PROMOTED` / `ARCHIVED`の学びは常時ロードから外し、`index/<domain>.md`の1行だけ残す。仕組みが守るものを毎回読ませない。
+`--list`の`自動ロード層`が90%を超えたらsession-closeの報告に1行載せ、次セッションの目的候補へ「常時ロード層の整理」を足す。
+`MEMORY.md`はharness管理のため、台帳ツールから書き換えない。
+
 ## コマンド
 - 一覧とキュー更新: `node tools/learning-ledger.mjs --list --queue-out ~/.claude/promotion-queue.md`
 - 再発記録: `node tools/learning-ledger.mjs --bump <memory.md>`

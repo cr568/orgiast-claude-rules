@@ -656,6 +656,9 @@ Astra クールダウン中は Sol を使う。明示の `--model astra`（ま�
 - **1セッション=1目的は hook で機械的に担保する**: SessionStart の `session-purpose-gate` が「このセッションの目的を1行宣言せよ」と要求し、最初の依頼をそのセッションの目的として記録する。以後 UserPromptSubmit で**目的ドリフト**（別目的の依頼＝キーワードの重なりが薄い／「別件」「ところで」「次は」等）を検知したら、**着手前に**『ここで /session-close して新セッションで』と1行提案することを強制する（ブロックはしない。userが「続けて」と言えばそのまま継続）。16ターンを超えたセッションには区切り提案のナッジも出る。判定は純ローカル（API課金ゼロ・状態は `~/.claude/session-purpose/<session_id>.json`）。
 - セッションを閉じる時は `/session-close` skill で 成果要約→commit/PR→memory永続化→残TODO→次セッション用テンプレ→`/clear`促し まで完結させる。1セッション=1目的を守り、長い会話に複数タスクを積まない（文脈肥大は精度低下とコスト増を招く）。
 
+**委譲しない条件**: 単一ファイルの確認・grep 1発・数ステップのgit操作（status/diff/log/worktree）・直前の文脈を強く共有する確認は、AgentやCodexの起動コストの方が大きいため監督が直接実行してよい。独立した確認は1レスポンスにまとめて同時に投げる。
+実装本体（ファイル生成・複数ファイル編集・テスト作成）は従来どおりCodex／安い経路へ委譲する。lane-guardの閾値（4回警告/8回停止）は変更しない。
+
 詳細: `https://raw.githubusercontent.com/kimkon1011/orgiast-claude-rules/main/rules-extracted/token-model-cost-routing.md`
 
 **1.18.1 実行レーン制（Fable は相談と判定、実行は非Claude → Sonnet → Opus(設計のみ)）**

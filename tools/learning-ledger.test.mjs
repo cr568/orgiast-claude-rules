@@ -75,3 +75,31 @@ test('--dryでは書き込まない', () => {
   run(['--bump', file, '--dry'], { out: () => {}, err: () => {} });
   assert.equal(fs.readFileSync(file, 'utf8'), before);
 });
+
+test('MEMORY.mdのバイト数・比率・常時ロード行数を表示する', () => {
+  const f = fixture();
+  const index = '- [一](one.md)\n- [二](two.md)';
+  f.write('MEMORY.md', `# Memory\n\n## 常に効くルール\n${index}\n\n## ドメイン索引\n- [索引](index/x.md)\n`);
+  f.write('one.md', memory({ count: 1 })); f.write('two.md', memory({ count: 1 }));
+  const lines = [];
+  run(['--memory-dir', f.dir, '--list'], { out: (line) => lines.push(line), err: () => {} });
+  const bytes = fs.statSync(path.join(f.dir, 'MEMORY.md')).size;
+  assert.match(lines.join('\n'), new RegExp(`自動ロード層: MEMORY.md ${bytes}B / 上限 24985B \\(${Math.round(bytes / 24985 * 100)}%\\) / 常に効くルール 2行`));
+});
+
+test('PROMOTEDだけを掃除候補にする', () => {
+  const f = fixture();
+  f.write('MEMORY.md', '## 常に効くルール\n- [済](done.md)\n- [現役](active.md)\n');
+  f.write('done.md', memory({ count: 3, status: 'PROMOTED' })); f.write('active.md', memory({ count: 1 }));
+  const lines = [];
+  run(['--memory-dir', f.dir, '--list'], { out: (line) => lines.push(line), err: () => {} });
+  assert.match(lines.join('\n'), /掃除候補: done\.md（PROMOTED だが常時ロードに残存）/);
+  assert.doesNotMatch(lines.join('\n'), /掃除候補: active\.md/);
+});
+
+test('MEMORY.md無しでも落ちずqueueに状態を出す', () => {
+  const f = fixture(); const queue = path.join(f.dir, 'queue', 'promotion.md'); const lines = [];
+  run(['--memory-dir', f.dir, '--list', '--queue-out', queue], { out: (line) => lines.push(line), err: () => {} });
+  assert.match(lines.join('\n'), /自動ロード層: MEMORY\.md なし/);
+  assert.match(fs.readFileSync(queue, 'utf8'), /自動ロード層: MEMORY\.md なし\n掃除候補: 0件/);
+});

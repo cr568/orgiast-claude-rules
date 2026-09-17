@@ -15,6 +15,7 @@ import {
   KEPT_CLAUDE_ENV,
   launchNextSession,
   parseHandoffCwd,
+  parseHandoffModel,
   pickAccountEmail,
   pickNewestExtensionBinary,
   pickNewestVersionDir,
@@ -212,6 +213,13 @@ test('Windows Terminal と cmd.exe の起動 argv を組み立てる', () => {
     command: 'cmd.exe', args: ['/c', 'start', '', '/D', 'C:\\work', 'claude.exe', 'go'], cwd: 'C:\\work', detached: true,
   });
   assert.equal(planLaunch({ claudeBin: '', cwd: 'C:\\work', prompt: 'go', wt: '' }), null);
+});
+
+test('handoffのsonnet/opusだけをterminal起動の--modelへ渡す', () => {
+  assert.equal(parseHandoffModel('<!-- 前セッション: x / cwd: C:\\work / model: sonnet -->'), 'sonnet');
+  assert.equal(parseHandoffModel('<!-- model: fable -->'), '');
+  assert.deepEqual(planLaunch({ claudeBin: 'claude.exe', cwd: 'C:\\work', prompt: '/session-start', wt: 'wt.exe', model: 'opus' }).args,
+    ['-w', 'new-window', '-d', 'C:\\work', 'claude.exe', '--model', 'opus', '/session-start']);
 });
 
 test('起動抑止と force の安全境界を判定する', () => {
