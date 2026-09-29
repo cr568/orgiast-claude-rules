@@ -1,0 +1,6 @@
+{
+  "pattern": "実装タスクの続行可否を user に一言求める",
+  "route": "聞かずに当ターンで実装を続ける。実装の実行は codex-do.mjs（前景・単発）。**2026-09-27 実測: codex-do.mjs は WSL 経由（`wsl -l -q`）で、このPCは WSL ディストリ未導入のため codex レーンが起動せず内蔵フォールバック(Gemini→DeepSeek)で約20分かかる**（native `codex` 0.154.0 は存在するが経路外）。時間が尽きるなら Claude 直で実装し、user の一言を待って止まらない。**機械側の受け皿は `tools/stop-gate.mjs#shouldBlockProgressQuestion`（runner 経由 code=progress-question）だが ONBOARDING.md:1049 のとおり既定オフ。このPCは `~/.claude/stop-gate-enabled` 不在＝無効で、他人のPCで勝手に有効化しない**。よって応答は「次に kim がすること: なし」で終えられる形にする。",
+  "confidence": "high",
+  "source": "handoff-audit-nightly:ff41f255bd35c4dd 起点（2026-09-25 の block 2件: fdbd2ff8「『続けて』等の一言で TJP-04 以降を継続します」/ cdc529a3「このまま次のファイルに進んでよいですか？」）。**2026-09-27 実測**: 台帳3本（handoff-audit-ledger / handoff-audit-nightly-ledger / stop-gate-runner-ledger）の 2026-09-25T18:02:02Z 以降 26 件を走査 → 同型は 2026-09-25T19:32Z の cdc529a3（「PR #24 を見て、ここで「OK」か修正点を返してください」）1 件のみ＝**同一セッション内の再発**。**2026-09-26 の監査済み 2 セッション（579e1f3e / 3cf5a07b）は双方「次に kim がすること: なし」で再発 0**。走査: runs/2026-09-27-3-recurrence-scan.mjs / 2026-09-27-3-nextkim-scan.mjs"
+}
