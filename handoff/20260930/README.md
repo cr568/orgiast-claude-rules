@@ -44,3 +44,13 @@ routing だけ作り直して再実行すればよい（knowledge は skip さ�
 
 現行 `origin/main` = `ed6d45a` に対し **routing パッチは apply-check OK**（2026-10-01 実測）。
 つまり今すぐ実行する分には一発で通る。腐敗が問題になるのは**上流 main がさらに前進した後**。
+
+## Windows での改行化け（2026-10-01 実測・`apply-preserved.mjs` 側で対処済み）
+Windows の clone は `core.autocrlf=true` になりがちで、**checkout された `routing-table-handoff.patch` が
+CRLF 化する**（実測: CR 164 個。同じツリーの `tools/eval-harness.mjs` は CR 0）。
+そのまま `git apply` すると `trailing whitespace` という**原因と無関係に見えるエラー**で必ず落ちる。
+
+`apply-preserved.mjs` はパッチを読んで CRLF→LF に正規化してから当てるので、この罠は塞いである
+（実行ログに `[routing] patch line endings: CRLF -> LF 正規化した` と出る）。
+もし手で `git apply handoff/20260930/routing-table-handoff.patch` を叩いて `trailing whitespace` が出たら、
+パッチが CRLF 化しているだけなので `tr -d '\r' < ... > /tmp/p.patch` のように剥がしてから当てること。

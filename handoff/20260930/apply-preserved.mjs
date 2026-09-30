@@ -7,6 +7,7 @@
 //                       触ると不適用になる(過去に 09-29→09-30 で実際に FAILED)。--3way も救済にならない
 //                       (コンフリクトマーカーを残すだけ)。よって失敗時は黙って進まず、作り直し手順を出して停止する。
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -60,9 +61,18 @@ const already = (() => {
 if (already) {
   console.log('[routing] skip (既に適用済み)');
 } else {
+  // 改行の正規化: Windows の clone は core.autocrlf=true になりがちで、checkout された
+  // パッチが CRLF 化する(実測: CR 164個)。その状態で git apply すると
+  // 「trailing whitespace」という無関係なエラーで必ず落ちる。パッチ側を LF に戻してから当てる。
+  const rawPatch = fs.readFileSync(rPatch, 'utf8');
+  const crlf = rawPatch.includes('\r\n');
+  const usePatch = crlf ? path.join(os.tmpdir(), 'routing-handoff-normalized.patch') : rPatch;
+  if (crlf) fs.writeFileSync(usePatch, rawPatch.replace(/\r\n/g, '\n'), 'utf8');
+  console.log('[routing] patch line endings: ' + (crlf ? 'CRLF -> LF 正規化した' : 'LF のまま'));
+
   try {
     // 失敗時 git apply はファイルを一切書き換えない(原子的)ので、半適用の心配は無い。
-    execFileSync('git', ['apply', rPatch], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['apply', usePatch], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (e) {
     const first = String(e.stderr || e.message).trim().split('\n')[0];
     console.error('[routing] FAILED: パッチが現行 main の tools/eval-harness.mjs に当たりません(文脈ずれ=腐敗)。');
