@@ -1,6 +1,6 @@
 # 保全成果物の引き継ぎ (2026-09-30 / cr568 → write 権限PC)
 
-このブランチは**マージしない**。``fork (cr568) → write 権限PC`` の**輸送体**であり、
+このブランチは**マージしない**。`fork (cr568) → write 権限PC` の**輸送体**であり、
 中身を正本ブランチへ適用したら役目は終わる。
 
 ## なぜ fork PR では駄目か
@@ -24,9 +24,23 @@ gh pr create --base main --head auto/20260930-preserved --title "docs+fix: 保�
 gh pr edit <PR> --add-label automerge
 ```
 
-## なぜ腐敗しないか
-従来は `git apply` の context patch で追記していたため、上流 main が前進するたびに不適用になった
-(2026-09-29 版 → 09-30 に entries 20→21 で FAILED、再生成を要した)。
-`apply-preserved.mjs` は **JSON を parse して marker `ff41f255bd35c4dd` の有無で冪等に追記**するため、
-entries が何件に増えていても適用でき、再実行しても二重追記しない。
-routing-table 側は適用済み判定(`writeRoutingHandoff` の有無)を先に行う。
+## 腐敗耐性は2つの半分で異なる（2026-10-01 実測・重要）
+READ して「main が進んでも一発で通る」と期待しないこと。実測で確定した違いは次のとおり。
+
+| 半分 | 方式 | main 前進への耐性 |
+|---|---|---|
+| knowledge (`handoff-audit-knowledge.json`) | JSON を parse し marker `ff41f255bd35c4dd` の有無で冪等追記 | **強い**。entries が何件でも当たる。再実行しても二重追記しない |
+| routing (`tools/eval-harness.mjs` + 新規テスト) | **`git apply` の context patch** | **弱い**。main が `tools/eval-harness.mjs` のハンク近傍に触れると不適用になる |
+
+routing 側の脆さは実測済み:
+- 過去に 09-29 版 → 09-30 で entries 前進のため `apply --check` が FAILED（再生成を要した）
+- `--3way` は**救済にならない**（`Applied patch ... with conflicts` / `U tools/eval-harness.mjs`＝競合マーカーを残すだけ）
+- 隔離クローンで main 前進を人工的に再現した実測でも `rot=yes threeWayRescue=no`
+  （`runs/2026-10-01-3-routing-rot-sim.mjs`）
+
+そのため `apply-preserved.mjs` は routing が当たらなかったとき **黙って進まず exit 2** で停止し、
+パッチの作り直し手順を表示する。**knowledge 側は既に適用済みのまま残る**ので、
+routing だけ作り直して再実行すればよい（knowledge は skip され二重追記しない）。
+
+現行 `origin/main` = `ed6d45a` に対し **routing パッチは apply-check OK**（2026-10-01 実測）。
+つまり今すぐ実行する分には一発で通る。腐敗が問題になるのは**上流 main がさらに前進した後**。

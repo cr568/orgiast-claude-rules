@@ -1,6 +1,11 @@
 #!/usr/bin/env node
-// 保全成果物を上流 main へ反映する(冪等・main が前進しても腐敗しない)
-// 使い方: node handoff/20260930/apply-preserved.mjs <repo-root>
+// 保全成果物を上流 main へ反映する(冪等)。使い方: node handoff/20260930/apply-preserved.mjs <repo-root>
+//
+// 腐敗耐性は2半分で異なる(2026-10-01 実測で確定):
+//   (1) knowledge 側 = JSON を parse して marker の有無で判定 → main が前進しても腐敗しない・再実行安全
+//   (2) routing 側   = git apply する context patch → main が tools/eval-harness.mjs のハンク近傍を
+//                       触ると不適用になる(過去に 09-29→09-30 で実際に FAILED)。--3way も救済にならない
+//                       (コンフリクトマーカーを残すだけ)。よって失敗時は黙って進まず、作り直し手順を出して停止する。
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -46,23 +51,30 @@ if (!okMarker) throw new Error('read-back 失敗: ' + MARKER + ' が JSON に無
 if (!present && after !== before + 1) throw new Error('read-back 失敗: entries ' + before + ' -> ' + after);
 console.log('[knowledge] ' + action + ' / entries ' + before + ' -> ' + after + ' / marker present=' + okMarker);
 
-// --- (2) routing-table パッチ ---
+// --- (2) routing-table パッチ (context patch。main 前進で腐敗しうる) ---
 const rPatch = path.join(here, 'routing-table-handoff.patch');
-const git = (args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' });
+const hPath = path.join(repo, 'tools', 'eval-harness.mjs');
 const already = (() => {
-  try {
-    return fs
-      .readFileSync(path.join(repo, 'tools', 'eval-harness.mjs'), 'utf8')
-      .includes('writeRoutingHandoff');
-  } catch {
-    return false;
-  }
+  try { return fs.readFileSync(hPath, 'utf8').includes('writeRoutingHandoff'); } catch { return false; }
 })();
 if (already) {
   console.log('[routing] skip (既に適用済み)');
 } else {
-  execFileSync('git', ['apply', rPatch], { cwd: repo, stdio: 'inherit' });
-  const h = fs.readFileSync(path.join(repo, 'tools', 'eval-harness.mjs'), 'utf8');
+  try {
+    // 失敗時 git apply はファイルを一切書き換えない(原子的)ので、半適用の心配は無い。
+    execFileSync('git', ['apply', rPatch], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    const first = String(e.stderr || e.message).trim().split('\n')[0];
+    console.error('[routing] FAILED: パッチが現行 main の tools/eval-harness.mjs に当たりません(文脈ずれ=腐敗)。');
+    console.error('  knowledge 側の追記は完了済みです(上のログ)。routing 側だけを次の要領で反映してください:');
+    console.error('    git checkout -b tmp origin/main');
+    console.error('    git apply -3 ' + rPatch + '     # 競合は手で解決(3way は競合マーカーを残すので必ず目視)');
+    console.error('    git diff origin/main -- tools/eval-harness.mjs tools/routing-table-handoff.test.mjs \\');
+    console.error('      > handoff/20260930/routing-table-handoff.patch   # 作り直して本スクリプトを再実行');
+    console.error('  raw error: ' + first);
+    process.exit(2);
+  }
+  const h = fs.readFileSync(hPath, 'utf8');
   for (const fn of ['writeRoutingHandoff', 'diffRoutingCategories', 'formatRoutingEntry']) {
     if (!h.includes(fn)) throw new Error('routing read-back 失敗: ' + fn + ' が無い');
   }
@@ -70,4 +82,3 @@ if (already) {
     throw new Error('routing read-back 失敗: テスト同梱が無い');
   console.log('[routing] applied / export 3件 + テスト同梱 present');
 }
-void git;
