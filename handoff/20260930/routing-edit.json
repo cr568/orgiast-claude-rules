@@ -1,0 +1,104 @@
+{
+  "schema": 1,
+  "target": "tools/eval-harness.mjs",
+  "marker": "writeRoutingHandoff",
+  "note": "context patch ではなく行アンカー方式。行番号・ハンク文脈に依存しないため上流 main が前進しても腐敗しない。",
+  "baseSha256": "0c97e7474307b76d360a40c337d64de252bbde26c67fe47f09106005c52d3f04",
+  "resultSha256": "4a15b98149436e49e92e75e8f2880f41d3693c265fe181d358203af573d129aa",
+  "edits": [
+    {
+      "mode": "replace",
+      "from": [
+        "import { rebuildRoutingTable } from './routing-table.mjs';"
+      ],
+      "to": [
+        "import { rebuildRoutingTable, routingTableFile } from './routing-table.mjs';"
+      ]
+    },
+    {
+      "mode": "insertAfter",
+      "from": [
+        "  // 全provider計測の完了で routing-table.json を再生成する(仕様C: eval 結果に連動するルーティング表)。"
+      ],
+      "to": [
+        "  // 全provider計測の完了で routing-table.json を再生成する(仕様C: eval 結果に連動するルーティング表)。",
+        "  // 再生成は commit/push しないため、変更が出たら runs/ に引き継ぎ成果物を残す(失われない経路の確保)。",
+        "  const outFile = routingTableFile();",
+        "  const beforeText = fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8') : null;"
+      ]
+    },
+    {
+      "mode": "insertAfter",
+      "from": [
+        "  catch (error) { console.error(`routing-table 再生成失敗: ${String(error?.message ?? error)}`); }"
+      ],
+      "to": [
+        "  catch (error) { console.error(`routing-table 再生成失敗: ${String(error?.message ?? error)}`); }",
+        "  try {",
+        "    const afterText = fs.existsSync(outFile) ? fs.readFileSync(outFile, 'utf8') : null;",
+        "    const handoff = writeRoutingHandoff({ beforeText, afterText, runsDir: path.join(HERE, '..', 'runs'), stamp: new Date().toISOString().slice(0, 10) });",
+        "    if (handoff) {",
+        "      console.log(`routing-table 更新あり(${handoff.rows.length}カテゴリ)。push権限のあるPCへ引き継ぎ: ${handoff.notePath}`);",
+        "      for (const r of handoff.rows) console.log(`  ${r.category}: ${r.before} → ${r.after}`);",
+        "    }",
+        "  } catch (error) { console.error(`routing-table 引き継ぎ作成失敗: ${String(error?.message ?? error)}`); }"
+      ]
+    },
+    {
+      "mode": "append",
+      "from": [],
+      "to": [
+        "",
+        "// ── routing-table 引き継ぎ(生成物を失わない経路の確保) ────────────────────────",
+        "// eval-harness --all は計測後に tools/routing-table.json を書き換えるだけで",
+        "// commit/push しないため、push 権限の無いPCで回すと更新が rescue ブランチに",
+        "// 吸われて誰もマージしないまま消える(2026-09-29 実測・runs/2026-09-29-3.summary.md)。",
+        "// 変更を検出したら runs/ に「そのままコピーできる成果物 + 引き継ぎメモ」を残す。",
+        "export function formatRoutingEntry(entry) {",
+        "  if (!entry) return '(なし)';",
+        "  const rate = typeof entry.rate === 'number' ? `${(entry.rate * 100).toFixed(0)}%` : '?%';",
+        "  return `${entry.provider}/${entry.model} ${rate} $${entry.usdPerTask} ${entry.msAvg}ms n=${entry.samples}`;",
+        "}",
+        "function safeParseTable(text) { if (typeof text !== 'string' || !text.trim()) return null; try { return JSON.parse(text); } catch { return null; } }",
+        "/** 変更のあったカテゴリだけを {category, before, after} で返す(無変更なら空配列)。 */",
+        "export function diffRoutingCategories(beforeText, afterText) {",
+        "  const a = safeParseTable(beforeText)?.categories ?? {}, b = safeParseTable(afterText)?.categories ?? {};",
+        "  const rows = [];",
+        "  for (const category of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) {",
+        "    const before = formatRoutingEntry(a[category]), after = formatRoutingEntry(b[category]);",
+        "    if (before !== after) rows.push({ category, before, after });",
+        "  }",
+        "  return rows;",
+        "}",
+        "/** 変更があるときだけ runs/ に成果物とメモを書く。無変更なら null(毎晩ゴミを増やさない)。 */",
+        "export function writeRoutingHandoff({ beforeText, afterText, runsDir, stamp, relPath = 'tools/routing-table.json' }) {",
+        "  const rows = diffRoutingCategories(beforeText, afterText);",
+        "  if (!rows.length) return null;",
+        "  fs.mkdirSync(runsDir, { recursive: true });",
+        "  const jsonPath = path.join(runsDir, `${stamp}-routing-table.json`), notePath = path.join(runsDir, `${stamp}-routing-table-handoff.md`);",
+        "  fs.writeFileSync(jsonPath, afterText, 'utf8');",
+        "  fs.writeFileSync(notePath, `${[",
+        "    `# routing-table 引き継ぎ (${stamp})`, '',",
+        "    `計測により ${relPath} が更新されたが、このPCは上流への push 権限を持たない`,",
+        "    '(`cr568` = pull のみ / fork PR は auto-merge.yml 条件1で対象外)。更新を失わないため、下記を残す。', '',",
+        "    '## 変更(カテゴリ: 変更前 → 変更後)',",
+        "    ...rows.map((r) => `- ${r.category}: ${r.before} → ${r.after}`), '',",
+        "    '## write 権限のあるPCでの適用(人手ゼロ)',",
+        "    '1. 正本ブランチを origin/main から切る',",
+        "    `2. このフォルダの \\`${path.basename(jsonPath)}\\` を \\`${relPath}\\` にコピー`,",
+        "    '3. `node --test tools/routing-table.test.mjs` / `node --test tools/eval-harness.test.mjs` を通す',",
+        "    '4. commit → push → `automerge` ラベル付与(fork 経由は不可)', '',",
+        "    `成果物: ${jsonPath}`,",
+        "  ].join('\\n')}\\n`, 'utf8');",
+        "  return { jsonPath, notePath, rows };",
+        "}"
+      ]
+    }
+  ],
+  "newFiles": [
+    {
+      "path": "tools/routing-table-handoff.test.mjs",
+      "content": "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport fs from 'node:fs';\nimport os from 'node:os';\nimport path from 'node:path';\nimport { diffRoutingCategories, formatRoutingEntry, writeRoutingHandoff } from './eval-harness.mjs';\n\nconst table = (categories) => `${JSON.stringify({ builtAt: '2026-09-29T00:00:00.000Z', categories }, null, 2)}\\n`;\nconst entry = (provider, model, extra = {}) => ({ provider, model, rate: 1, usdPerTask: 0.0001, msAvg: 900, samples: 3, ...extra });\n\ntest('無変更なら差分ゼロ・ファイルを作らない', () => {\n  const text = table({ code: entry('deepseek', 'deepseek-chat') });\n  assert.deepEqual(diffRoutingCategories(text, text), []);\n  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rt-handoff-'));\n  assert.equal(writeRoutingHandoff({ beforeText: text, afterText: text, runsDir, stamp: '2026-09-29' }), null);\n  assert.deepEqual(fs.readdirSync(runsDir), []);\n});\n\ntest('モデル/速度の変更をカテゴリ単位で検出する', () => {\n  const before = table({ code: entry('openrouter', 'llama-3.3-70b', { msAvg: 2078 }), jp_reply: entry('deepseek', 'deepseek-chat') });\n  const after = table({ code: entry('deepseek', 'deepseek-chat', { msAvg: 933 }), jp_reply: entry('deepseek', 'deepseek-chat') });\n  const rows = diffRoutingCategories(before, after);\n  assert.equal(rows.length, 1);\n  assert.equal(rows[0].category, 'code');\n  assert.match(rows[0].before, /openrouter\\/llama-3\\.3-70b/);\n  assert.match(rows[0].after, /deepseek\\/deepseek-chat/);\n});\n\ntest('カテゴリの追加・削除も検出する', () => {\n  const before = table({ code: entry('deepseek', 'deepseek-chat') });\n  const after = table({ summarize: entry('groq', 'openai-gpt-oss-120b') });\n  const rows = diffRoutingCategories(before, after);\n  assert.deepEqual(rows.map((r) => r.category), ['code', 'summarize']);\n  assert.equal(rows[0].after, '(なし)');\n  assert.equal(rows[1].before, '(なし)');\n});\n\ntest('壊れた JSON でも例外を投げない', () => {\n  assert.deepEqual(diffRoutingCategories('', 'not json'), []);\n  assert.equal(formatRoutingEntry(null), '(なし)');\n});\n\ntest('変更時は runs/ に成果物と引き継ぎメモを書く(read-back 検証)', () => {\n  const before = table({ code: entry('openrouter', 'llama-3.3-70b', { msAvg: 2078 }) });\n  const after = table({ code: entry('deepseek', 'deepseek-chat', { msAvg: 933 }) });\n  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rt-handoff-'));\n  const r = writeRoutingHandoff({ beforeText: before, afterText: after, runsDir, stamp: '2026-09-29' });\n  assert.ok(r);\n  assert.equal(r.rows.length, 1);\n  // 成果物は「そのままコピーできる」= 書き戻した文字列が after と完全一致\n  assert.equal(fs.readFileSync(r.jsonPath, 'utf8'), after);\n  assert.equal(JSON.parse(fs.readFileSync(r.jsonPath, 'utf8')).categories.code.model, 'deepseek-chat');\n  const note = fs.readFileSync(r.notePath, 'utf8');\n  assert.match(note, /code: openrouter\\/llama-3\\.3-70b .*→.*deepseek\\/deepseek-chat/);\n  assert.match(note, /tools\\/routing-table\\.json/);\n  assert.match(note, /automerge/);\n  assert.equal(fs.readdirSync(runsDir).length, 2);\n});\n"
+    }
+  ]
+}

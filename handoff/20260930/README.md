@@ -24,41 +24,31 @@ gh pr create --base main --head auto/20260930-preserved --title "docs+fix: 保�
 gh pr edit <PR> --add-label automerge
 ```
 
-## 腐敗耐性は2つの半分で異なる（2026-10-01 実測・重要）
-READ して「main が進んでも一発で通る」と期待しないこと。実測で確定した違いは次のとおり。
+## 腐敗耐性（2026-10-02 改訂: 両半分とも main 前進に強い方式になった）
 
 | 半分 | 方式 | main 前進への耐性 |
 |---|---|---|
 | knowledge (`handoff-audit-knowledge.json`) | JSON を parse し marker `ff41f255bd35c4dd` の有無で冪等追記 | **強い**。entries が何件でも当たる。再実行しても二重追記しない |
-| routing (`tools/eval-harness.mjs` + 新規テスト) | **`git apply` の context patch** | **弱い**。main が `tools/eval-harness.mjs` のハンク近傍に触れると不適用になる |
+| routing (`tools/eval-harness.mjs` + 新規テスト) | **行アンカー方式**（`routing-edit.json`） | **強い**。行番号がずれても、近傍の別の行が書き換わっても当たる（末尾追記はアンカー無し） |
 
-routing 側の脆さは実測済み:
-- 過去に 09-29 版 → 09-30 で entries 前進のため `apply --check` が FAILED（再生成を要した）
-- `--3way` は**救済にならない**（`Applied patch ... with conflicts` / `U tools/eval-harness.mjs`＝競合マーカーを残すだけ）
-- 隔離クローンで main 前進を人工的に再現した実測でも `rot=yes threeWayRescue=no`
-  （`runs/2026-10-01-3-routing-rot-sim.mjs`）
+`routing-edit.json` は context patch を捨て、**変更のあった行そのもの**（挿入は直前の1行）だけを
+アンカーにした編集列（`replace` / `insertAfter` / `append` の4件）。同梱の
+`routing-table-handoff.patch` は参考資料で、適用には使わない。
 
-そのため `apply-preserved.mjs` は routing が当たらなかったとき **黙って進まず exit 2** で停止し、
-パッチの作り直し手順を表示する。**knowledge 側は既に適用済みのまま残る**ので、
-routing だけ作り直して再実行すればよい（knowledge は skip され二重追記しない）。
+### 実測した根拠（2026-10-02）
+- **生成時の等価性**: `base + edits` が「patch を当てた結果」と**バイト一致**することを assert
+  （`runs/2026-10-02-3-build-routing-edit.mjs`。`baseSha256` / `resultSha256` を JSON に記録）
+- **腐敗耐性の対照実験**: 旧 context patch が依存していた文脈行を1行だけ書き換えた木で
+  → 旧 patch は `patch does not apply` で **FAILED**、新方式は **applied**（書き換えも保持・テスト 5/5 PASS）
+- **現行 main `7f743ec` での end-to-end**: 1回目 = `[knowledge] entries 21 -> 22` ＋ `[routing] applied / anchors=4`、
+  2回目 = 両方 skip で entries 22 のまま＝**冪等**。`node --test tools/routing-table-handoff.test.mjs` **5/5 PASS**。
+  差分は狙いの3ファイルのみ（`tools/eval-harness.mjs` +57/-1）
 
-`origin/main` = `ed6d45a` に対し **routing パッチは apply-check OK**（2026-10-01 実測）。
-つまり今すぐ実行する分には一発で通る。腐敗が問題になるのは**上流 main がさらに前進した後**。
+適用に失敗した場合は黙って進まず **exit 2** で停止し、作り直し手順を表示する
+（knowledge 側は既に適用済みのまま残るので、routing だけ作り直して再実行すればよい）。
 
-**2026-10-02 追記（上流 main 前進後の再実測）**: `origin/main` が `ed6d45a` → **`7f743ec`**
-（`Driveハブ退行防止: hub-pushと夜間登録を復旧 (#606)`）へ前進した後も、routing パッチは
-**apply-check OK のまま**（`apply-preserved.mjs` 1回目 = `entries 21 -> 22` ＋ routing applied／
-2回目 = 両方 skip で entries 22 のまま＝冪等／固有マーカー 5/5 present／
-`node --test tools/routing-table-handoff.test.mjs` 5/5 PASS／変更は狙いの3ファイルのみ）。
-⇒ **2コミット前進では腐敗しなかった**。ただし上の表のとおり routing 側は context patch なので、
-前進の内容によっては落ちうる。落ちた場合は exit 2 の指示に従って作り直す（knowledge は skip され二重追記しない）。
-
-## Windows での改行化け（2026-10-01 実測・`apply-preserved.mjs` 側で対処済み）
-Windows の clone は `core.autocrlf=true` になりがちで、**checkout された `routing-table-handoff.patch` が
-CRLF 化する**（実測: CR 164 個。同じツリーの `tools/eval-harness.mjs` は CR 0）。
-そのまま `git apply` すると `trailing whitespace` という**原因と無関係に見えるエラー**で必ず落ちる。
-
-`apply-preserved.mjs` はパッチを読んで CRLF→LF に正規化してから当てるので、この罠は塞いである
-（実行ログに `[routing] patch line endings: CRLF -> LF 正規化した` と出る）。
-もし手で `git apply handoff/20260930/routing-table-handoff.patch` を叩いて `trailing whitespace` が出たら、
-パッチが CRLF 化しているだけなので `tr -d '\r' < ... > /tmp/p.patch` のように剥がしてから当てること。
+## 改行（2026-10-01 実測 → 2026-10-02 で不要化）
+旧方式は Windows の clone（`core.autocrlf=true`）で checkout されたパッチが CRLF 化し、
+`git apply` が `trailing whitespace` という無関係なエラーで落ちていた。新方式は
+`routing-edit.json`（改行を `\r?\n` で吸収して読む）なので、この罠は原理的に発生しない。
+`routing-table-handoff.patch` を手で当てる場合だけ、旧来どおり `tr -d '\r'` で剥がすこと。
