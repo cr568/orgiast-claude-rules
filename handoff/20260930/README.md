@@ -42,8 +42,16 @@ routing 側の脆さは実測済み:
 パッチの作り直し手順を表示する。**knowledge 側は既に適用済みのまま残る**ので、
 routing だけ作り直して再実行すればよい（knowledge は skip され二重追記しない）。
 
-現行 `origin/main` = `ed6d45a` に対し **routing パッチは apply-check OK**（2026-10-01 実測）。
+`origin/main` = `ed6d45a` に対し **routing パッチは apply-check OK**（2026-10-01 実測）。
 つまり今すぐ実行する分には一発で通る。腐敗が問題になるのは**上流 main がさらに前進した後**。
+
+**2026-10-02 追記（上流 main 前進後の再実測）**: `origin/main` が `ed6d45a` → **`7f743ec`**
+（`Driveハブ退行防止: hub-pushと夜間登録を復旧 (#606)`）へ前進した後も、routing パッチは
+**apply-check OK のまま**（`apply-preserved.mjs` 1回目 = `entries 21 -> 22` ＋ routing applied／
+2回目 = 両方 skip で entries 22 のまま＝冪等／固有マーカー 5/5 present／
+`node --test tools/routing-table-handoff.test.mjs` 5/5 PASS／変更は狙いの3ファイルのみ）。
+⇒ **2コミット前進では腐敗しなかった**。ただし上の表のとおり routing 側は context patch なので、
+前進の内容によっては落ちうる。落ちた場合は exit 2 の指示に従って作り直す（knowledge は skip され二重追記しない）。
 
 ## Windows での改行化け（2026-10-01 実測・`apply-preserved.mjs` 側で対処済み）
 Windows の clone は `core.autocrlf=true` になりがちで、**checkout された `routing-table-handoff.patch` が
