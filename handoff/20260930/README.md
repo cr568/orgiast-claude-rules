@@ -44,6 +44,15 @@ gh pr edit <PR> --add-label automerge
   2回目 = 両方 skip で entries 22 のまま＝**冪等**。`node --test tools/routing-table-handoff.test.mjs` **5/5 PASS**。
   差分は狙いの3ファイルのみ（`tools/eval-harness.mjs` +57/-1）
 
+### 実測した根拠（2026-10-03 再検証 / main 前進 `7f743ec` → `e8e01dd`）
+- **行アンカーは前進後も有効**: 隔離クローン（`origin/main` = `e8e01dd`）で
+  1回目 = `[knowledge] inserted / entries 21 -> 22 / marker present=true` ＋ `[routing] applied / anchors=4 / 既知の base と一致`（exit 0）、
+  2回目 = `[knowledge] skip (既に存在) / entries 22 -> 22` ＋ `[routing] skip (既に適用済み)`＝**冪等**
+- **回帰ゼロ**: 適用後 **3587 tests / fail 5**、pristine `e8e01dd` **3582 tests / fail 5** ＝
+  **失敗集合が完全一致**（+5 は新規テスト分。fail 5 は main 既存のベースライン失敗でパッチ起因ではない）
+- **未反映は不変**: 上流 `e8e01dd` の `tools/handoff-audit-knowledge.json` = entries **21** / `ff41f255bd35c4dd` **0件**、
+  `tools/routing-table-handoff.test.mjs` は **HTTP 404** ＝ 両半分とも未収録
+
 適用に失敗した場合は黙って進まず **exit 2** で停止し、作り直し手順を表示する
 （knowledge 側は既に適用済みのまま残るので、routing だけ作り直して再実行すればよい）。
 
