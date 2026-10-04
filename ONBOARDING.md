@@ -200,6 +200,10 @@ bound scriptのscriptId不明時はDrive MCPで`mimeType='application/vnd.google
 
 URL規約を守り、内部IDに名前を併記し、初心者向けの完全な手順を毎回示す。
 
+**1.5.0 URL を出すときは「どのアカウントで開くか」を必ず併記する（kim 2026-10-04 厳命・全PC全アカウント・絶対）**
+
+リンクを提示するときは、**そのURLをどのアカウントでログインして開くのか**を必ず同じ場所に書く。ブラウザの既定アカウントは人ごとに違い、別アカウント所有のリソースは 404／アクセス権エラーになるか、**気付かず別アカウントのまま操作して意図しない結果になる**。形式は `<URL>（**<アカウント名>** で開く）`。既定アカウントと違う場合は「シークレットウィンドウで開く」も併記する。Google Workspace は 1.5 の規約（`/a/orgiast.jp/`・Drive は `?authuser=`）で吸収されるが、**GitHub / Vercel / npm / X / Discord / Supabase など authuser 相当の仕組みが無いサービスは必ず明記**する。デスクトップのショートカットを配る場合もファイル名か本文にアカウント名を入れる。あわせて**選択肢の既定値が意図と違う箇所**も書く（実害 2026-10-04: GitHub の Add people で Role を選ばなかったため admin 依頼が write で発行された／settings/access をどのアカウントで開くか書かず kim の手が止まった）。
+
 **1.5 Google Workspace URL は `/a/orgiast.jp/` を挟む**
 
 kim が読む Doc は `tools/gdoc-publish.mjs`（URL をハイパーリンク化・read-back 検証）で作る。Drive MCP の text/plain 直投は URL がリンク化されないので使わない。
