@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { budgetVerdict, estimateTokens, noteResponse, readBudget, writeBudget } from './rate-budget.mjs';
 
 export const FALLBACK_CHAIN = Object.freeze([
   { provider: 'groq', model: 'openai/gpt-oss-120b' },
@@ -98,7 +99,7 @@ function reasonForLog(reason, maxLength = 140) {
   return singleLine.length <= maxLength ? singleLine : `${singleLine.slice(0, maxLength - 1)}…`;
 }
 
-export async function callWithFallback({ start, chain = FALLBACK_CHAIN, payloadFor, fetchImpl = fetch, onAttempt, onFailover, validateResponse, sleepImpl = defaultSleep, cooldownFile, ledgerFile, now = () => Date.now() }) {
+export async function callWithFallback({ start, chain = FALLBACK_CHAIN, payloadFor, fetchImpl = fetch, onAttempt, onFailover, validateResponse, sleepImpl = defaultSleep, cooldownFile, ledgerFile, budgetFile, now = () => Date.now() }) {
   const home = process.env.ORGIAST_HOME || os.homedir();
   const timestamp = now();
   const cost = dailyCost(ledgerFile || path.join(home, '.claude', 'executor-usage.jsonl'), timestamp);
@@ -146,6 +147,17 @@ export async function callWithFallback({ start, chain = FALLBACK_CHAIN, payloadF
   const useCooldown = chain.length > 0 && (cooldownFile != null || !process.env.NODE_TEST_CONTEXT);
   const cooldownPath = cooldownFile || path.join(home, '.claude', 'provider-cooldown.json');
   const cooldowns = useCooldown ? readJson(cooldownPath, {}) : {};
+  const cooldownMax = threshold('ORGIAST_LLM_429_COOLDOWN_MAX_MS', 900_000);
+  const cooldownMin = Math.min(cooldownMax, threshold('ORGIAST_LLM_429_COOLDOWN_MIN_MS', 60_000));
+  let cooldownDirty = false;
+  // Bound legacy 429 entries from their original start, not from every read.
+  for (const state of Object.values(cooldowns)) {
+    if (state?.reason !== 'http_429') continue;
+    const began = Number.isFinite(state.at) ? state.at : timestamp;
+    const until = Math.min(Number(state.until), began + cooldownMax);
+    if (until < Number(state.until)) { state.until = until; cooldownDirty = true; }
+  }
+  saveCooldowns();
   const available = useCooldown ? candidates.filter(({ provider }) => !(Number(cooldowns?.[provider]?.until) > timestamp)) : candidates;
   const selectedCandidates = available.length ? available : candidates;
   const skipped = [];
@@ -159,16 +171,17 @@ export async function callWithFallback({ start, chain = FALLBACK_CHAIN, payloadF
     }
   }
 
-  let cooldownDirty = false;
   function setCooldown(provider, status, response, permanentBilling = false) {
     if (!useCooldown) return;
     let duration = 0;
-    if (status === 402 || permanentBilling) duration = 24 * 60 * 60 * 1000;
+    if (status === 429) duration = Math.min(cooldownMax, Math.max(cooldownMin, retryAfterMs(response, now()) ?? cooldownMin));
+    else if (status === 402 || permanentBilling) duration = 24 * 60 * 60 * 1000;
     else if ([401, 403].includes(status)) duration = 6 * 60 * 60 * 1000;
-    else if (status === 429) duration = retryAfterMs(response, timestamp) ?? 30 * 60 * 1000;
     if (!duration) return;
-    cooldowns[provider] = { until: timestamp + duration, reason: `http_${status}`, at: timestamp };
+    const at = now();
+    cooldowns[provider] = { until: at + duration, reason: `http_${status}`, at };
     cooldownDirty = true;
+    saveCooldowns();
   }
   function clearCooldown(provider) {
     if (useCooldown && cooldowns?.[provider]) { delete cooldowns[provider]; cooldownDirty = true; }
@@ -177,6 +190,13 @@ export async function callWithFallback({ start, chain = FALLBACK_CHAIN, payloadF
     if (!cooldownDirty) return;
     try { fs.mkdirSync(path.dirname(cooldownPath), { recursive: true }); fs.writeFileSync(cooldownPath, `${JSON.stringify(cooldowns, null, 2)}\n`); } catch {}
   }
+
+  // 分窓トークン残量の永続バケット(A: 429 を受ける前に絞る / C: プロセス間で同じバケットを共有)。
+  // 429 になってから cooldown で避けるのでは遅い。残量が足りない候補は投げる前に落とし、
+  // 連鎖の次の候補(実測では cerebras が定額 $0)へ回す。
+  // cooldown と同じ多重防御: テストが budgetFile を渡し忘れても実環境の受け皿を触らない。
+  const useBudget = budgetFile != null || !process.env.NODE_TEST_CONTEXT;
+  const budgetPath = budgetFile || path.join(home, '.claude', 'provider-budget.json');
 
   const failures = [];
   const requests = new Map();
@@ -198,6 +218,16 @@ export async function callWithFallback({ start, chain = FALLBACK_CHAIN, payloadF
     let lastAttempt = 0;
     const request = await requestAt(candidateIndex);
     if (!request) continue;
+    // 候補ごとに読み直す。並列プロセスが直前に書いた残量を取りこぼさないため(C)。
+    const budgetStore = useBudget ? readBudget(budgetPath) : {};
+    const verdict = useBudget
+      ? budgetVerdict({ store: budgetStore, provider: candidate.provider, neededTokens: estimateTokens(request), now: now() })
+      : { allow: true };
+    if (!verdict.allow) {
+      skipped.push({ provider: candidate.provider, model: candidate.model, reason: verdict.reason });
+      console.error(`[budget] ${candidate.provider} はスキップ (${verdict.reason})`);
+      continue;
+    }
     let lastReason = '';
     for (let attempt = 0; attempt < 3; attempt++) {
       lastAttempt = attempt;
@@ -208,6 +238,8 @@ export async function callWithFallback({ start, chain = FALLBACK_CHAIN, payloadF
       try {
         response = await fetchImpl(request.url, request.init);
         status = response.status;
+        // 残量ヘッダを下限として記録する。次に同じ provider を選ぶ時、この値で事前に絞れる。
+        if (useBudget && response?.headers && noteResponse(budgetStore, candidate.provider, response.headers, now())) writeBudget(budgetPath, budgetStore);
         if (response.ok) {
           if (validateResponse) {
             const json = await response.clone().json().catch(() => null);
