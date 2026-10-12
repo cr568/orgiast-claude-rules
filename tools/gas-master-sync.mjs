@@ -37,6 +37,33 @@ export function assertGasEqual(left, right) {
   if (a.size !== b.size || [...a].some(([k, v]) => b.get(k)?.text !== v.text)) throw new Error('本番 pull と同期対象 src に差分があります');
 }
 
+// T10 (af39f74) は秘密トークンの直書きを Script Properties に移行した。本番の Script Properties へ値が
+// 入る前に read-back 同期すると、本番スナップショットが古い直書きを運び戻して master を巻き戻す
+// (2026-10-13 の fefaf1e で実際に発生し、scriptPropertiesSecrets.test.mjs の5件が赤くなった)。
+// 同期は本番→GitHub の一方向なので、ここで本番側を検査して fail-closed で止める。bypass は意図的に用意しない。
+export const REMOVED_SECRET_IDENTIFIERS = ['CASE_API_TOKEN_DEFAULT', 'SALES_CTX_TOKEN_DEFAULT', 'TLDV_API_KEY_DEFAULT'];
+// 値そのものは書かない。「引用符つき 32 文字以上の hex」「UUID」という“形”で検出する (booth の
+// test/scriptPropertiesSecrets.test.mjs と同じ規則を、同期対象の本番スナップショットへ適用する)。
+export const SECRET_SHAPE_PATTERNS = [
+  /['"][0-9a-fA-F]{32,}['"]/,
+  /['"][0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}['"]/,
+];
+export function findSecretRegression(files) {
+  const hits = [];
+  for (const [key, file] of files) {
+    for (const id of REMOVED_SECRET_IDENTIFIERS) if (file.text.includes(id)) hits.push(`${key}: ${id}`);
+    for (const re of SECRET_SHAPE_PATTERNS) if (re.test(file.text)) hits.push(`${key}: 秘密値らしき直書き (${re})`);
+  }
+  return hits;
+}
+export function assertNoSecretRegression(files) {
+  const hits = findSecretRegression(files);
+  if (hits.length) {
+    throw new Error(`本番スナップショットが秘密トークンの直書きを再導入します (T10 の巻き戻り)。`
+      + `本番の Script Properties に値が入るまで同期しないこと: ${hits.join(', ')}`);
+  }
+}
+
 export function syncGasMaster({ project, snapshot, dryRun = false }, {
   spawn = spawnCommand, stdout = s => process.stdout.write(s), stderr = s => process.stderr.write(s),
 } = {}) {
@@ -48,6 +75,10 @@ export function syncGasMaster({ project, snapshot, dryRun = false }, {
   const cwd = path.join(temp, 'repo');
   const git = (...args) => checked(spawn, 'git', args, cwd);
   try {
+    const source = gasFiles(snapshot);
+    // 本番スナップショットの検査。clone より前に置き、巻き戻りを検知したら Git を一切触らない。
+    assertNoSecretRegression(source);
+    if (!source.has('appsscript.json')) throw new Error('本番 snapshot に appsscript.json がありません');
     const origin = checked(spawn, 'git', ['remote', 'get-url', 'origin'], project);
     if (!/^(?:https:\/\/github\.com\/|git@github\.com:)kimkon1011\/booth-production-app(?:\.git)?$/.test(origin)) throw new Error('制作アプリの origin が一致しません');
     const head = checked(spawn, 'git', ['rev-parse', 'HEAD'], project);
@@ -63,8 +94,7 @@ export function syncGasMaster({ project, snapshot, dryRun = false }, {
     git('checkout', '-b', branch, head);
     const target = path.join(cwd, 'src');
     fs.mkdirSync(target, { recursive: true });
-    const source = gasFiles(snapshot), existing = gasFiles(target);
-    if (!source.has('appsscript.json')) throw new Error('本番 snapshot に appsscript.json がありません');
+    const existing = gasFiles(target);
     for (const [key, file] of existing) if (!source.has(key)) fs.unlinkSync(path.join(target, file.relative));
     for (const [key, file] of source) {
       const dest = path.join(target, existing.get(key)?.relative || file.relative);
