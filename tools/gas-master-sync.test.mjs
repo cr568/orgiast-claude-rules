@@ -6,7 +6,7 @@ import path from 'node:path';
 import { BOOTH_SCRIPT, syncGasMaster } from './gas-master-sync.mjs';
 import { runOverlay } from './gas-overlay-push.mjs';
 
-function fixture(t, { ff = true, pushFail = false, claspFail = false, mismatch = false, staged = true } = {}) {
+function fixture(t, { ff = true, pushFail = false, claspFail = false, mismatch = false, staged = true, secret = false } = {}) {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'gas-sync-test-'));
   t.after(() => fs.rmSync(project, { recursive: true, force: true }));
   fs.mkdirSync(path.join(project, 'src'));
@@ -43,7 +43,8 @@ function fixture(t, { ff = true, pushFail = false, claspFail = false, mismatch =
   const runner = (args, { cwd }) => {
     if (args[0] === 'push') return { status: claspFail ? 1 : 0 };
     pulls++;
-    for (const [name, text] of Object.entries({ 'Code.js': pulls === 1 ? 'old' : 'new\n', 'appsscript.json': '{}', 'ProductionOnly.js': mismatch && pulls === 2 ? 'race' : 'live' })) fs.writeFileSync(path.join(cwd, 'src', name), text);
+    // secret: 本番スナップショットが T10 撤去前の直書きトークンをまだ運んでいる状態を再現する。
+    for (const [name, text] of Object.entries({ 'Code.js': pulls === 1 ? 'old' : 'new\n', 'appsscript.json': '{}', 'ProductionOnly.js': secret ? "const CASE_API_TOKEN_DEFAULT = '0123456789abcdef0123456789abcdef';\n" : (mismatch && pulls === 2 ? 'race' : 'live') })) fs.writeFileSync(path.join(cwd, 'src', name), text);
     return { status: 0 };
   };
   return { project, calls, run(dryRun = false) {
@@ -81,4 +82,11 @@ test('unselected production file changed during read-back → no git calls', t =
 });
 test('no staged difference skips commit but still pushes twice', t => {
   const f = fixture(t, { staged: false }); f.run(); assert.equal(f.calls.some(c => c[1] === 'commit'), false); assert.equal(f.calls.filter(c => c[1] === 'push').length, 2);
+});
+test('本番スナップショットが秘密トークン直書きを再導入する場合は Git を一切触らない', t => {
+  const f = fixture(t, { secret: true }); const r = f.run();
+  assert.equal(r.code, 0); assert.equal(r.result.readBack, 'ok'); assert.equal(r.result.gitSync.status, 'failed');
+  assert.match(r.result.gitSync.error, /T10 の巻き戻り/);
+  assert.match(r.result.gitSync.error, /ProductionOnly\.js: CASE_API_TOKEN_DEFAULT/);
+  assert.deepEqual(f.calls, []);
 });
