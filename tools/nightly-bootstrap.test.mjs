@@ -40,6 +40,7 @@ function runBootstrap(fix, target, args = [], extraEnv = {}, shell, bootstrap = 
     `$env:ORGIAST_NIGHTLY_REPO = ${psQuote(toWindowsPath(fix.repo))}`,
     `$env:PATH = ${psQuote(windowsPowerShellDir)}`,
     "$env:ORGIAST_NIGHTLY_NO_SELF_UPDATE = '1'",
+    "$env:ORGIAST_NIGHTLY_NO_GIT_FALLBACK = '1'",
     ...extraEnvLines,
     `& ${psQuote(bootstrapPath)} -Target ${psQuote(targetPath)}${shellArgument} -TargetArguments $args`,
     'exit $LASTEXITCODE',
@@ -55,6 +56,7 @@ function runBootstrap(fix, target, args = [], extraEnv = {}, shell, bootstrap = 
       HOME: toWindowsPath(fix.home),
       USERPROFILE: toWindowsPath(fix.home),
       PATH: windowsPowerShellDir,
+      ORGIAST_NIGHTLY_NO_GIT_FALLBACK: '1',
       ...extraEnv,
     },
   });
@@ -71,6 +73,7 @@ function runBootstrapAsync(fix, target, args = [], extraEnv = {}) {
     `$env:ORGIAST_NIGHTLY_REPO = ${psQuote(toWindowsPath(fix.repo))}`,
     `$env:PATH = ${psQuote(windowsPowerShellDir)}`,
     "$env:ORGIAST_NIGHTLY_NO_SELF_UPDATE = '1'",
+    "$env:ORGIAST_NIGHTLY_NO_GIT_FALLBACK = '1'",
     ...extraEnvLines,
     `& ${psQuote(toWindowsPath(script))} -Target ${psQuote(target)} -TargetArguments $args`,
     'exit $LASTEXITCODE',
@@ -87,6 +90,7 @@ function runBootstrapAsync(fix, target, args = [], extraEnv = {}) {
         HOME: toWindowsPath(fix.home),
         USERPROFILE: toWindowsPath(fix.home),
         PATH: windowsPowerShellDir,
+        ORGIAST_NIGHTLY_NO_GIT_FALLBACK: '1',
         ...extraEnv,
       },
     });
@@ -352,7 +356,8 @@ test('heartbeat is fail-open and runs before target extension dispatch', () => {
 
 test('missing target exits 1 and writes readable Japanese log', { skip: !hasPowerShell }, () => {
   const fix = fixture('missing');
-  const result = runBootstrap(fix, join(fix.dir, 'missing.ps1'));
+  // git 不在を再現する: 既定の設置先からの補完も止める（CI ランナーには C:\Program Files\Git がある）
+  const result = runBootstrap(fix, join(fix.dir, 'missing.ps1'), [], { ORGIAST_NIGHTLY_NO_GIT_FALLBACK: '1' });
   assert.equal(result.status, 1, result.stderr);
   const log = logText(fix);
   assert.match(log, /対象が見つからない/);
