@@ -297,6 +297,21 @@ export function fallbackBackendTimeoutSecs(timeoutSeconds, env = process.env) {
   return Math.max(60, Math.min(timeoutSeconds, wanted));
 }
 
+// タイムアウト時にプロセス木ごと殺す。Windows で shell:true のとき直接の子は cmd.exe なので、
+// child.kill() は cmd.exe だけを終わらせ、孫(gemini 等)が残る。孫が stdout パイプを握ったままだと
+// 'close' が発火せず、タイムアウトが実効しない
+// (2026-10-14 実測: 上限 600 秒の gemini-cli 試行が 4953 秒動き、1 回でチェーン全体 6153 秒を捨てた)。
+export function killProcessTree(child, { spawnImpl = spawnSync, platform = process.platform } = {}) {
+  if (!child || !child.pid) return;
+  if (platform === 'win32') {
+    try {
+      spawnImpl('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 10_000 });
+    } catch { /* 既に終了している */ }
+    return;
+  }
+  try { child.kill('SIGKILL'); } catch { /* 既に終了している */ }
+}
+
 export function buildQwenEnv(baseEnv, apiKey, { model = 'deepseek-chat', baseUrl = 'https://api.deepseek.com/v1' } = {}) {
   const env = { ...baseEnv };
   env.OPENAI_API_KEY = apiKey;
@@ -654,6 +669,8 @@ const treeBefore = treeSnapshot();
 const wantedEdit = !review && /実装|作って|修正|直して|追加して|リファクタ|refactor|fix|implement/i.test(instruction);
 const started = Date.now();
 let mockIndex = 0;
+
+
 function execute(command, commandArgs, options = {}) {
   if (process.env.CODEX_DO_MOCK_RESULTS) {
     try {
@@ -689,7 +706,7 @@ function execute(command, commandArgs, options = {}) {
     const timer = setTimeout(() => {
       timedOut = true;
       console.error(`\n⏱ ${command} が ${callTimeoutSeconds} 秒で応答を終えなかったので停止しました。--timeout で延長できます`);
-      child.kill('SIGKILL');
+      killProcessTree(child);
     }, callTimeoutSeconds * 1000);
     timer.unref?.();
     child.stdout.on('data', (chunk) => { outputChars += chunk.length; output += chunk.toString(); process.stdout.write(chunk); });

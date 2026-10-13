@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseHandoff } from './auto-session.mjs';
-import { applyAutoHeal, collectFindings, emptyOutputReason, isCooldownSkippedRow, isQuotaLimitedRow, parseRateLimitsFromText, readCodexUsedPercent, upsertFixTasks, windowResetsAfterLimit } from './delegation-health-check.mjs';
+import { applyAutoHeal, collectFindings, emptyOutputReason, isCooldownSkippedRow, isQuotaLimitedRow, lowYieldBackends, parseRateLimitsFromText, readCodexUsedPercent, upsertFixTasks, windowResetsAfterLimit } from './delegation-health-check.mjs';
 
 const NOW = new Date('2026-09-09T12:00:00.000Z');
 const homes = [];
@@ -712,4 +712,45 @@ test('cooldown 行しか無い窓で未試行が3件未満なら finding を出�
   const ids = collectFindings({ home: dir, now: NOW }).map((f) => f.id);
   assert.equal(ids.includes('provider_cooldown_skipped'), false);
   assert.equal(ids.includes('lane_outage_unrepaired'), false);
+});
+
+test('低成果は実際に秒数を使ったバックエンドへ帰属する（chain の timeout 秒数を末尾へ押し付けない）', () => {
+  const rows = [
+    { provider: 'fallback', model: 'cheap-code:deepseek/deepseek-v4-flash', secs: 6153, out: 0, status: 'timeout',
+      chain: [
+        { backend: 'gemini-cli', model: 'gemini-3.7-flash', secs: 4953, out: 0, outcome: 'timeout' },
+        { backend: 'cheap-code:deepseek', model: 'deepseek-v4-flash', secs: 600, out: 0, outcome: 'timeout' }] },
+    { provider: 'fallback', model: 'cheap-code:deepseek/deepseek-v4-flash', secs: 1425, out: 98, status: 'ok',
+      chain: [
+        { backend: 'gemini-cli', model: 'gemini-3.7-flash', secs: 637, out: 1149, outcome: 'timeout' },
+        { backend: 'cheap-code:deepseek', model: 'deepseek-v4-flash', secs: 187, out: 98, outcome: 'ok' }] },
+  ];
+  assert.equal(lowYieldBackends(rows).size, 0);
+});
+
+test('低成果の帰属先は実際に長時間だったバックエンドになる', () => {
+  const slow = (secs) => ({ provider: 'fallback', model: 'cheap-code:deepseek/deepseek-v4-flash', secs, out: 5,
+    chain: [{ backend: 'cheap-code:deepseek', model: 'deepseek-v4-flash', secs, out: 5, outcome: 'ok' }] });
+  const counts = lowYieldBackends([slow(1200), slow(1300), { provider: 'codex', model: 'gpt-5', secs: 5000, out: 0 }]);
+  assert.equal(counts.get('deepseek-v4-flash'), 2);
+  assert.equal(counts.size, 1);
+});
+
+test('chain を持たない旧形式の fallback 行は行そのままで判定する', () => {
+  const counts = lowYieldBackends([{ provider: 'fallback', model: 'gemini-cli', secs: 1000, out: 50 }]);
+  assert.equal(counts.get('gemini-cli'), 1);
+});
+
+test('低成果の chain 行だけでは fallback_low_yield を起票しない', () => {
+  const dir = home();
+  write(dir, 'executor-usage.jsonl', [
+    { t: '2026-09-09T10:00:00Z', provider: 'fallback', model: 'cheap-code:deepseek/deepseek-v4-flash', secs: 1425, out: 98,
+      chain: [{ backend: 'gemini-cli', model: 'gemini-3.7-flash', secs: 637, out: 1149, outcome: 'timeout' },
+        { backend: 'cheap-code:deepseek', model: 'deepseek-v4-flash', secs: 187, out: 98, outcome: 'ok' }] },
+    { t: '2026-09-09T10:30:00Z', provider: 'fallback', model: 'cheap-code:deepseek/deepseek-v4-flash', secs: 953, out: 102,
+      chain: [{ backend: 'gemini-cli', model: 'gemini-3.7-flash', secs: 846, out: 2289, outcome: 'timeout' },
+        { backend: 'cheap-code:deepseek', model: 'deepseek-v4-flash', secs: 106, out: 102, outcome: 'ok' }] },
+  ].map(row).join(''));
+  const findings = collectFindings({ home: dir, now: NOW });
+  assert.equal(findings.filter((f) => f.id === 'fallback_low_yield').length, 0);
 });

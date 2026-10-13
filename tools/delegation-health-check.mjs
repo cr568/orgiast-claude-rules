@@ -72,6 +72,29 @@ export function readCodexUsedPercent(options = {}) {
   } catch { return null; }
 }
 
+// フォールバックの「長時間なのに成果が無い」を、実際に秒数を使ったバックエンドへ帰属させる。
+// row.secs はチェーン全体、row.out / row.model は最後に走ったバックエンドの値なので、行そのままで
+// 判定すると前半の timeout が捨てた秒数を末尾のバックエンドの「長時間」と誤認する
+// (2026-10-14 診断: 低成果7件すべてが「gemini-cli の timeout + cheap-code:deepseek の短い成功」で、
+//  実際には 107〜311 秒で終わっている deepseek を毎晩起票していた。捨てた秒数は
+//  fallback_chain_timeout 側の症状)。chain があるときは timeout した試行を除いた各試行で、
+//  chain が無い旧形式の行は行そのもので判定する。戻り値は モデル名 → 件数。
+export function lowYieldBackends(rows = []) {
+  const counts = new Map();
+  for (const row of rows) {
+    if (row?.provider !== 'fallback') continue;
+    const attempts = Array.isArray(row.chain) && row.chain.length
+      ? row.chain.filter((a) => a && a.outcome !== 'timeout')
+      : [row];
+    for (const attempt of attempts) {
+      if (!(Number(attempt.secs) > 900 && Number(attempt.out) < 300)) continue;
+      const name = attempt.model || attempt.backend || '不明';
+      counts.set(name, (counts.get(name) || 0) + 1);
+    }
+  }
+  return counts;
+}
+
 function reasonTop(rows) {
   const counts = new Map();
   for (const row of rows) { const reason = String(row.reason || '理由不明'); counts.set(reason, (counts.get(reason) || 0) + 1); }
@@ -197,8 +220,14 @@ export function collectFindings({ home, now = new Date(), codexUsedPercent = nul
       evidence: [`${spawnFailed.length}件`, `model ${models}`, `code ${codes}`],
       fixTask: `フォールバック先(${models})の子プロセス起動が OS エラー(${codes})で失敗している。spawn の引数長・実行ファイルパスを確認し、再現テストを追加して修正` });
   }
-  const lowYield = usageRows.filter((row) => row.provider === 'fallback' && Number(row.secs) > 900 && Number(row.out) < 300);
-  if (lowYield.length >= 2) { const models = [...new Set(lowYield.map((row) => row.model || '不明'))].join(', '); findings.push({ id: 'fallback_low_yield', severity: 'medium', title: 'フォールバックの低成果', evidence: [`${lowYield.length}件`, `model ${models}`], fixTask: `フォールバック先(${models})が長時間走って成果が無い。codex-fallback-order.json の順序と各バックエンドの実効性を見直す` }); }
+  const lowYieldByBackend = lowYieldBackends(usageRows);
+  const lowYieldCount = [...lowYieldByBackend.values()].reduce((sum, count) => sum + count, 0);
+  if (lowYieldCount >= 2) {
+    const models = [...lowYieldByBackend.keys()].join(', ');
+    findings.push({ id: 'fallback_low_yield', severity: 'medium', title: 'フォールバックの低成果',
+      evidence: [`${lowYieldCount}件`, `model ${models}`],
+      fixTask: `フォールバック先(${models})が長時間走って成果が無い。codex-fallback-order.json の順序と各バックエンドの実効性を見直す` });
+  }
   const chainTimeout = usageRows.filter((row) => row.provider === 'fallback' && Array.isArray(row.chain)
     && row.chain.some((a) => a && a.outcome === 'timeout'));
   if (chainTimeout.length >= 2) {
