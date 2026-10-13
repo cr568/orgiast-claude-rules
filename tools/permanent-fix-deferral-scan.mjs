@@ -62,6 +62,17 @@ export function detect(text) {
   }).filter(Boolean).sort((a, b) => a.match.index - b.match.index);
 }
 
+// Stop hook の再入ガードで「評価せず記録」された行か。stop-gate-runner は stop_hook_active の
+// ときは判定せず verdict:'skipped' で台帳に書くだけ（tools/stop-gate-runner.mjs:119）。これは
+// セッションの手渡し判断ではなく、同じターンの直前に block として評価済みの行が二重に並んだもの。
+// 数えると実体のない先送りヒットが生まれる（2026-10-12T04:40:38Z / f5fc66f7 の W と
+// 04:50:42Z / 349e7edb の P3 がこれに当たり、どちらも同一セッションが数十秒〜17分後に
+// 作業を着地させていた）。
+export function unevaluated(entry) {
+  return entry?.verdict === 'skipped'
+    && Array.isArray(entry.reasonCodes) && entry.reasonCodes.includes('stop_hook_active');
+}
+
 const DEFAULT_SINCE = '1970-01-01T00:00:00Z';
 const NAMES = ['stop-gate-runner-ledger.jsonl', 'handoff-audit-ledger.jsonl', 'handoff-audit-nightly-ledger.jsonl'];
 
@@ -79,6 +90,8 @@ export function scan({ home = os.homedir(), since = DEFAULT_SINCE, until = null 
       if (!entry) continue;
       const at = Date.parse(entry.ts);
       if (!(at >= Date.parse(since)) || (until !== null && !(at < Date.parse(until)))) continue;
+      // ゲートが判定していない行は「手渡し」ではないので対象にしない（上記 unevaluated の説明）。
+      if (unevaluated(entry)) continue;
       const quotes = index === 0 ? [String(entry.excerpt ?? '')]
         : (Array.isArray(entry.violations) ? entry.violations : []).map(v => String(v?.quote ?? ''));
       let text = '';
