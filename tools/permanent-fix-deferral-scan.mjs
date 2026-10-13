@@ -29,8 +29,25 @@ const P1 = {
     return null;
   }
 };
-const P2 = /(次セッション|次回セッション|次回に|後日)[^」"'\n]{0,60}(実装|対応|修正|改修|恒久)/;
-const W  = /(数分|しばらく|少し|少々)[^」"'\n]{0,20}(お?待ち|待って)|完了を?待って|完了待ちで/;
+const AUDIT_MARKER = /\[handoff-audit:[0-9a-f]{16}\]|恒久修正の先送り文を検出（/;
+function isAuditCitation(text, index) {
+  const quoteStart = text.lastIndexOf('「', index);
+  if (quoteStart < 0 || text.indexOf('」', quoteStart + 1) < index) return false;
+  const before = text.slice(Math.max(0, quoteStart - 40), quoteStart);
+  if (AUDIT_MARKER.test(before)) return true;
+  // 実物の TODO はマーカーと引用の間に日時・session ID・判定を挟む。
+  const lineStart = Math.max(text.lastIndexOf('\n', quoteStart - 1) + 1, 0);
+  return AUDIT_MARKER.test(text.slice(lineStart, quoteStart)) &&
+    /（[^\r\n「」]*\）$/.test(text.slice(lineStart, quoteStart));
+}
+function auditAwareFind(regex, text) {
+  for (const match of text.matchAll(new RegExp(regex, 'g'))) {
+    if (!isAuditCitation(text, match.index)) return match;
+  }
+  return null;
+}
+const P2 = { find: text => auditAwareFind(/(次セッション|次回セッション|次回に|後日)[^」"'\n]{0,60}(実装|対応|修正|改修|恒久)/, text) };
+const W  = { find: text => auditAwareFind(/(数分|しばらく|少し|少々)[^」"'\n]{0,20}(お?待ち|待って)|完了を?待って|完了待ちで/, text) };
 const FIX = '実装|修正|改修|恒久|恒久化|修復|作り直';
 const HANDOFF_LINE = /次に\s*kim\s*がすること[:：][ \t]*([^\r\n]*)/;
 const HANDOFF_EMPTY = /^(なし|ありません|ありません。|特になし|無し)/;
@@ -39,7 +56,7 @@ const ASK_CONTEXT = /(恒久|配布|自動修復|実装|修正|改修|恒久化)
 const P3 = {
   find(text) {
     for (const match of text.matchAll(new RegExp(HANDOFF_LINE, 'g'))) {
-      if (!HANDOFF_EMPTY.test(match[1]) && new RegExp(FIX).test(match[1])) return match;
+      if (!isAuditCitation(text, match.index) && !HANDOFF_EMPTY.test(match[1]) && new RegExp(FIX).test(match[1])) return match;
     }
     return null;
   }
@@ -48,7 +65,7 @@ const P4 = {
   find(text) {
     for (const match of text.matchAll(new RegExp(ASK_PERMISSION, 'g'))) {
       const context = text.slice(Math.max(0, match.index - 60), match.index + match[0].length + 60);
-      if (ASK_CONTEXT.test(context)) return match;
+      if (!isAuditCitation(text, match.index) && ASK_CONTEXT.test(context)) return match;
     }
     return null;
   }
