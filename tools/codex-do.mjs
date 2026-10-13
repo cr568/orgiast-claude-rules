@@ -470,6 +470,34 @@ export function wslCodexLaunchPlan({ distroFound, codexPresent, versionOk, insta
   return allowNative ? 'native' : 'abort';
 }
 
+// Windows の npm グローバルは codex を shim(codex / codex.cmd / codex.ps1)として置くため、
+// shell:false の子プロセス起動では実体を走らせられない(2026-10-14 実測: 'codex' を渡すと
+// ENOENT、'codex.cmd' は EINVAL)。shell:true は引数がエスケープされず指示が壊れるので使えない(§1.17)。
+// 実体は npm パッケージ同梱の vendor/<target>/bin/codex.exe にあるため、それを直接起動する。
+// これが executor-usage.jsonl の「spawn codex ENOENT」(delegation-health の codex_spawn_failed)の原因。
+export function resolveWindowsCodexBinary(options = {}) {
+  if ((options.platform ?? process.platform) !== 'win32') return null;
+  const fsImpl = options.fsImpl ?? fs;
+  const pathImpl = options.pathImpl ?? path;
+  const env = options.env ?? process.env;
+  // 明示指定を最優先(別prefixに npm -g した場合の逃げ道)。
+  if (env.CODEX_BIN && fsImpl.existsSync(env.CODEX_BIN)) return env.CODEX_BIN;
+  const appData = env.APPDATA || env.LOCALAPPDATA;
+  if (!appData) return null;
+  const scope = pathImpl.join(appData, 'npm', 'node_modules', '@openai', 'codex', 'node_modules', '@openai');
+  for (const pkg of ['codex-win32-x64', 'codex-win32-arm64']) {
+    const vendor = pathImpl.join(scope, pkg, 'vendor');
+    let targets = [];
+    // target ディレクトリ名は arch 依存(x86_64-pc-windows-msvc 等)なので列挙して探す。
+    try { targets = fsImpl.readdirSync(vendor); } catch { continue; }
+    for (const target of targets) {
+      const exe = pathImpl.join(vendor, target, 'bin', 'codex.exe');
+      if (fsImpl.existsSync(exe)) return exe;
+    }
+  }
+  return null;
+}
+
 if (isEntry(import.meta.url)) {
 
 const args = process.argv.slice(2);
@@ -774,6 +802,16 @@ if (!useCodex) {
   process.exit(routed.provider ? 0 : (routed.result.status || 1));
 }
 
+// ネイティブ実行の起動コマンド。Windows では npm shim を直接 spawn できないため実体の .exe を使う。
+// 解決できないときだけ従来どおり PATH 上の 'codex' に落とし、ENOENT を台帳に残して次の修理に回す。
+function nativeCodexCommand() {
+  if (process.platform !== 'win32') return 'codex';
+  const resolved = resolveWindowsCodexBinary();
+  if (resolved) return resolved;
+  console.error('⚠️ ネイティブ codex の実体(vendor の codex.exe)が見つかりませんでした。PATH 上の codex をそのまま起動します（Windows の npm shim では ENOENT になります）');
+  return 'codex';
+}
+
 async function launchCodex(codexArgs) {
   let result;
 
@@ -844,13 +882,13 @@ async function launchCodex(codexArgs) {
       console.error('⚠️ WSL 経路が使えないため、--allow-native の指定によりネイティブ Windows codex で実行します。\nWindows 版は read-only サンドボックス固定でファイルを書けない既知の不具合(openai/codex#35428)があり、編集が保存されない可能性が高い。');
       const nativeArgs = [...codexArgs];
       if (!isInsideGitRepo(cwd)) nativeArgs.splice(-1, 0, '--skip-git-repo-check');
-      result = await execute('codex', nativeArgs, { cwd });
+      result = await execute(nativeCodexCommand(), nativeArgs, { cwd });
     }
   } else {
     if (process.platform === 'win32') console.error('⚠️ --force-native によりネイティブ Windows codex で実行します。編集が保存されない可能性があります');
     const nativeArgs = [...codexArgs];
     if (!isInsideGitRepo(cwd)) nativeArgs.splice(-1, 0, '--skip-git-repo-check');
-    result = await execute('codex', nativeArgs, { cwd });
+    result = await execute(nativeCodexCommand(), nativeArgs, { cwd });
   }
 
   return result;

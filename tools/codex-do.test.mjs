@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS, resolveWindowsCodexBinary } = await import('./codex-do.mjs');
 
 function run(args, options = {}) {
   return spawnSync(process.execPath, [tool, ...args], {
@@ -1528,4 +1528,47 @@ test('detectQuotaLimit: U+2019 の引用符つき usage limit 文言を検出す
   const r = detectQuotaLimit('', stderr, 1, '');
   assert.equal(r.matched, true);
   assert.equal(r.pattern, "You've hit your usage limit");
+});
+
+// 2026-10-14 診断: Windows の npm グローバルは codex を shim(codex / codex.cmd / codex.ps1)で置くため、
+// shell:false の spawn では実体を起動できず ENOENT(または EINVAL)で死ぬ。
+// 実測: spawn('codex')=ENOENT / spawn('codex.cmd')=EINVAL / spawn(vendor の codex.exe)=codex-cli 0.162.1。
+// これが executor-usage.jsonl の「spawn codex ENOENT」(delegation-health の codex_spawn_failed)の原因。
+test('resolveWindowsCodexBinary: npm 同梱の vendor/codex.exe を解決する', (t) => {
+  const appData = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbin-'));
+  t.after(() => fs.rmSync(appData, { recursive: true, force: true }));
+  const binDir = path.join(appData, 'npm', 'node_modules', '@openai', 'codex', 'node_modules', '@openai',
+    'codex-win32-x64', 'vendor', 'x86_64-pc-windows-msvc', 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  const exe = path.join(binDir, 'codex.exe');
+  fs.writeFileSync(exe, '');
+  assert.equal(resolveWindowsCodexBinary({ platform: 'win32', env: { APPDATA: appData } }), exe);
+});
+
+test('resolveWindowsCodexBinary: 実体が無ければ null を返し PATH 上の shim へ落とす', (t) => {
+  const appData = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbin-none-'));
+  t.after(() => fs.rmSync(appData, { recursive: true, force: true }));
+  assert.equal(resolveWindowsCodexBinary({ platform: 'win32', env: { APPDATA: appData } }), null);
+  // arm64 も同じ解決経路で拾えること(パッケージ名だけが違う)。
+  const binDir = path.join(appData, 'npm', 'node_modules', '@openai', 'codex', 'node_modules', '@openai',
+    'codex-win32-arm64', 'vendor', 'aarch64-pc-windows-msvc', 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  const exe = path.join(binDir, 'codex.exe');
+  fs.writeFileSync(exe, '');
+  assert.equal(resolveWindowsCodexBinary({ platform: 'win32', env: { APPDATA: appData } }), exe);
+});
+
+test('resolveWindowsCodexBinary: CODEX_BIN の明示指定を最優先する', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codexbin-override-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const custom = path.join(root, 'custom-codex.exe');
+  fs.writeFileSync(custom, '');
+  assert.equal(resolveWindowsCodexBinary({ platform: 'win32', env: { CODEX_BIN: custom, APPDATA: root } }), custom);
+  // 指定が実在しないときは無視して npm レイアウトの探索へ進む。
+  assert.equal(resolveWindowsCodexBinary({ platform: 'win32', env: { CODEX_BIN: path.join(root, 'nope.exe'), APPDATA: root } }), null);
+});
+
+test('resolveWindowsCodexBinary: Windows 以外では何も解決しない', () => {
+  assert.equal(resolveWindowsCodexBinary({ platform: 'linux', env: { APPDATA: 'X' } }), null);
+  assert.equal(resolveWindowsCodexBinary({ platform: 'darwin', env: { APPDATA: 'X' } }), null);
 });

@@ -27,11 +27,28 @@ function matchesNotDistributed(manifest, name) {
   return notDistributedEntries(manifest).some(([pattern]) => globToRegExp(pattern).test(name));
 }
 
-// リポジトリ直下の実体（.git / node_modules を除く）。git に依存せず readdir で取る。
+// .gitignore がルート直下を指すパターン(/name/ や /name)で無視している項目は、リポジトリの
+// 一部ではない環境ノイズなので分類対象から外す。 $env:LOCALAPPDATA 未設定の PowerShell が
+// repo 直下に掘る /Microsoft/ を毎回「未分類」で落としていた(2026-10-14 診断)。
+function ignoredTopLevelNames() {
+  let text = '';
+  try { text = fs.readFileSync(path.join(repoRoot, '.gitignore'), 'utf8'); } catch { return new Set(); }
+  const names = new Set();
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || line.startsWith('!')) continue;
+    const match = /^\/([^/*]+)\/?$/.exec(line);
+    if (match) names.add(match[1]);
+  }
+  return names;
+}
+
+// リポジトリ直下の実体（.git / node_modules / gitignore 済みを除く）。git に依存せず readdir で取る。
 function topLevelEntries() {
+  const ignored = ignoredTopLevelNames();
   return fs
     .readdirSync(repoRoot, { withFileTypes: true })
-    .filter((entry) => entry.name !== '.git' && entry.name !== 'node_modules')
+    .filter((entry) => entry.name !== '.git' && entry.name !== 'node_modules' && !ignored.has(entry.name))
     .map((entry) => entry.name);
 }
 
