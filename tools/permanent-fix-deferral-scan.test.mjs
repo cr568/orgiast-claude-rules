@@ -212,3 +212,16 @@ test('実インシデントの逐語（W）は verdict=skipped の再入行な�
   assert.equal(scan({ home }).sources[0].hits, 1);
   assert.equal(scan({ home }).sources[0].byPattern.W, 1);
 });
+
+test('指示・指摘の引用（実装指示／修正点／修正内容）はP3と誤検出しない', () => {
+  // 2026-10-14 の実測で P3 の過去ヒット 7/7 がこの型だった（真の先送りは 0 件）。
+  // いずれも「次に kim がすること」が承認・レビュー・コミットの依頼で、FIX 語は
+  // 指示や指摘を名詞で引用しただけ（実装指示 / 修正点 / 修正内容 / 修正指示）。
+  for (const quote of [
+    '次に kim がすること: 変更8ファイルをレビューし、問題なければ commit（実装指示により commit は監督側で実施）',
+    '次に kim がすること: 内容をご確認のうえ、問題なければコミット／次のタスクへ。修正点があれば指示を。',
+    '次に kim がすること: requirements.html を確認し、「承認」または修正指示を返信する。',
+    '次に kim がすること: issue にコメント1行（問題なければ `承認`／直したい箇所があれば修正内容）。',
+    '次に kim がすること: PR #21 を見て、ここで「OK」か、修正点を返してください。'
+  ]) assert.deepEqual(detect(quote).map(found => found.pattern), [], quote);
+});
