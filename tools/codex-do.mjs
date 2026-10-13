@@ -14,6 +14,7 @@ import { parseCodexResetUntil, providerCooldownMs, writeCodexCooldown } from './
 import { classifyTaskKind, CODEX_KINDS, TASK_KINDS } from './lib/task-kind.mjs';
 import { syncWslCodexAuth } from './lib/codex-wsl-auth-sync.mjs';
 import { EX_TEMPFAIL, budgetSummary, claudeFile, decideCodexGate, deferredPayload, isUsageLimitText, parseUsageLimitUntil, providerLimitedUntil, writeCodexCooldownFile } from './lib/executor-gate.mjs';
+import { coolingBackendNames, recordFallbackBackendOutcome, skipCoolingBackends } from './fallback-backend-health.mjs';
 
 // Windows の shell 経由起動では引数がクォートされないため、この値に空白を入れると
 // -p の値が割れて Gemini が使い方(ヘルプ)を出して終わる。空白を入れないこと。
@@ -958,7 +959,8 @@ if (quotaCheck.matched || escalationFailed || launchUnavailable) {
     if (quotaCheck.matched) console.error(`[codex-do] Codex usage limit detected: ${quotaCheck.pattern} at index ${quotaCheck.index}. Context: "${quotaCheck.snippet}"`);
     console.error(`[codex-do] Falling back to an agentic CLI...`);
 
-    const backends = resolveFallbackBackends(home);
+    const resolvedBackends = resolveFallbackBackends(home);
+    const backends = skipCoolingBackends(resolvedBackends, coolingBackendNames(home));
     if (backends.length === 0) {
       console.error('GEMINI_API_KEY、DEEPSEEK_API_KEY、OPENROUTER_API_KEY が無いためフォールバックを実行できません');
       result.status = 1;
@@ -1013,6 +1015,7 @@ if (quotaCheck.matched || escalationFailed || launchUnavailable) {
           outcome
         });
 
+        if (outcome === 'timeout') recordFallbackBackendOutcome(home, { backend: backend.name, outcome });
         if (result.timedOut) {
           console.error(`[codex-do] backend=${backend.name} が ${backendTimeout} 秒でタイムアウトしたため次のバックエンドへ移ります`);
           continue;
