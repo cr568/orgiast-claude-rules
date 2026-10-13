@@ -31,7 +31,18 @@ const P1 = {
 };
 const P2 = /(次セッション|次回セッション|次回に|後日)[^」"'\n]{0,60}(実装|対応|修正|改修|恒久)/;
 const W  = /(数分|しばらく|少し|少々)[^」"'\n]{0,20}(お?待ち|待って)|完了を?待って|完了待ちで/;
-const FIX = '実装|修正|改修|恒久|恒久化|修復|作り直';
+// 「実装指示」「修正点」「修正内容」のように、FIX 語の直後が名詞の用法は **指示・指摘の引用**で
+// あって先送りの行為ではない。2026-10-14 の実測で P3 の過去ヒット 7/7 がこの型
+// （実装→指示 / 修正→指示・点・内容）で、真の先送りは 1 件も無かった。行為形
+// （自動修復の恒久化を次回に回す／修正した／実装する）は引き続き検出する。
+const FIX_NOUN_AFTER = /^(指示|点|内容|事項|案|方針|予定|項目|対象|箇所)/;
+const FIX_WORDS = /実装|修正|改修|恒久|恒久化|修復|作り直/g;
+function handoffHasFixAction(line) {
+  for (const match of line.matchAll(FIX_WORDS)) {
+    if (!FIX_NOUN_AFTER.test(line.slice(match.index + match[0].length))) return true;
+  }
+  return false;
+}
 const HANDOFF_LINE = /次に\s*kim\s*がすること[:：][ \t]*([^\r\n]*)/;
 const HANDOFF_EMPTY = /^(なし|ありません|ありません。|特になし|無し)/;
 const ASK_PERMISSION = /(やりますか|進めますか|進めてよいか|よろしいですか|可否|判断してください|決めてください|選んでください)/;
@@ -39,7 +50,7 @@ const ASK_CONTEXT = /(恒久|配布|自動修復|実装|修正|改修|恒久化)
 const P3 = {
   find(text) {
     for (const match of text.matchAll(new RegExp(HANDOFF_LINE, 'g'))) {
-      if (!HANDOFF_EMPTY.test(match[1]) && new RegExp(FIX).test(match[1])) return match;
+      if (!HANDOFF_EMPTY.test(match[1]) && handoffHasFixAction(match[1])) return match;
     }
     return null;
   }
