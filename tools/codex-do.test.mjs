@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, nativeCodexWriteCapable, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, nativeCodexWriteCapable, nativeCodexInvocation, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
 
 function run(args, options = {}) {
   return spawnSync(process.execPath, [tool, ...args], {
@@ -980,6 +980,20 @@ test('WSL ディストリが無くても代替バックエンドがあるなら�
 // 2026-10-14 作業用011: WSL ディストリ 0 件（BIOS の VT-x 無効で WSL2 自体が入らない）でも、
 // native codex が書き込める設定の機械では codex レーンを生かす。WSL 不在で毎回あきらめて
 // launched:false の行を残すと delegation-health の codex_lane_unavailable が起票され続ける。
+test('nativeCodexInvocation: Windows は .cmd を避け、node + JS エントリで起動する', () => {
+  // 2026-10-14 実測: spawn('codex') は PATHEXT 未解決で ENOENT、.cmd を渡すと Node 24 が EINVAL。
+  assert.deepEqual(nativeCodexInvocation({ platform: 'linux' }), { command: 'codex', prefixArgs: [] });
+  const appData = 'C:\\Users\\x\\AppData\\Roaming';
+  const entry = path.join(appData, 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+  assert.deepEqual(
+    nativeCodexInvocation({ platform: 'win32', env: { APPDATA: appData }, execPath: 'node.exe', existsImpl: () => true }),
+    { command: 'node.exe', prefixArgs: [entry] },
+  );
+  // 実体が無い／APPDATA が無い機械は従来どおり 'codex' に倒す
+  assert.deepEqual(nativeCodexInvocation({ platform: 'win32', env: { APPDATA: appData }, existsImpl: () => false }), { command: 'codex', prefixArgs: [] });
+  assert.deepEqual(nativeCodexInvocation({ platform: 'win32', env: {}, existsImpl: () => true }), { command: 'codex', prefixArgs: [] });
+});
+
 test('WSL が無くても native codex に書き込める設定なら codex で実行する', { skip: process.platform !== 'win32' }, (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-nativeauto-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));

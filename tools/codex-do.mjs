@@ -503,6 +503,22 @@ export function nativeWriteAutoAllowed({ env = process.env } = {}) {
   return nativeCodexWriteCapable();
 }
 
+// Windows の codex は npm が置く .cmd シムで、shell を介さない spawn からは起動できない。
+// ENOENT（Node が PATHEXT を解決しない）に加え、Node 24 は .cmd/.bat を shell 無しで spawn すると
+// EINVAL で拒否する（CVE-2024-27980 の対策）。shell:true は指示やパスがシェル解釈されるため使わず、
+// シムが最終的に呼ぶ JS エントリを node で直接起動する
+// （2026-10-14 実測: 作業用011 で launched:true / out:0 / "spawn codex ENOENT" → .cmd で EINVAL。
+// native 経路のテストは CODEX_DO_MOCK_RESULTS で spawn 自体を差し替えていたため実機で露見していなかった）。
+export function nativeCodexInvocation({ platform = process.platform, env = process.env, execPath = process.execPath, existsImpl = fs.existsSync } = {}) {
+  if (platform !== 'win32') return { command: 'codex', prefixArgs: [] };
+  const base = env.APPDATA;
+  if (base) {
+    const entry = path.join(base, 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+    if (existsImpl(entry)) return { command: execPath, prefixArgs: [entry] };
+  }
+  return { command: 'codex', prefixArgs: [] };
+}
+
 if (isEntry(import.meta.url)) {
 
 const args = process.argv.slice(2);
@@ -883,13 +899,15 @@ async function launchCodex(codexArgs) {
         : '⚠️ WSL 経路が使えないため、ネイティブ Windows codex で実行します（~/.codex/config.toml の [windows] sandbox = "unelevated" を確認済み。openai/codex#35428 の回避設定）。');
       const nativeArgs = [...codexArgs];
       if (!isInsideGitRepo(cwd)) nativeArgs.splice(-1, 0, '--skip-git-repo-check');
-      result = await execute('codex', nativeArgs, { cwd });
+      const nativeInvocation = nativeCodexInvocation();
+      result = await execute(nativeInvocation.command, [...nativeInvocation.prefixArgs, ...nativeArgs], { cwd });
     }
   } else {
     if (process.platform === 'win32') console.error('⚠️ --force-native によりネイティブ Windows codex で実行します。編集が保存されない可能性があります');
     const nativeArgs = [...codexArgs];
     if (!isInsideGitRepo(cwd)) nativeArgs.splice(-1, 0, '--skip-git-repo-check');
-    result = await execute('codex', nativeArgs, { cwd });
+    const nativeInvocation = nativeCodexInvocation();
+    result = await execute(nativeInvocation.command, [...nativeInvocation.prefixArgs, ...nativeArgs], { cwd });
   }
 
   return result;
