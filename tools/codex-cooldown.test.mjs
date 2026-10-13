@@ -55,6 +55,18 @@ test('providerResetUntil は7日超の絶対日時を fallbackMs へ戻す', () 
   assert.equal(providerResetUntil('resets at 2027-01-26 18:44', now), now + 5 * HOUR);
 });
 
+// 2026-10-13 実測: glm(z.ai Coding Plan)の 429 本文は「will reset at」の**単数形**で、
+// 秒付きの絶対日時を出す。この値が glm の復帰時刻(provider-cooldown.json の until)を
+// そのまま決めるため、7日以内の絶対日時が 5h の fallback へ落ちないことを固定する。
+// 落ちると cooldown が 5h ごとに明けては週次上限に当たり直す空回りになる。
+test('providerResetUntil は z.ai の reset at YYYY-MM-DD HH:MM:SS をローカル時刻で解釈する', () => {
+  const now = new Date(2026, 9, 13, 16, 15, 0).getTime();
+  const text = 'glm:glm-5.3 HTTP429: {"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-10-15 19:53:29"}}';
+  assert.equal(providerResetUntil(text, now), new Date(2026, 9, 15, 19, 53, 29).getTime());
+  // 秒が無い形でも同じ日時として読む
+  assert.equal(providerResetUntil('Your limit will reset at 2026-10-15 19:53', now), new Date(2026, 9, 15, 19, 53, 0).getTime());
+});
+
 test('parseCodexResetUntil は年明示の過去日時なら now を返す', () => {
   const now = new Date(2026, 8, 8, 20, 0).getTime();
   assert.equal(parseCodexResetUntil('try again at Sep 7th, 2026 11:27 AM', now), now);
