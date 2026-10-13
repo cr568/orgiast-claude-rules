@@ -37,8 +37,25 @@ function Write-NightlyLog([string]$Step, [string]$Result) {
     }
 }
 
+function Send-NightlyHeartbeat([string]$StartedAt, [bool]$Ok, [string]$Summary) {
+    try {
+        $heartbeatScript = Join-Path $repo 'tools\lib\heartbeat.mjs'
+        if (-not (Test-Path -LiteralPath $heartbeatScript -PathType Leaf)) { $heartbeatScript = Join-Path $HOME '.claude\tools\lib\heartbeat.mjs' }
+        if (-not (Test-Path -LiteralPath $heartbeatScript -PathType Leaf)) { return }
+        $okText = if ($Ok) { 'true' } else { 'false' }
+        # 空文字の引数を渡すと後続の --xxx を値として食ってしまう(startedAt が "--finishedAt" になる)ので、
+        # 空のときは --startedAt 自体を組み立てない。
+        $heartbeatArgs = @('--job', 'nightly-bootstrap')
+        if (-not [string]::IsNullOrEmpty($StartedAt)) { $heartbeatArgs += @('--startedAt', $StartedAt) }
+        $heartbeatArgs += @('--finishedAt', (Get-Date -Format 'o'), '--ok', $okText, '--cycleMinutes', '1440')
+        if (-not [string]::IsNullOrEmpty($Summary)) { $heartbeatArgs += @('--summary', $Summary) }
+        & node $heartbeatScript @heartbeatArgs 2>$null | Out-Null
+    } catch { }
+}
+
 function Stop-Nightly([string]$Step, [string]$Result, [int]$Code) {
     Write-NightlyLog $Step $Result
+    Send-NightlyHeartbeat -StartedAt $nightlyStartedAt -Ok $false -Summary ("error:" + $Step + " " + $Result)
     exit $Code
 }
 
@@ -79,6 +96,9 @@ function Get-NightlyFileSha256([string]$Path) {
 
 try {
     Write-NightlyLog 'nightly-bootstrap' 'ok:開始'
+
+    # 早期の Stop-Nightly(対象確認など)でも終了ハートビートに開始時刻を載せられるよう、最初に取る。
+    $nightlyStartedAt = (Get-Date -Format 'o')
 
     $repo = if ($env:ORGIAST_NIGHTLY_REPO) {
         $env:ORGIAST_NIGHTLY_REPO
@@ -298,7 +318,7 @@ try {
         $heartbeatScript = Join-Path $repo 'tools\lib\heartbeat.mjs'
         if (-not (Test-Path -LiteralPath $heartbeatScript -PathType Leaf)) { $heartbeatScript = Join-Path $HOME '.claude\tools\lib\heartbeat.mjs' }
         if (Test-Path -LiteralPath $heartbeatScript -PathType Leaf) {
-            & node $heartbeatScript --job nightly-bootstrap --startedAt (Get-Date -Format 'o') 2>$null | Out-Null
+            & node $heartbeatScript --job nightly-bootstrap --startedAt $nightlyStartedAt 2>$null | Out-Null
         }
     } catch { }
 
@@ -330,8 +350,10 @@ try {
     }
 
     Write-NightlyLog '対象実行' ("ok:" + [IO.Path]::GetFileName($targetPath) + " 終了コード=" + $targetExitCode)
+    Send-NightlyHeartbeat -StartedAt $nightlyStartedAt -Ok $true -Summary ("対象=" + [IO.Path]::GetFileName($targetPath) + " 終了コード=" + $targetExitCode)
     exit $targetExitCode
 } catch {
     try { Write-NightlyLog 'nightly-bootstrap' ("error:" + $_.Exception.Message) } catch { }
+    Send-NightlyHeartbeat -StartedAt $nightlyStartedAt -Ok $false -Summary ("error:" + $_.Exception.Message)
     exit 1
 }
