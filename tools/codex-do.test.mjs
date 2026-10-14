@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
 
 const runDirs = [];
 function workDir() {
@@ -119,6 +119,25 @@ test('fallbackBackendTimeoutSecs は全体枠・既定値・環境変数・下�
   assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 900);
   assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: 'garbage' }), 600);
   assert.equal(fallbackBackendTimeoutSecs(10, {}), 60);
+});
+
+test('chainBackendBudgetSecs は連鎖の残り予算を超えない（全体枠を使い切ったら0で打ち切る）', () => {
+  // 1本目が未消費: これまでどおり1バックエンド上限(600)が効く
+  assert.equal(chainBackendBudgetSecs(1800, 0, {}), 600);
+  // 全体枠600を1本目で使い切った: 2本目に渡す予算は無い（従来は最大1200秒を消費していた）
+  assert.equal(chainBackendBudgetSecs(600, 600.047, {}), 0);
+  assert.equal(chainBackendBudgetSecs(600, 601, {}), 0);
+  // 全体枠1800のうち600秒消費: 残り1200だが1バックエンド上限600が効く
+  assert.equal(chainBackendBudgetSecs(1800, 600, {}), 600);
+  // 残りが上限より小さいときは残りが上限になる
+  assert.equal(chainBackendBudgetSecs(1800, 1650, {}), 150);
+  // 残りが下限(60)未満でも残りを返し、0 以下は 0（呼び出し側が打ち切る）
+  assert.equal(chainBackendBudgetSecs(1800, 1790, {}), 10);
+  assert.equal(chainBackendBudgetSecs(1800, 1800, {}), 0);
+  assert.equal(chainBackendBudgetSecs(1800, 1801, {}), 0);
+  // 環境変数の上限は残り予算にも反映される
+  assert.equal(chainBackendBudgetSecs(1800, 0, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 900);
+  assert.equal(chainBackendBudgetSecs(1800, 1500, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 300);
 });
 
 test('指示が空なら使い方を出して終了する', () => {

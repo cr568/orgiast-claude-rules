@@ -360,6 +360,16 @@ export function killProcessTree(child, { spawnImpl = spawnSync, platform = proce
   try { child.kill('SIGKILL'); } catch { /* 既に終了している */ }
 }
 
+// フォールバック連鎖の残り予算。1バックエンドの上限(既定900秒)をそのまま次のバックエンドにも
+// 与えると、--timeout 600 で2バックエンドなら最大1200秒＝指定した全体枠の2倍を消費しうる。
+// 先に走った分を差し引き、残りが無ければ 0 を返して打ち切る（低成果のタイムアウトで
+// 時間を捨て続けるのを止める。2026-10-15）。
+export function chainBackendBudgetSecs(timeoutSeconds, elapsedSecs, env = process.env) {
+  const remaining = Math.floor(Number(timeoutSeconds) - Number(elapsedSecs));
+  if (!Number.isFinite(remaining) || remaining <= 0) return 0;
+  return Math.min(fallbackBackendTimeoutSecs(timeoutSeconds, env), remaining);
+}
+
 export function buildQwenEnv(baseEnv, apiKey, { model = 'deepseek-chat', baseUrl = 'https://api.deepseek.com/v1' } = {}) {
   const env = { ...baseEnv };
   env.OPENAI_API_KEY = apiKey;
@@ -1054,9 +1064,14 @@ if (quotaCheck.matched || escalationFailed || launchUnavailable) {
       console.error('GEMINI_API_KEY、DEEPSEEK_API_KEY、OPENROUTER_API_KEY が無いためフォールバックを実行できません');
       result.status = 1;
     } else {
-      const backendTimeout = fallbackBackendTimeoutSecs(timeoutSeconds);
+      const chainStarted = Date.now();
       fallbackChain = [];
       for (const backend of backends) {
+        const backendTimeout = chainBackendBudgetSecs(timeoutSeconds, (Date.now() - chainStarted) / 1000);
+        if (backendTimeout <= 0) {
+          console.error(`[codex-do] フォールバック全体の時間枠(${timeoutSeconds}秒)を使い切ったため、残りのバックエンドは実行しません`);
+          break;
+        }
         const attemptStarted = Date.now();
         lastBackend = backend;
         console.log(`[codex-do] fallback backend=${backend.name} model=${backend.model}`);
