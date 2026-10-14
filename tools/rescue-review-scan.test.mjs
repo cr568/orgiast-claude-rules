@@ -4,16 +4,27 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { scanRescueBranches } from './rescue-review-scan.mjs';
 
-// import.meta.url からスクリプトのディレクトリを求める(fileURLToPath 相当)。
+// import.meta.url からスクリプトのディレクトリを求める。
+// 手組みの file:// 剥がしは POSIX で先頭スラッシュまで削れて path.resolve が cwd 相対になり、
+// パスが二重化して MODULE_NOT_FOUND になる(Windows では C:/ が残るため再現しない)。
 function dirOf(metaUrl) {
-  let self = metaUrl;
-  if (self.startsWith('file:///')) self = self.slice('file:///'.length);
-  else if (self.startsWith('file://')) self = self.slice('file://'.length);
-  self = decodeURIComponent(self).replace(/^\/([A-Za-z]:)/, '$1');
-  return path.dirname(path.resolve(self));
+  return path.dirname(fileURLToPath(metaUrl));
 }
+
+// 回帰ガード: 求めたスクリプトパスは絶対パスで実在し、cwd を変えても変わらない。
+// 旧実装は POSIX で cwd を前置して二重化した(Linux CI でのみ再現)。
+test('dirOf の解決結果は絶対パスで実在し cwd に依存しない', t => {
+  const before = dirOf(import.meta.url);
+  assert.ok(path.isAbsolute(before), `not absolute: ${before}`);
+  assert.ok(fs.existsSync(path.join(before, 'rescue-review-scan.mjs')));
+  const cwd = process.cwd();
+  t.after(() => process.chdir(cwd));
+  process.chdir(os.tmpdir());
+  assert.equal(dirOf(import.meta.url), before);
+});
 
 // 実 git を叩く既定実装と同じシグネチャ (dir, args) の関数。
 function realGit(dir, args) {

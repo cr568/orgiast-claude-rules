@@ -4,6 +4,7 @@
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 // git の既定実装。dir で git を実行し stdout を返す。失敗時は例外を投げる。
 function defaultGit(dir, args) {
@@ -138,18 +139,16 @@ function run(argv) {
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
-// fileURLToPath 相当を node:path だけで賄い、CLI 直接実行時のみ run する。
+// CLI 直接実行時のみ run する。
+// 手組みの file:// 剥がしは POSIX で先頭スラッシュまで削れて path.resolve が cwd 相対になり、
+// 常に「メインモジュールでない」と誤判定して無言で何も出力しなくなる。
 function isMainModule() {
   if (!process.argv[1]) return false;
   const invoked = path.resolve(process.argv[1]);
-  let self = import.meta.url;
-  if (self.startsWith('file:///')) self = self.slice('file:///'.length);
-  else if (self.startsWith('file://')) self = self.slice('file://'.length);
-  self = decodeURIComponent(self).replace(/^\/([A-Za-z]:)/, '$1');
-  const resolvedSelf = path.resolve(self);
+  const self = fileURLToPath(import.meta.url);
   return process.platform === 'win32'
-    ? resolvedSelf.toLowerCase() === invoked.toLowerCase()
-    : resolvedSelf === invoked;
+    ? self.toLowerCase() === invoked.toLowerCase()
+    : self === invoked;
 }
 
 if (isMainModule()) {
