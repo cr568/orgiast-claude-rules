@@ -39,7 +39,7 @@
     "pattern": "API キー/接続文字列/ID が要る",
     "route": "過去 transcript・.env.local・production bundle・keyserve から復元。user に再聞き禁止",
     "confidence": "high",
-    "source": "feedback-credentials-never-reask-universal"
+    "source": "feedback-credentials-never-reask-universal ／ 2026-10-15 再検証（handoff-audit:0ab11a96de53cc66）: 窓 2026-09-17〜10-15 でクレデンシャル再聞き 0 件（台帳 495 行・assistant turn 7,826 を実走査、検出器 selftest 10/10）。再発監査は `node tools/handoff-audit-credential-reask-scan.mjs --since <日付>`（読み取り専用）で可能。詳細 tools/handoff-audit-findings-credential-reask-recheck.md"
   },
   {
     "pattern": "GAS の関数実行が要る",
