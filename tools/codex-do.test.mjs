@@ -114,21 +114,24 @@ test('--timeout と --cwd を付けても指示文が引数として食われな
 });
 
 test('fallbackBackendTimeoutSecs は全体枠・既定値・環境変数・下限を反映する', () => {
-  assert.equal(fallbackBackendTimeoutSecs(1800, {}), 600);
+  // 既定は 900 秒（2026-10-15: 600 では全体枠に余裕があっても打ち切って時間を捨てていた）
+  assert.equal(fallbackBackendTimeoutSecs(1800, {}), 900);
+  // 全体枠が既定より小さいときは全体枠が上限になる（総予算は超えない）
+  assert.equal(fallbackBackendTimeoutSecs(600, {}), 600);
   assert.equal(fallbackBackendTimeoutSecs(300, {}), 300);
   assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 900);
-  assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: 'garbage' }), 600);
+  assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: 'garbage' }), 900);
   assert.equal(fallbackBackendTimeoutSecs(10, {}), 60);
 });
 
 test('chainBackendBudgetSecs は連鎖の残り予算を超えない（全体枠を使い切ったら0で打ち切る）', () => {
-  // 1本目が未消費: これまでどおり1バックエンド上限(600)が効く
-  assert.equal(chainBackendBudgetSecs(1800, 0, {}), 600);
+  // 1本目が未消費: これまでどおり1バックエンド上限(既定900)が効く
+  assert.equal(chainBackendBudgetSecs(1800, 0, {}), 900);
   // 全体枠600を1本目で使い切った: 2本目に渡す予算は無い（従来は最大1200秒を消費していた）
   assert.equal(chainBackendBudgetSecs(600, 600.047, {}), 0);
   assert.equal(chainBackendBudgetSecs(600, 601, {}), 0);
-  // 全体枠1800のうち600秒消費: 残り1200だが1バックエンド上限600が効く
-  assert.equal(chainBackendBudgetSecs(1800, 600, {}), 600);
+  // 全体枠1800のうち600秒消費: 残り1200だが1バックエンド上限900が効く
+  assert.equal(chainBackendBudgetSecs(1800, 600, {}), 900);
   // 残りが上限より小さいときは残りが上限になる
   assert.equal(chainBackendBudgetSecs(1800, 1650, {}), 150);
   // 残りが下限(60)未満でも残りを返し、0 以下は 0（呼び出し側が打ち切る）
