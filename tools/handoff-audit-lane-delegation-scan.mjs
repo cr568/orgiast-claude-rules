@@ -26,6 +26,9 @@
  *             監査 TODO 文そのものは除外する（毎セッションのプロンプトに入るため、数えると
  *             自己言及で膨らむ）。委譲はしたが完了している turn（例: `委譲判定: 実装=Codex（完了）`）
  *             は RUNNING 語が無いので近接共起で自動的に落ちる。
+ *             定型の注入バナー（`**[委譲判定]** …` は DELEG 語、`**[夜間判定]** …` は RUNNING 語
+ *             「待機」を含む）は判定前に除去する。両者が全 turn に必ず入るため、素で見ると
+ *             機械的に共起して偽陽性になる（2026-10-15 の実測 FP 6 件中 5 件がこれ）。
  *
  * 使い方:
  *   node tools/handoff-audit-lane-delegation-scan.mjs                    # 既定窓(28日前〜現在)
@@ -70,17 +73,27 @@ const det = new RegExp(
 // （要件は半角 `/` を指定しているが、プロンプト本文では全角 `／` でも現れるため両対応にする）。
 const AUDIT_TODO = /サブエージェント[/／]他AIレーンへ実装を委譲して/;
 
+// 全 turn に必ず入る定型バナー。`**[委譲判定]** …` は DELEG 語（委譲）、
+// `**[夜間判定]** …` は RUNNING 語（待機）を含むため、除かないと機械的に共起して偽陽性になる。
+// 行末まで除去する（バナーは 1 行に収まる）。
+const BANNER = /\*\*\[(?:委譲判定|夜間判定)\]\*\*[^\n]*/g;
+
+/** 定型バナー行を空白に置換した本文（判定・根拠表示はこちらを使う）。 */
+export function stripBanners(text) {
+  return String(text || '').replace(BANNER, ' ');
+}
+
 /** 1 turn の本文が「委譲して実行中で終えた」型かを判定する。 */
 export function detect(text) {
-  const t = String(text || '');
-  if (!t) return false;
+  const t = stripBanners(text);
+  if (!t.trim()) return false;
   if (AUDIT_TODO.test(t)) return false;
   return det.test(t);
 }
 
-/** 一致した部分文字列（人手分類の根拠）。 */
+/** 一致した部分文字列（人手分類の根拠）。バナー由来の一致は根拠にしない。 */
 export function firstMatch(text) {
-  const m = det.exec(String(text || ''));
+  const m = det.exec(stripBanners(text));
   return m ? m[0] : '';
 }
 
@@ -96,6 +109,8 @@ export const CONTROLS = [
   { name: 'N3 実行中語のみ（委譲語なし）', text: '実行中のプロセスは kill されるため run_in_background は禁止です。', want: false },
   { name: 'N4 委譲語も実行中語も無い', text: '実装は完了し、テストは全件 PASS しました。', want: false },
   { name: 'N5 遠く離れた語（同一 turn でも非近接）', text: 'Codex に委譲しました。' + 'あ'.repeat(200) + 'この処理が実行中かは不明です。', want: false },
+  { name: 'N6 注入バナーのみ（委譲判定＋夜間判定の共起）', text: '実装は数行なので自分で行います。\n**[委譲判定]** 自分で実施（理由: 数行/設定/設計試行錯誤中）\n**[夜間判定]** 即時実行（理由: 締切が近く、待機理由なし）\n', want: false },
+  { name: 'P6 バナー＋本物の委譲実行中は陽性のまま', text: '**[委譲判定]** 実装=Codex（理由: 定型の量産）\n**[夜間判定]** 即時実行（理由: 待機理由なし）\nCodex に委譲しました（バックグラウンド実行中 ID: b3kw1ixab）。\n', want: true },
 ];
 
 export function selftest() {
@@ -112,9 +127,11 @@ export function scan({ home = os.homedir(), since = Date.now(), readFile = fs.re
   const rows = [];
   const push = (src, ts, id, text) => {
     if (!(Date.parse(ts) >= since)) return; // turn の時刻で窓を判定（ファイル mtime の混入を防ぐ）
-    const t = String(text || '').replace(/[\r\n]+/g, ' ').trim();
-    if (!detect(t)) return;
-    rows.push({ src, ts, id, match: firstMatch(t).slice(0, 200), text: t.slice(0, 320) });
+    const raw = String(text || '');
+    // 改行を潰す前に判定する（バナー除去が行単位のため。潰した後では行末が拾えない）。
+    if (!detect(raw)) return;
+    const t = stripBanners(raw).replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+    rows.push({ src, ts, id, match: firstMatch(raw).replace(/\s+/g, ' ').slice(0, 200), text: t.slice(0, 320) });
   };
 
   const ledgerFile = path.join(home, '.claude', 'handoff-audit-ledger.jsonl');
