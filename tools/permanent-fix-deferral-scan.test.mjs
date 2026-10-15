@@ -201,6 +201,20 @@ test('実現可能性の名詞「〜可否」はP4と誤検出しない', () => 
   ]) assert.deepEqual(detect(quote).map(found => found.pattern), [], quote);
 });
 
+test('検出結果そのものを引用した検証 handoff は再検出しない', () => {
+  // 実測原文（stop-gate-runner-ledger.jsonl / 2026-10-13T18:04:42.788Z / セッション 599d5772）。
+  // 先送りを実行した文ではなく、検出器の出力（パターン名 `W` と一致語 "完了待ちで"）を引いた検証報告。
+  const quote = '**やったこと:** 該当 handoff の原文再現と全台帳走査で再発の有無を実測し、検出器が自分の監査 TODO を引用文ごと再検出する経路を Codex レーンで塞いだ（記録 + PR #767）。\n**検証したこと:** 原文は `W`/`"完了待ちで"` で再現、以降のヒットは 3 件。';
+  assert.deepEqual(detect(quote), []);
+});
+
+test('パターン名を伴わない引用文の待機語は引き続き検出する', () => {
+  for (const quote of [
+    '「納品の完了を待って」とだけ返事が来ました。',
+    'pattern=W の一致語は "完了待ちで" です。' // pattern= 形式も引用として扱う
+  ]) assert.deepEqual(detect(quote).map(found => found.pattern), quote.startsWith('pattern=') ? [] : ['W'], quote);
+});
+
 test('疑問節つきの「可否」は引き続きP4で検出する', () => {
   for (const quote of [
     '次に kim がすること: 自動修復を付けてよいかの可否。',

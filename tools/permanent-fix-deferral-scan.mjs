@@ -40,9 +40,25 @@ function isAuditCitation(text, index) {
   return AUDIT_MARKER.test(text.slice(lineStart, quoteStart)) &&
     /（[^\r\n「」]*\）$/.test(text.slice(lineStart, quoteStart));
 }
+// 監査 TODO の引用（isAuditCitation）とは別に、検証セッションの handoff が検出結果そのものを
+// 引用する形がある。実測（2026-10-13T18:04:42.788Z / 599d5772）: `原文は \`W\`/"完了待ちで" で再現`。
+// これは先送りを実行した文ではなく検出器の出力をデータとして引いた文なので、一致がその引用スパンの
+// 内側にあり、開き引用符の手前にパターン名（P1-P4/W）がある場合だけ採用しない。パターン名の前置きを
+// 条件にするのは、素の引用文（「…完了を待っています」）を巻き込まないため。
+const QUOTE_PAIRS = [['「', '」'], ['"', '"'], ["'", "'"]];
+const PATTERN_TOKEN = /(?:^|[^A-Za-z0-9])(P1|P2|P3|P4|W)(?![A-Za-z0-9])/;
+function isPatternNameQuote(text, index) {
+  return QUOTE_PAIRS.some(([open, close]) => {
+    const start = text.lastIndexOf(open, index);
+    if (start < 0 || start === index) return false;
+    if (text.indexOf(close, index) < 0) return false;
+    return PATTERN_TOKEN.test(text.slice(Math.max(0, start - 40), start));
+  });
+}
 function auditAwareFind(regex, text) {
   for (const match of text.matchAll(new RegExp(regex, 'g'))) {
-    if (!isAuditCitation(text, match.index)) return match;
+    if (isAuditCitation(text, match.index) || isPatternNameQuote(text, match.index)) continue;
+    return match;
   }
   return null;
 }
