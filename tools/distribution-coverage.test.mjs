@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -27,11 +29,45 @@ function matchesNotDistributed(manifest, name) {
   return notDistributedEntries(manifest).some(([pattern]) => globToRegExp(pattern).test(name));
 }
 
-// リポジトリ直下の実体（.git / node_modules を除く）。git に依存せず readdir で取る。
+// git が「未追跡かつ .gitignore 済み」と判定した最上位項目名を、ls-files の
+// NUL 区切り出力から取り出す。'Microsoft/' のようなディレクトリは末尾の '/' を落として
+// 先頭セグメントだけを名前として扱う（純関数にしてテストから直接呼べるようにする）。
+function rootNamesFromIgnoredList(stdout) {
+  return new Set(
+    String(stdout)
+      .split('\0')
+      .filter(Boolean)
+      .map((entry) => entry.replace(/\/$/, '').split('/')[0]),
+  );
+}
+
+// $env:LOCALAPPDATA 未設定の PowerShell が repo 直下に掘る /Microsoft/ のような
+// マシンローカルな環境ノイズは、リポジトリの一部ではないので分類対象から外す。
+// 追跡済みの項目は返らない（--others は未追跡のみ）ため、本来の配布対象は影響を受けない。
+function ignoredTopLevelNames(root = repoRoot) {
+  try {
+    // --others: 未追跡のみ / --ignored --exclude-standard: .gitignore で無視されたもの
+    // --directory: 中身に降りず最上位名だけ（node_modules 等で列挙が膨らむのを防ぐ）
+    const result = spawnSync(
+      'git',
+      ['-C', root, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'],
+      { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
+    );
+    if (result.status !== 0 || !result.stdout) return new Set();
+    return rootNamesFromIgnoredList(result.stdout);
+  } catch {
+    return new Set(); // git が無い環境ではフィルタせず従来どおり判定する
+  }
+}
+
+// リポジトリ直下の実体（.git / node_modules / gitignore 済みの環境ノイズを除く）。
+// 列挙は readdir のままにする: git 追跡外の“本物の”新規項目は今まで通り「未分類」として
+// 拾いたいので、git ls-files による列挙には切り替えない。
 function topLevelEntries() {
+  const ignored = ignoredTopLevelNames();
   return fs
     .readdirSync(repoRoot, { withFileTypes: true })
-    .filter((entry) => entry.name !== '.git' && entry.name !== 'node_modules')
+    .filter((entry) => entry.name !== '.git' && entry.name !== 'node_modules' && !ignored.has(entry.name))
     .map((entry) => entry.name);
 }
 
@@ -189,6 +225,41 @@ test('(e) 配布スクリプトは manifest を読み、直書き配列を主定
         hardcodedMatch.index < manifestRead,
         `${name} の直書き配列が manifest 読み込みより後にある（manifest が主定義になっていない）`,
       );
+    }
+  }
+});
+
+// ls-files -z の出力解析は純関数なので、実リポジトリの状態に依存せず検証できる。
+test('(f) ls-files の NUL 区切り出力から最上位項目名を取り出す', () => {
+  assert.deepEqual(
+    [...rootNamesFromIgnoredList('Microsoft/\0.wt/\0codex-rule1.log\0')].sort(),
+    ['Microsoft', '.wt', 'codex-rule1.log'].sort(),
+  );
+  assert.deepEqual([...rootNamesFromIgnoredList('nested/keep/inside/\0')], ['nested']);
+  assert.deepEqual([...rootNamesFromIgnoredList('plain.txt\0')], ['plain.txt']);
+  assert.deepEqual([...rootNamesFromIgnoredList('')], []);
+});
+
+// (b) が環境ノイズで偽赤にならないことの回帰テスト。
+// 使い捨てリポジトリで「.gitignore 済みは除外・未追跡の新規項目は残る」を実測する。
+test('(g) gitignore 済みの最上位項目は除外され、未追跡の新規項目は残る', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dist-cov-'));
+  try {
+    const init = spawnSync('git', ['-C', tmp, 'init', '-q'], { encoding: 'utf8' });
+    assert.equal(init.status, 0, 'git init に失敗（git が無い環境ではこのテストを実行できない）');
+    fs.mkdirSync(path.join(tmp, 'noise'));
+    fs.mkdirSync(path.join(tmp, 'newdir'));
+    fs.writeFileSync(path.join(tmp, '.gitignore'), '/noise/\n', 'utf8');
+
+    const ignored = ignoredTopLevelNames(tmp);
+    assert.ok(ignored.has('noise'), '.gitignore 済みの noise が除外対象に入っていない');
+    assert.ok(!ignored.has('newdir'), '未追跡でも .gitignore されていない newdir を除外してはいけない');
+    assert.ok(!ignored.has('.git'), '追跡対象外の .git は除外名に含めない（列挙側で別途除く）');
+  } finally {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // 一時ディレクトリの後始末失敗はテスト結果に影響しない
     }
   }
 });
