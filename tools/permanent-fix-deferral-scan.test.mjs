@@ -131,6 +131,19 @@ test('委譲の完了待ちはW(待機)であって先送り(P1-P4)ではない'
   const quote = 'Codex の2本の完了を待っています。';
   assert.deepEqual(detect(quote).map(found => found.pattern), ['W']);
 });
+test('handoff-audit TODO の引用内にある待機・修正語を再検出しない', () => {
+  const todos = [
+    '16. [handoff-audit:655fbad73a29c865] 恒久修正の先送り文を検出（2026-10-12T11:08:57.526Z / a4c12da7 / W）「ィブ Codex が書き込みタスクで exit_null になる原因診断（Sonnet）の完了待ちです。 次に kim がすること: なし（Discord DM」 — この handoff が再発していないかを実物で検証し結果を記録する（再発防止の経路: 違反セッションの先送りを当ターン内に実装まで終える（例: 2026-10-12T11:08:57.526Z / a4c12da7-a178-44cb-af93-3cbb39caaee7））。kimへのDMなし。',
+    '17. [handoff-audit:ed21f8915eaaf823] 恒久修正の先送り文を検出（2026-10-12T10:44:41.681Z / 98dbc140 / P3）「次に kim がすること: ISSUES 1（`MailApproval_proposeFromLatest` に `attachmentIds` を接続）を修」 — この handoff が再発していないかを実物で検証し結果を記録する（再発防止の経路: 違反セッションの先送りを当ターン内に実装まで終える（例: 2026-10-12T10:44:41.681Z / 98dbc140-9999-4123-b486-7725c1b90363））。kimへのDMなし。'
+  ];
+  for (const todo of todos) assert.deepEqual(detect(todo), [], todo);
+});
+test('監査引用ガードは素の待機文と引用外の待機文を抑制しない', () => {
+  for (const quote of [
+    'Codex の2本の完了を待っています。',
+    '[handoff-audit:655fbad73a29c865] 恒久修正の先送り文を検出（W）「引用」検証の結果、Codex の2本の完了を待っています。'
+  ]) assert.deepEqual(detect(quote).map(found => found.pattern), ['W'], quote);
+});
 test('全台帳で最初の一致だけをパターン別に集計する', t => {
   const home = fixture(t);
   const quotes = ['恒久修正は次セッションで行う', '後日に実装する',
