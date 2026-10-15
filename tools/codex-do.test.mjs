@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
 
 const runDirs = [];
 function workDir() {
@@ -1545,4 +1545,25 @@ test('detectQuotaLimit: U+2019 の引用符つき usage limit 文言を検出す
   const r = detectQuotaLimit('', stderr, 1, '');
   assert.equal(r.matched, true);
   assert.equal(r.pattern, "You've hit your usage limit");
+});
+
+test('killProcessTree は Windows でプロセス木ごと殺す（タイムアウトを実効させる）', () => {
+  const calls = [];
+  killProcessTree({ pid: 4242, kill: (sig) => calls.push(['kill', sig]) },
+    { spawnImpl: (cmd, args) => calls.push([cmd, args]), platform: 'win32' });
+  assert.deepEqual(calls, [['taskkill', ['/pid', '4242', '/T', '/F']]]);
+});
+
+test('killProcessTree は非 Windows で SIGKILL を送る', () => {
+  const calls = [];
+  killProcessTree({ pid: 4242, kill: (sig) => calls.push(['kill', sig]) },
+    { spawnImpl: () => { throw new Error('windows 以外では spawn しない'); }, platform: 'linux' });
+  assert.deepEqual(calls, [['kill', 'SIGKILL']]);
+});
+
+test('killProcessTree は pid が無ければ何もしない', () => {
+  const calls = [];
+  killProcessTree({ kill: () => calls.push('kill') },
+    { spawnImpl: () => calls.push('spawn'), platform: 'win32' });
+  assert.deepEqual(calls, []);
 });
