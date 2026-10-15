@@ -13,6 +13,7 @@ const accountDomains = [
 ];
 const workspaceDomains = ['docs.google.com', 'drive.google.com', 'sheets.google.com', 'script.google.com', 'slides.google.com', 'forms.google.com'];
 const email = /[\w.+-]+@[\w-]+\.[\w.-]+/;
+const unresolvedFact = /未確認|不明|わからない|分からない|要確認|持ち主|未特定/;
 const matchesDomain = (host, domain) => host === domain || host.endsWith(`.${domain}`);
 
 function needsAccount(raw) {
@@ -58,9 +59,11 @@ export function judge(text) {
       return !(prose.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) || []).some(value => value.toLowerCase() === account.toLowerCase());
     }
     if (globalAccount) return false;
-    return !lines.slice(Math.max(0, line - 2), line + 3).some(value =>
+    const nearby = lines.slice(Math.max(0, line - 2), line + 3);
+    const hasUnresolved = nearby.some(value => unresolvedFact.test(value));
+    return !nearby.some(value =>
       email.test(value)
-      || (/(?:で開く|アカウント)/.test(value) && /\*\*[^*\n]+\*\*/.test(value))
+      || (!hasUnresolved && /(?:で開く|アカウント)/.test(value) && /\*\*[^*\n]+\*\*/.test(value))
       || (value.includes('open-url-as.ps1') && value.includes('-Account'))
     );
   }).map(({ url }) => url);

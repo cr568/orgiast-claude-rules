@@ -28,3 +28,20 @@ test('path-only handoff still requires audit evidence', () => {
   assert.equal(judgeUserBurden(launcher).decision, 'block');
   assert.equal(judgeUserBurden(`${launcher}\n${audit}`).decision, 'pass');
 });
+
+test('手渡し内の未確認事項を block する', () => {
+  const result = judgeUserBurden(`次に kim がすること: OpenRouter の持ち主は未確認のまま開く\n${audit}`);
+  assert.equal(result.decision, 'block');
+  assert.match(result.reason, /^\[UNRESOLVED-IN-HANDOFF\]/);
+  const steps = judgeUserBurden(`次に kim がすること: 設定画面を開く\n1. 手順: リンクを開く\n2. 場所: 管理アカウントは要確認\nhttps://example.com/settings\n${audit}`);
+  assert.equal(steps.decision, 'block');
+  assert.match(steps.reason, /管理アカウントは要確認/);
+});
+
+test('手渡し外の未確認は対象外', () => {
+  assert.equal(judgeUserBurden(`調査報告: 契約日は未確認です。\n次に kim がすること: ダブルクリックする\n${launcher}\n${audit}`).decision, 'pass');
+});
+
+test('未確認事項のない手渡しは従来どおり通過', () => {
+  assert.equal(judgeUserBurden(`次に kim がすること: ダブルクリックする\n${launcher}\n${audit}`).decision, 'pass');
+});
