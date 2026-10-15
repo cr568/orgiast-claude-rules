@@ -82,7 +82,7 @@ node tools/claude-ai-run.mjs --prompt-file path/to/instruction.md --timeout 180
 
 ```bash
 # トリガー一覧を取得
-node tools/remote-trigger.mjs list_triggers
+node tools/remote-trigger.mjs list
 
 # トリガーを実行
 node tools/remote-trigger.mjs run '{"trigger_id":"trig_017cwe1Kwy6BWxs3zoF8DLre"}'
@@ -100,7 +100,8 @@ node tools/remote-trigger.mjs run '{"trigger_id":"trig_017cwe1Kwy6BWxs3zoF8DLre"
 
 | action | payload | 実測の出典 |
 |---|---|---|
-| `list_triggers` | `{}` | — |
+| `list` | `{}` | 2026-10-15 実呼び出し |
+| `get` | `{"trigger_id":"trig_..."}` | — |
 | `run` | `{"trigger_id":"trig_017cwe1Kwy6BWxs3zoF8DLre"}` | `runs/2026-10-14-3.rt-run.md` |
 | `list_runs` | `{"trigger_id":"trig_017cwe1Kwy6BWxs3zoF8DLre"}` | `runs/2026-10-14-3.rt-probe.md` |
 | `get_run_log` | `{"session_id":"cse_015uGLEshSvParaFYTYZdkdA"}` | `runs/2026-10-14-3.rt-log.md` |
@@ -110,7 +111,8 @@ node tools/remote-trigger.mjs run '{"trigger_id":"trig_017cwe1Kwy6BWxs3zoF8DLre"
 ## 確定している制約（限界）
 
 - **RemoteTrigger API のスコープ**:
-  利用可能なアクションは `list_triggers`, `get_trigger`, `create_trigger`, `update_trigger`, `list_runs`, `run`, `get_run_log`, `create_webhook_trigger` のみ。
+  利用可能なアクションは `list`, `get`, `create`, `update`, `run`, `list_runs`, `get_run_log`, `create_webhook_trigger` のみ。
+  **`list_triggers` / `get_trigger` / `update_trigger` は存在しない値**（2026-10-15 に実呼び出しで確認。渡すとツール側が `not an allowed value` で拒否する）。
 - **環境（environment）の egress 許可ドメインは API 経由で変更不可**:
   外部通信を伴う Routine で接続拒否（接続先ドメイン未許可）が発生した場合、RemoteTrigger 経由ではドメインを追加できない。**claude.ai の Web UI（設定画面）でのみ変更可能**である（2026-10-14 確定）。
 

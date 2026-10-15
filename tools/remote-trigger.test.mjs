@@ -12,6 +12,20 @@ import {
 
 const tool = fileURLToPath(new URL('./remote-trigger.mjs', import.meta.url));
 
+// 2026-10-15 に実際に RemoteTrigger を呼んで確認した正しい action 集合。
+// 委譲実装は list_triggers / get_trigger / create_trigger / update_trigger という
+// 存在しない値を入れていた（実呼び出しでツール側が「not an allowed value」で拒否）。
+test('ACTIONS: 実測した RemoteTrigger の action 名と一致する', () => {
+  assert.deepEqual(
+    [...ACTIONS].sort(),
+    ['list', 'get', 'create', 'update', 'run', 'list_runs', 'get_run_log', 'create_webhook_trigger'].sort()
+  );
+  for (const wrong of ['list_triggers', 'get_trigger', 'create_trigger', 'update_trigger']) {
+    assert.equal(ACTIONS.includes(wrong), false, `${wrong} は実在しない action`);
+    assert.throws(() => validateAction(wrong), /未知の action です/);
+  }
+});
+
 // 実測で get_run_log の run 識別子は session_id だった（run_id ではない）。
 // 引数名を間違えるとエラーにならず空振りするため、うっかり run_id に戻さないよう固定する。
 test('PAYLOAD_HINTS: get_run_log は session_id を使う（run_id ではない）', () => {
@@ -23,7 +37,7 @@ test('PAYLOAD_HINTS: get_run_log は session_id を使う（run_id ではない�
 
 test('validateAction: 既知のアクションは通過し、未知のアクションは例外を投げる', () => {
   assert.equal(validateAction('run'), 'run');
-  assert.equal(validateAction('list_triggers'), 'list_triggers');
+  assert.equal(validateAction('list'), 'list');
   assert.equal(validateAction('get_run_log'), 'get_run_log');
 
   for (const act of ACTIONS) {
@@ -65,8 +79,8 @@ test('parseActionArgs: 不正な JSON で例外を投げる', () => {
 });
 
 test('parseActionArgs: payload 省略時は空オブジェクトとなりオプションを解釈する', () => {
-  const parsed = parseActionArgs(['list_triggers', '--dry-run', '--timeout', '60']);
-  assert.equal(parsed.action, 'list_triggers');
+  const parsed = parseActionArgs(['list', '--dry-run', '--timeout', '60']);
+  assert.equal(parsed.action, 'list');
   assert.deepEqual(parsed.payload, {});
   assert.equal(parsed.dryRun, true);
   assert.equal(parsed.timeoutSec, 60);
@@ -91,8 +105,8 @@ test('buildTriggerPrompt: trig_x と "action":"run" が含まれるプロンプ�
 });
 
 test('buildTriggerPrompt: payload 省略時は {"action":"<action>"} が組み立てられる', () => {
-  const prompt = buildTriggerPrompt('list_triggers');
-  assert.match(prompt, /\{"action":"list_triggers"\}/);
+  const prompt = buildTriggerPrompt('list');
+  assert.match(prompt, /\{"action":"list"\}/);
 });
 
 test('CLI --dry-run: 子プロセスを起動せず exit 0 で終了し正しい JSON を出力する', () => {
@@ -118,7 +132,7 @@ test('CLI --help / 引数なし: 使い方と ACTIONS 一覧を stderr に出力
   const resultNoArgs = spawnSync(process.execPath, [tool], { encoding: 'utf8' });
   assert.equal(resultNoArgs.status, 2);
   assert.match(resultNoArgs.stderr, /使い方: node tools\/remote-trigger\.mjs/);
-  assert.match(resultNoArgs.stderr, /list_triggers/);
+  assert.match(resultNoArgs.stderr, /list/);
   assert.match(resultNoArgs.stderr, /run/);
 
   const resultHelp = spawnSync(process.execPath, [tool, '--help'], { encoding: 'utf8' });
