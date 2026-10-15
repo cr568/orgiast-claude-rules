@@ -91,7 +91,7 @@ Stop の `user-burden-gate` が依頼のある最終応答を監査する。本�
 - できていない・未検証の行には「原因（事実と推測を分ける）→ 次の一手（実行者・手順）」を併記し、Claude が実行できる分は報告前に着手する。
 - 事例: 複合機スキャン→Drive 自動アップで FAX フォルダを「対象に含めた」と報告し、テストは別フォルダだけで合格とした。初期調査で FAX の「直近30日 0件・最終 2024/3」を取得していたのに報告せず、複合機入替で FAX 保存設定が消えていたことを user の問い合わせで初めて発見した。
 
-**🔴 内部宛メッセージはチャットに「宛先／用件／本文」を表示し、Gmail下書き・送信は禁止。Gmail下書きは外部宛だけとし、本文と下書き件名もチャットに併記する。**
+**🔴 社内メンバー（社内・グループ会社・スタッフ）への連絡は、Claude が Discord の DM で送る（`node ~/orgiast-claude-rules/tools/discord-dm.mjs "<名前 or メール>" --body "<本文>"`。宛先の名前→ID解決は台帳と Bot が行い、user に聞かない）。Gmail の下書き・送信は内部宛には作らない。Discord で送れない時だけ、チャットに「宛先／用件／本文」をコピペできる完成形で表示する。Gmail下書きは外部宛だけとし、本文と下書き件名もチャットに併記する。**
 
 内部判定: 社内・グループ会社（東邦鋼業 genbateam.toho@gmail.com、Reブース、NEXTForward）・スタッフ。orgiast.jp / toho-kogyo.com と `~/.claude/internal-recipients.json`（既定 `tools/internal-recipients.default.json`）を使い、`internal-recipient-gmail-guard` が宛先を照合する。
 

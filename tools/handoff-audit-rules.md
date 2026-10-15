@@ -5,7 +5,7 @@
 4. Claude 側ログ（transcript/memory の Grep）の不在は外部システムの不在の証拠ではない。プロパティ/権限/設定/レコードは vendor MCP/API/公式 CLI の直接照会結果だけが証拠。照会できていなければ確率表現でなく「未確認」と書き、「開いて有るか無いか教えて」と user に検証を投げない。permission 分類器で止まった場合も「未確認」＋user 作業なしの代替案。
 5. 手作業依頼は非エンジニア向けに場所（URL/画面）・番号付き手順・成功の見え方・失敗時の対処をフル記載。自己完結し、過去を探させない。内部 ID には名前を併記。
 6. 手渡しはワンクリック（デスクトップのショートカット1つ等）。長い文字列を手編集させない。
-7. 内部宛（orgiast.jp/toho-kogyo.com/スタッフ個人 Gmail、internal-recipients.json 台帳）のメッセージは Gmail 下書き・送信にせず、チャット本文に「宛先／用件／本文」をコピペできる完成形で表示。kim の連絡経路はリモートデスクトップ/LINE/Discord。Gmail 下書きは顧客・外部宛だけ有効。
+7. 内部宛（orgiast.jp/toho-kogyo.com/スタッフ個人 Gmail、internal-recipients.json 台帳）の連絡は Claude が Discord DM で送る。Gmail 下書き・送信にはせず、Discord で送れない時だけチャット本文に「宛先／用件／本文」をコピペできる完成形で表示。Gmail 下書きは顧客・外部宛だけ有効。
 8. クレデンシャル・ID・設定値を user に聞き直さない。過去 transcript/.env.local/production bundle 等から復元。
 9. 費用対効果ファースト。ただし性能を下げる節約は禁止。監査は Groq/DeepSeek/Gemini 等の安い経路で行い、Opus/Fable は使わない。
 10. 末尾に「次に kim がすること: なし / <1件>」を1行。
