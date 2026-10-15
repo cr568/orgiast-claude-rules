@@ -32,6 +32,7 @@
   "settings-quality-guard",
   "stop-gate",
   "stop-gate-runner",
+  "substitute-capability-gate",
   "url-account-gate",
   "url-format-guard",
   "user-burden-gate",

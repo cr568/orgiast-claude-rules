@@ -160,6 +160,10 @@
       "rollout": "deny",
       "legacy": true
     },
+    "substitute-capability-gate": {
+      "rollout": "deny",
+      "legacy": true
+    },
     "user-burden-gate": {
       "rollout": "deny",
       "legacy": true

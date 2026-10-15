@@ -1,5 +1,6 @@
 export const GATE_CONTRACT = {"name": "url-account-gate", "remedies": [{"kind": "repo-file", "ref": "tools/gate-remedies.md", "section": "url-account-gate"}]};
 import { latestAssistantText } from './lib/assistant-text.mjs';
+import { catalog, providerForHost } from './provider-catalog.mjs';
 import { isEntry } from './is-entry.mjs';
 
 const accountDomains = [
@@ -15,7 +16,7 @@ const workspaceDomains = ['docs.google.com', 'drive.google.com', 'sheets.google.
 const email = /[\w.+-]+@[\w-]+\.[\w.-]+/;
 const matchesDomain = (host, domain) => host === domain || host.endsWith(`.${domain}`);
 
-function needsAccount(raw) {
+function needsAccount(raw, services = catalog) {
   let url;
   try { url = new URL(raw); } catch { return false; }
   const host = url.hostname.toLowerCase().replace(/\.$/, '');
@@ -24,13 +25,13 @@ function needsAccount(raw) {
   if (workspaceDomains.some(domain => matchesDomain(host, domain))) {
     return !(matchesDomain(host, 'script.google.com') && /^\/home(?:\/|$)/.test(url.pathname));
   }
-  return accountDomains.some(domain => matchesDomain(host, domain))
+  return !!providerForHost(host, services) || accountDomains.some(domain => matchesDomain(host, domain))
     || (matchesDomain(host, 'play.google.com') && url.pathname.startsWith('/console'))
     || (matchesDomain(host, 'agoda.com') && /\/ycs(?:\/|$)/i.test(url.pathname))
     || /\/(?:admin|console|dashboard|settings|login|signin|account)/i.test(url.pathname);
 }
 
-export function judge(text) {
+export function judge(text, { services = catalog } = {}) {
   // Keep line boundaries so fenced content cannot bring a distant account closer.
   const body = text.replace(/```[\s\S]*?```/g, block => block.replace(/[^\r\n]/g, ''));
   if (body.includes('[URL-ACCOUNT-OK]')) return { triggered: false, missing: [], urls: [] };
@@ -39,7 +40,7 @@ export function judge(text) {
   for (const [line, value] of lines.entries()) {
     for (const match of value.matchAll(/https?:\/\/[^\s<>\x60"'\[\]{}()（）「」『』、。！？]+/gi)) {
       const url = match[0].replace(/[.,;:!?]+$/, '');
-      if (needsAccount(url)) found.push({ url, line });
+      if (needsAccount(url, services)) found.push({ url, line });
     }
   }
   const urls = [...new Set(found.map(({ url }) => url))];
@@ -48,6 +49,16 @@ export function judge(text) {
     && /[\w.+-]+@[\w-]+\.[\w.-]+(?:\*\*)?\s*で開く/.test(line));
   const missing = found.filter(({ url: raw, line }) => {
     const url = new URL(raw);
+    const provider = providerForHost(url.hostname.toLowerCase().replace(/\.$/, ''), services);
+    const nearby = lines.slice(Math.max(0, line - 1), line + 1).join('\n').replace(/https?:\/\/[^\s<>\x60"'\[\]{}()（）「」『』、。！？]+/gi, '');
+    if (provider) {
+      if (/user_[A-Za-z0-9]+|ユーザーID|(?:^|[\s*（(])[A-Za-z0-9]{16,}(?=$|[\s*）)])/i.test(nearby)) return true;
+      if (!provider.account) return !/\[ACCOUNT-UNKNOWN\][ \t]+\S/.test(lines[line]);
+      // メールは別アカウントの部分文字列として一致させない。
+      return email.test(provider.account)
+        ? !(nearby.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) || []).includes(provider.account)
+        : !nearby.includes(provider.account);
+    }
     if (workspaceDomains.some(domain => matchesDomain(url.hostname.replace(/\.$/, ''), domain))) {
       const accounts = url.searchParams.getAll('authuser');
       const account = accounts[0] || '';
@@ -57,6 +68,7 @@ export function judge(text) {
         .replace(/https?:\/\/[^\s<>\x60"'\[\]{}()（）「」『』、。！？]+/gi, '');
       return !(prose.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) || []).some(value => value.toLowerCase() === account.toLowerCase());
     }
+    if (/user_[A-Za-z0-9]+|ユーザーID|(?:^|[\s*（(])[A-Za-z0-9]{16,}(?=$|[\s*）)])/i.test(nearby)) return true;
     if (globalAccount) return false;
     return !lines.slice(Math.max(0, line - 2), line + 3).some(value =>
       email.test(value)
@@ -67,8 +79,12 @@ export function judge(text) {
   return { triggered: urls.length > 0, missing: [...new Set(missing)], urls };
 }
 
-export function formatReason(urls) {
-  return '[URL-ACCOUNT] 次の URL に「どのアカウントで開くか」が書かれていません（ONBOARDING §1.5.0・kim 2026-10-04 厳命）。形式: <URL>（**<アカウント名>** で開く）。既定アカウントと違うなら「シークレットウィンドウで開く」も併記。本文の URL が全部同じアカウントなら「以下の URL はすべて **x@y** で開く」の1行でよい。Workspace は authuser=<開く人のメール> が必須（既存クエリには &authuser= を追加）。URL の同じ行か直前に「<同じメール> で開いてください」を書く。/a/orgiast.jp/ は不可。自分宛は環境の userEmail、他人宛は共有済みの相手メール。script.google.com/home/ 系は従来どおり除外。Workspace には離れた全体宣言は使えない。例外は [URL-ACCOUNT-OK]。\n' + urls.join('\n');
+export function formatReason(urls, { services = catalog } = {}) {
+  const accounts = [...new Set(urls.flatMap(raw => {
+    const provider = providerForHost(new URL(raw).hostname, services);
+    return provider ? [provider.account ? 'カタログ上のアカウント: ' + provider.account : 'カタログ上のアカウント: 未確認。[ACCOUNT-UNKNOWN] <調べた場所> を URL と同じ行に書く'] : [];
+  }))];
+  return accounts.join('\n') + '\nアカウントは人が分かるメール/ラベルで書く。\n' + '[URL-ACCOUNT] 次の URL に「どのアカウントで開くか」が書かれていません（ONBOARDING §1.5.0・kim 2026-10-04 厳命）。形式: <URL>（**<アカウント名>** で開く）。既定アカウントと違うなら「シークレットウィンドウで開く」も併記。本文の URL が全部同じアカウントなら「以下の URL はすべて **x@y** で開く」の1行でよい。Workspace は authuser=<開く人のメール> が必須（既存クエリには &authuser= を追加）。URL の同じ行か直前に「<同じメール> で開いてください」を書く。/a/orgiast.jp/ は不可。自分宛は環境の userEmail、他人宛は共有済みの相手メール。script.google.com/home/ 系は従来どおり除外。Workspace には離れた全体宣言は使えない。例外は [URL-ACCOUNT-OK]。\n' + urls.join('\n');
 }
 
 function main() {
