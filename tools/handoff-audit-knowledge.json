@@ -124,5 +124,11 @@
     "route": "node C:/Users/uers/orgiast-claude-rules/tools/gdoc-update.mjs --id <docId> --file <本文.md>（DWD SA で kim を代理、URL 不変・全置換・read-back 付き。--check で現状取得。表はヘッダが崩れるのでリストで書く）。新規 Doc 作成やコネクタ有効化の依頼に逃げない",
     "confidence": "high",
     "source": "2026-09-28 バドミントン指示書で「未接続」と誤って手渡し"
+  },
+  {
+    "pattern": "サブエージェント/他AIレーンへ実装を委譲して『実行中』で終わる",
+    "route": "codex-do.mjs を前景・単発（--timeout 付き）で回し、実装を委譲したら『実行中』のまま handoff せず当ターン内に完了まで見届ける（バックグラウンド起動・『実行中で終える』は禁止。WSL 不在で codex 経路が起動しない PC は内蔵フォールバック→不可なら Claude 直で実装）",
+    "confidence": "high",
+    "source": "handoff-audit-nightly:cd0e44f6287a30bd9eb06925705ff6833711b4c62af5246898c21dcfd0229578 / 2026-10-15 rescue/auto-session-20261014-030203 のレビューで landing（同 rescue の他2件は既存 entry と route が重複のため除外。当該型の再発監査ツールは PR #781）"
   }
 ]
