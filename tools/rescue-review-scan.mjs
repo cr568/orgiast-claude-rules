@@ -1,5 +1,6 @@
 // rescue/* ブランチのうち「本当に人間のレビューが必要なもの」だけを列挙する読み取り専用スキャナ。
 // main に取り込み済み(covered)・他枝と同一変更(duplicate)を除外し、unique だけを残す。
+// git cherry で、枝を切った後に main へ取り込まれた変更も covered と判定する。
 // ネットワークアクセスなし・ファイル書き込みなし(git の読み取りのみ)。
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -134,7 +135,18 @@ export function scanRescueBranches({
     const { files, added, deleted } = sumNumstat(numstat);
     const fingerprint = fingerprintOf(patch);
     if (patch === '') {
-      results.push({ branch, files, added, deleted, fingerprint, status: 'covered' });
+      results.push({ branch, files, added, deleted, fingerprint, status: 'covered', reason: 'no-commits' });
+      continue;
+    }
+    let alreadyUpstream = false;
+    try {
+      const lines = git(dir, ['cherry', main, branch]).split(/\r?\n/).filter(line => line.trim() !== '');
+      alreadyUpstream = lines.length > 0 && lines.every(line => line.startsWith('- '));
+    } catch {
+      // 判定不能なら既存の分類にフォールバックし、レビュー対象を残す。
+    }
+    if (alreadyUpstream) {
+      results.push({ branch, files, added, deleted, fingerprint, status: 'covered', reason: 'already-upstream' });
       continue;
     }
     if (firstByFingerprint.has(fingerprint)) {
