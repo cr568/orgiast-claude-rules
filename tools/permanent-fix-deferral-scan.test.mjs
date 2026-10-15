@@ -192,3 +192,19 @@ test('handoff行自体に修正語がある場合は引き続き検出する', t
     assert.equal(source.byPattern.P3, 1);
   }
 });
+
+test('実現可能性の名詞「〜可否」はP4と誤検出しない', () => {
+  for (const quote of [
+    'Codex のネイティブ実行可否（スモーク・書き込みテスト）と写真収集エージェントの結果待ちです。結果が揃い次第、実装を Codex か Sonnet エージェントのどちらかに投入します。',
+    'cr@orgiast.jp の Fable 利用可否をローカル記録で確認し、実装の投入先を決めます。',
+    'WSL 復旧の可否と codex レーンの生存を実測してから修正します。'
+  ]) assert.deepEqual(detect(quote).map(found => found.pattern), [], quote);
+});
+
+test('疑問節つきの「可否」は引き続きP4で検出する', () => {
+  for (const quote of [
+    '次に kim がすること: 自動修復を付けてよいかの可否。',
+    'この修正を進めてよいか可否を判断してください。'
+  ]) assert.ok(detect(quote).some(found => found.pattern === 'P4'), quote);
+});
+
