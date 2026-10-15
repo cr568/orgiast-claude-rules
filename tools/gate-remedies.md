@@ -163,3 +163,7 @@ URLをMarkdownリンクまたは空白で囲み、日本語/全角文字との�
 
 実行テストとread-backを行い [TESTED]、軽微で不要なら理由付き [NO-TEST-OK]。
 
+
+## substitute-capability-gate
+
+同能力の生存レーンで実行して結果を示す（ONBOARDING §1.18.5）。user が対象プロバイダを名指しした場合のみ、本文に `[SUBSTITUTE-OK] <user の文言の引用>` を書く。

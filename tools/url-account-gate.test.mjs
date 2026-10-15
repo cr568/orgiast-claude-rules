@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { judge, formatReason } from './url-account-gate.mjs';
 
-const studio = 'https://aistudio.google.com/prompts/new_chat';
+const studio = 'https://ai.studio/prompts/new_chat';
 const account = '（**kim@orgiast.jp** で開く）';
 const gate = fileURLToPath(new URL('./url-account-gate.mjs', import.meta.url));
 
@@ -157,4 +157,32 @@ test('Workspace は前後1行に限定し、旧パスに authuser を足して�
   assert.deepEqual(judge(`${url}\n\nreader@example.com で開いてください`).missing, [url]);
   const legacy = url.replace('/document/', '/a/orgiast.jp/document/');
   assert.deepEqual(judge(`${legacy} reader@example.com で開いてください`).missing, [legacy]);
+});
+
+test('カタログのアカウントは同じ行または直前行に完全一致が必要', () => {
+  const url = 'https://openrouter.ai/settings/credits';
+  const account = 'seisaku-team@orgiast.jp';
+  const services = [{ id: 'openrouter', account }];
+  for (const text of [`${url} ${account}`, `${account}\n${url}`]) assert.deepEqual(judge(text, { services }).missing, []);
+  for (const text of [url, `${url} ログインして開いてください`, `${url} kim@orgiast.jp`, `${url} other-${account}`, `${url}\n${account}`, `${account}\n\n${url}`]) {
+    assert.deepEqual(judge(text, { services }).missing, [url]);
+  }
+  assert.match(formatReason([url], { services }), /カタログ上のアカウント: seisaku-team@orgiast.jp/);
+});
+
+test('account が null または未定義なら同じ行の調査先タグのみ許可', () => {
+  const url = 'https://console.x.ai/';
+  for (const service of [{ id: 'grok', account: null }, { id: 'grok' }]) {
+    const options = { services: [service] };
+    assert.deepEqual(judge(`${url} [ACCOUNT-UNKNOWN] カタログ・認証設定を確認`, options).missing, []);
+    for (const text of [`${url} ログインして開いてください`, `${url} [ACCOUNT-UNKNOWN]`, `[ACCOUNT-UNKNOWN] カタログ確認\n${url}`]) assert.deepEqual(judge(text, options).missing, [url]);
+  }
+});
+
+test('内部 ID をアカウントと認めず、人が分かるメール/ラベルを要求', () => {
+  const url = 'https://github.com/org/repo';
+  for (const label of ['user_3HyaRyBEMrj8Bee8exsLo9cNFCI', 'ユーザーID kim', 'Abcdef1234567890']) {
+    assert.deepEqual(judge(`${url}（**${label}** で開く）`).missing, [url]);
+  }
+  assert.match(formatReason([url]), /アカウントは人が分かるメール\/ラベルで書く/);
 });

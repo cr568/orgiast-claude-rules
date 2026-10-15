@@ -160,6 +160,11 @@
       "rollout": "deny",
       "legacy": true
     },
+    "substitute-capability-gate": {
+      "rollout": "deny",
+      "distributedAt": "2026-10-15T00:00:00Z",
+      "denyAfter": "2026-10-22T00:00:00Z"
+    },
     "user-burden-gate": {
       "rollout": "deny",
       "legacy": true
