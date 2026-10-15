@@ -1,0 +1,157 @@
+// rescue/* ブランチのうち「本当に人間のレビューが必要なもの」だけを列挙する読み取り専用スキャナ。
+// main に取り込み済み(covered)・他枝と同一変更(duplicate)を除外し、unique だけを残す。
+// ネットワークアクセスなし・ファイル書き込みなし(git の読み取りのみ)。
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+// git の既定実装。dir で git を実行し stdout を返す。失敗時は例外を投げる。
+function defaultGit(dir, args) {
+  const result = spawnSync('git', ['-C', dir, ...args], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 120000,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const firstLine = (result.stderr || result.stdout || '').trim().split('\n')[0];
+    throw new Error(firstLine || `git ${args.join(' ')} failed (status ${result.status})`);
+  }
+  return result.stdout;
+}
+
+function fingerprintOf(patch) {
+  return crypto.createHash('sha256').update(patch).digest('hex');
+}
+
+// --numstat 出力から files/added/deleted を集計。binary 行("-" "-")は files にのみ数える。
+function sumNumstat(text) {
+  let files = 0;
+  let added = 0;
+  let deleted = 0;
+  for (const line of String(text).split('\n')) {
+    if (!line.trim()) continue;
+    files += 1;
+    const [a, d] = line.split('\t');
+    if (/^\d+$/.test(a)) added += Number(a);
+    if (/^\d+$/.test(d)) deleted += Number(d);
+  }
+  return { files, added, deleted };
+}
+
+// rescue ブランチ名を昇順で列挙する。
+function listBranches(git, repo, includeRemote) {
+  const patterns = ['refs/heads/rescue/'];
+  if (includeRemote) patterns.push('refs/remotes/origin/rescue/');
+  const seen = new Set();
+  const names = [];
+  for (const pattern of patterns) {
+    const out = git(repo, ['for-each-ref', '--format=%(refname:short)', pattern]);
+    for (const line of String(out).split('\n')) {
+      const name = line.trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      names.push(name);
+    }
+  }
+  return names.sort();
+}
+
+export function scanRescueBranches({ repo, main = 'origin/main', includeRemote = false, git = defaultGit } = {}) {
+  const dir = repo || '.';
+  // 重複判定はブランチ名昇順で「先に出現した方」を正とする。
+  const branches = listBranches(git, dir, includeRemote);
+  const firstByFingerprint = new Map();
+  const results = [];
+  for (const branch of branches) {
+    let patch;
+    let numstat;
+    try {
+      // three-dot で branch 自身の変更のみを取る。
+      patch = git(dir, ['diff', `${main}...${branch}`]);
+      numstat = git(dir, ['diff', '--numstat', `${main}...${branch}`]);
+    } catch (err) {
+      const message = String(err && err.message ? err.message : err).split('\n')[0];
+      results.push({ branch, files: 0, added: 0, deleted: 0, fingerprint: null, status: 'error', error: message });
+      continue;
+    }
+    const { files, added, deleted } = sumNumstat(numstat);
+    const fingerprint = fingerprintOf(patch);
+    if (patch === '') {
+      results.push({ branch, files, added, deleted, fingerprint, status: 'covered' });
+      continue;
+    }
+    if (firstByFingerprint.has(fingerprint)) {
+      results.push({ branch, files, added, deleted, fingerprint, status: 'duplicate', duplicateOf: firstByFingerprint.get(fingerprint) });
+      continue;
+    }
+    firstByFingerprint.set(fingerprint, branch);
+    results.push({ branch, files, added, deleted, fingerprint, status: 'unique' });
+  }
+  results.sort((a, b) => (a.branch < b.branch ? -1 : a.branch > b.branch ? 1 : 0));
+  return results;
+}
+
+function summarize(branches) {
+  const summary = { unique: 0, duplicate: 0, covered: 0, error: 0, total: branches.length };
+  for (const b of branches) {
+    if (Object.prototype.hasOwnProperty.call(summary, b.status)) summary[b.status] += 1;
+  }
+  return summary;
+}
+
+function parseArgs(argv) {
+  const opts = { repo: '.', main: 'origin/main', includeRemote: false, json: false };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === '--repo') opts.repo = argv[i + 1];
+    else if (a === '--main') opts.main = argv[i + 1];
+    else if (a === '--include-remote') opts.includeRemote = true;
+    else if (a === '--json') opts.json = true;
+  }
+  return opts;
+}
+
+function formatLine(b) {
+  const base = `${b.status}\t${b.branch}\t${b.files}\t${b.added}+/${b.deleted}-`;
+  if (b.status === 'duplicate' && b.duplicateOf) return `${base}\t(duplicate of ${b.duplicateOf})`;
+  if (b.status === 'error' && b.error) return `${base}\t(${b.error})`;
+  return base;
+}
+
+function run(argv) {
+  const opts = parseArgs(argv);
+  let branches;
+  try {
+    branches = scanRescueBranches({ repo: opts.repo, main: opts.main, includeRemote: opts.includeRemote });
+  } catch (err) {
+    process.stderr.write(`rescue-review-scan: ${err && err.message ? err.message : err}\n`);
+    return;
+  }
+  const summary = summarize(branches);
+  if (opts.json) {
+    process.stdout.write(`${JSON.stringify({ repo: opts.repo, main: opts.main, summary, branches }, null, 2)}\n`);
+    return;
+  }
+  const lines = [`unique: ${summary.unique} / duplicate: ${summary.duplicate} / covered: ${summary.covered} / error: ${summary.error}`];
+  for (const b of branches) lines.push(formatLine(b));
+  process.stdout.write(`${lines.join('\n')}\n`);
+}
+
+// CLI 直接実行時のみ run する。
+// 手組みの file:// 剥がしは POSIX で先頭スラッシュまで削れて path.resolve が cwd 相対になり、
+// 常に「メインモジュールでない」と誤判定して無言で何も出力しなくなる。
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  const invoked = path.resolve(process.argv[1]);
+  const self = fileURLToPath(import.meta.url);
+  return process.platform === 'win32'
+    ? self.toLowerCase() === invoked.toLowerCase()
+    : self === invoked;
+}
+
+if (isMainModule()) {
+  run(process.argv.slice(2));
+  process.exitCode = 0;
+}
