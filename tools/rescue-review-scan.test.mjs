@@ -31,7 +31,7 @@ function realGit(dir, args) {
   return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-function fixture(t, { featureBranch = false } = {}) {
+function fixture(t, { featureBranch = false, squashedMerge = false, cherryPickedFirst = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rescue-review-scan-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const repo = path.join(root, 'repo');
@@ -77,10 +77,73 @@ function fixture(t, { featureBranch = false } = {}) {
     git('checkout', 'main');
   }
 
+  if (squashedMerge) {
+    git('checkout', '-b', 'rescue/squashed', 'main');
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'squashed');
+    git('add', '.');
+    git('commit', '-m', 'squashed change');
+    git('checkout', 'main');
+    git('merge', '--squash', 'rescue/squashed');
+    git('commit', '-m', 'squash merged');
+  }
+  if (cherryPickedFirst) {
+    git('checkout', '-b', 'rescue/partial', 'main');
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'p1');
+    git('add', '.');
+    git('commit', '-m', 'partial first');
+    const first = git('rev-parse', 'HEAD').trim();
+    fs.writeFileSync(path.join(repo, 'c.txt'), 'p2');
+    git('add', '.');
+    git('commit', '-m', 'partial second');
+    git('checkout', 'main');
+    git('cherry-pick', first);
+  }
+
   return { root, repo, git };
 }
 
 const byBranch = list => Object.fromEntries(list.map(b => [b.branch, b]));
+
+test('枝を切った後に squash-merge された枝は covered(already-upstream) になる', t => {
+  const { repo } = fixture(t, { squashedMerge: true });
+  assert.notEqual(realGit(repo, ['diff', 'main...rescue/squashed']), '');
+  const m = byBranch(scanRescueBranches({ repo, main: 'main' }));
+  assert.equal(m['rescue/squashed'].status, 'covered');
+  assert.equal(m['rescue/squashed'].reason, 'already-upstream');
+  assert.equal(m['rescue/cov'].reason, 'no-commits');
+  assert.equal(m['rescue/u1'].status, 'unique');
+  assert.equal(m['rescue/u2'].status, 'duplicate');
+  assert.equal(m['rescue/u3'].status, 'unique');
+  assert.equal(m['rescue/cov'].status, 'covered');
+  assert.equal(m['rescue/squashed'].files, 1);
+  assert.match(m['rescue/squashed'].fingerprint, /^[0-9a-f]{64}$/);
+});
+
+test('一部だけ取り込み済みの枝は unique のままになる', t => {
+  const { repo } = fixture(t, { cherryPickedFirst: true });
+  assert.match(realGit(repo, ['cherry', 'main', 'rescue/partial']), /^\+ /m);
+  const m = byBranch(scanRescueBranches({ repo, main: 'main' }));
+  assert.equal(m['rescue/partial'].status, 'unique');
+});
+
+test('cherry の失敗や空出力は既存の分類にフォールバックする', t => {
+  const { repo } = fixture(t);
+  for (const fail of [true, false]) {
+    const git = (dir, args) => {
+      if (args[0] === 'cherry') {
+        if (fail) throw new Error('cherry failed');
+        return '';
+      }
+      return realGit(dir, args);
+    };
+    const m = byBranch(scanRescueBranches({ repo, main: 'main', git }));
+    assert.equal(m['rescue/u1'].status, 'unique');
+    assert.equal(m['rescue/u2'].status, 'duplicate');
+    assert.equal(m['rescue/u3'].status, 'unique');
+    assert.equal(m['rescue/cov'].status, 'covered');
+    assert.equal(Object.hasOwn(m['rescue/u1'], 'reason'), false);
+  }
+});
 
 test('unique / duplicate / covered を分類し、元の変更だけを unique に残す', t => {
   const f = fixture(t);
