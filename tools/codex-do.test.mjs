@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
 
 const runDirs = [];
 function workDir() {
@@ -114,11 +114,45 @@ test('--timeout と --cwd を付けても指示文が引数として食われな
 });
 
 test('fallbackBackendTimeoutSecs は全体枠・既定値・環境変数・下限を反映する', () => {
-  assert.equal(fallbackBackendTimeoutSecs(1800, {}), 600);
+  // 既定は 900 秒（2026-10-15: 600 では全体枠に余裕があっても打ち切って時間を捨てていた）
+  assert.equal(fallbackBackendTimeoutSecs(1800, {}), 900);
+  // 全体枠が既定より小さいときは全体枠が上限になる（総予算は超えない）
+  assert.equal(fallbackBackendTimeoutSecs(600, {}), 600);
   assert.equal(fallbackBackendTimeoutSecs(300, {}), 300);
   assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 900);
-  assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: 'garbage' }), 600);
+  assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: 'garbage' }), 900);
   assert.equal(fallbackBackendTimeoutSecs(10, {}), 60);
+});
+
+test('chainBackendBudgetSecs は連鎖の残り予算を超えない（全体枠を使い切ったら0で打ち切る）', () => {
+  // 1本目が未消費: これまでどおり1バックエンド上限(既定900)が効く
+  assert.equal(chainBackendBudgetSecs(1800, 0, {}), 900);
+  // 全体枠600を1本目で使い切った: 2本目に渡す予算は無い（従来は最大1200秒を消費していた）
+  assert.equal(chainBackendBudgetSecs(600, 600.047, {}), 0);
+  assert.equal(chainBackendBudgetSecs(600, 601, {}), 0);
+  // 全体枠1800のうち600秒消費: 残り1200だが1バックエンド上限900が効く
+  assert.equal(chainBackendBudgetSecs(1800, 600, {}), 900);
+  // 残りが上限より小さいときは残りが上限になる
+  assert.equal(chainBackendBudgetSecs(1800, 1650, {}), 150);
+  // 残りが下限(60)未満でも残りを返し、0 以下は 0（呼び出し側が打ち切る）
+  assert.equal(chainBackendBudgetSecs(1800, 1790, {}), 10);
+  assert.equal(chainBackendBudgetSecs(1800, 1800, {}), 0);
+  assert.equal(chainBackendBudgetSecs(1800, 1801, {}), 0);
+  // 環境変数の上限は残り予算にも反映される
+  assert.equal(chainBackendBudgetSecs(1800, 0, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 900);
+  assert.equal(chainBackendBudgetSecs(1800, 1500, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 300);
+});
+
+// 実測（2026-10-12〜10-14 の executor-usage.jsonl）: fallback 行が毎回 secs≈600.05 で
+// cheap-code:deepseek を打ち切っていた（chain の1本目が必ず600秒）。同時期の成功runは
+// 507/517/524/576 秒に分布＝600 の直下で切られていた。--timeout 900 のセッションが最も多く
+// （transcripts 実測 18回）、そこで既定600が上限になっていたのが時間を捨てていた原因。
+test('実測シナリオ: --timeout 900 の連鎖は1本600秒で打ち切られない', () => {
+  assert.equal(fallbackBackendTimeoutSecs(900, {}), 900);
+  // 1本目が全体枠を使い切ったら2本目は実行しない（600+600=1200 を捨てない）
+  assert.equal(chainBackendBudgetSecs(900, 900.05, {}), 0);
+  // 1本目が短く終われば残り(900-120=780)が2本目に渡る
+  assert.equal(chainBackendBudgetSecs(900, 120, {}), 780);
 });
 
 test('指示が空なら使い方を出して終了する', () => {

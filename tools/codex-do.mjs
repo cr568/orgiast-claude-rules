@@ -338,10 +338,17 @@ export function buildGeminiEnv(baseEnv, apiKey) {
 }
 
 // フォールバックの1バックエンドに掛けていい上限秒数。
-// 全体 --timeout より長くはできない。既定600秒、環境変数で上書き可。
+// 全体 --timeout より長くはできない。既定900秒、環境変数で上書き可。
+// 2026-10-15: 既定を 600→900 へ引き上げた。executor-usage.jsonl の実測で
+//   - 成功runは 129〜524 秒に分布（507/518/524 の成功が 600 cap の直下）
+//   - タイムアウトした6件のうち4件は out=69〜197 トークンを出しており「遅いが生産的」
+//   - つまり 600 は「深seek が必要とする時間」より短く、全体枠に余裕があるのに
+//     600 で打ち切って時間を捨てていた（delegation-health:fallback_chain_timeout）。
+// 全体 --timeout が 900 未満のセッションでは従来どおり --timeout が上限になるため
+// （この関数は min(timeoutSeconds, wanted) を返す）、既定の引き上げは総予算を超えない。
 export function fallbackBackendTimeoutSecs(timeoutSeconds, env = process.env) {
   const raw = Number(env.CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS);
-  const wanted = Number.isFinite(raw) && raw > 0 ? raw : 600;
+  const wanted = Number.isFinite(raw) && raw > 0 ? raw : 900;
   return Math.max(60, Math.min(timeoutSeconds, wanted));
 }
 
@@ -358,6 +365,16 @@ export function killProcessTree(child, { spawnImpl = spawnSync, platform = proce
     return;
   }
   try { child.kill('SIGKILL'); } catch { /* 既に終了している */ }
+}
+
+// フォールバック連鎖の残り予算。1バックエンドの上限(既定900秒)をそのまま次のバックエンドにも
+// 与えると、--timeout 600 で2バックエンドなら最大1200秒＝指定した全体枠の2倍を消費しうる。
+// 先に走った分を差し引き、残りが無ければ 0 を返して打ち切る（低成果のタイムアウトで
+// 時間を捨て続けるのを止める。2026-10-15）。
+export function chainBackendBudgetSecs(timeoutSeconds, elapsedSecs, env = process.env) {
+  const remaining = Math.floor(Number(timeoutSeconds) - Number(elapsedSecs));
+  if (!Number.isFinite(remaining) || remaining <= 0) return 0;
+  return Math.min(fallbackBackendTimeoutSecs(timeoutSeconds, env), remaining);
 }
 
 export function buildQwenEnv(baseEnv, apiKey, { model = 'deepseek-chat', baseUrl = 'https://api.deepseek.com/v1' } = {}) {
@@ -1054,9 +1071,14 @@ if (quotaCheck.matched || escalationFailed || launchUnavailable) {
       console.error('GEMINI_API_KEY、DEEPSEEK_API_KEY、OPENROUTER_API_KEY が無いためフォールバックを実行できません');
       result.status = 1;
     } else {
-      const backendTimeout = fallbackBackendTimeoutSecs(timeoutSeconds);
+      const chainStarted = Date.now();
       fallbackChain = [];
       for (const backend of backends) {
+        const backendTimeout = chainBackendBudgetSecs(timeoutSeconds, (Date.now() - chainStarted) / 1000);
+        if (backendTimeout <= 0) {
+          console.error(`[codex-do] フォールバック全体の時間枠(${timeoutSeconds}秒)を使い切ったため、残りのバックエンドは実行しません`);
+          break;
+        }
         const attemptStarted = Date.now();
         lastBackend = backend;
         console.log(`[codex-do] fallback backend=${backend.name} model=${backend.model}`);
