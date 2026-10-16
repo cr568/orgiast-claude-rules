@@ -2,8 +2,10 @@
 // このスクリプトは、このPC（DESKTOP-63MQR3L）の自動セッションから claude.ai コネクタの
 // RemoteTrigger ツール（claude.ai Routines API）を呼び出すための薄い CLI ラッパ。
 // 【重要制約】
-// RemoteTrigger で利用可能なアクションは list_triggers / get_trigger / create_trigger /
-// update_trigger / list_runs / run / get_run_log / create_webhook_trigger のみ。
+// RemoteTrigger で利用可能なアクションは list / get / create / update / run /
+// list_runs / get_run_log / create_webhook_trigger のみ。**2026-10-15 に実呼び出しで確認**:
+// list_triggers / get_trigger / update_trigger は存在しない値で、渡すとツール側が
+// 「not an allowed value」で拒否する（エラーにならず空振りするのではなく明示的に拒否される）。
 // 環境（environment）の egress 許可ドメインは RemoteTrigger API では読み書きできず、
 // claude.ai 側の Web UI 操作でのみ変更可能（2026-10-14 実証）。
 
@@ -20,12 +22,12 @@ import {
 } from './claude-ai-run.mjs';
 
 export const ACTIONS = Object.freeze([
-  'list_triggers',
-  'get_trigger',
-  'create_trigger',
-  'update_trigger',
-  'list_runs',
+  'list',
+  'get',
+  'create',
+  'update',
   'run',
+  'list_runs',
   'get_run_log',
   'create_webhook_trigger',
 ]);
@@ -35,7 +37,7 @@ export const ACTIONS = Object.freeze([
 export const PAYLOAD_HINTS = Object.freeze({
   run: '{"trigger_id":"trig_..."}',
   list_runs: '{"trigger_id":"trig_..."}',
-  get_trigger: '{"trigger_id":"trig_..."}',
+  get: '{"trigger_id":"trig_..."}',
   get_run_log: '{"session_id":"cse_..."}',
 });
 
