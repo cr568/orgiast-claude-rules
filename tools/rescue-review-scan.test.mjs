@@ -211,7 +211,7 @@ test('CLI 既定出力はサマリ行を先頭に出す', t => {
   const script = path.join(dirOf(import.meta.url), 'rescue-review-scan.mjs');
   const out = execFileSync(process.execPath, [script, '--repo', f.repo, '--main', 'main'], { encoding: 'utf8' });
   const lines = out.trim().split('\n');
-  assert.equal(lines[0], 'unique: 2 / duplicate: 1 / covered: 1 / covered-by-branch: 0 / error: 0');
+  assert.equal(lines[0], 'unique: 2 / duplicate: 1 / covered: 1 / covered-by-branch: 0 / covered-in-main: 0 / error: 0');
   assert.equal(lines.length, 5);
 });
 
@@ -256,5 +256,58 @@ test('CLI --no-compare-refs は照合を切り、サマリに covered-by-branch 
   assert.equal(withRefs.summary.coveredByBranch, 1);
   assert.equal(withRefs.summary.unique, 1);
   const without = execFileSync(process.execPath, [script, '--repo', f.repo, '--main', 'main', '--no-compare-refs'], { encoding: 'utf8' });
-  assert.equal(without.trim().split('\n')[0], 'unique: 2 / duplicate: 1 / covered: 1 / covered-by-branch: 0 / error: 0');
+  assert.equal(without.trim().split('\n')[0], 'unique: 2 / duplicate: 1 / covered: 1 / covered-by-branch: 0 / covered-in-main: 0 / error: 0');
+});
+
+// 同じ共通祖先から rescue のドラフトと main の改訂版を別々に作る。
+function supersededFixture(t, { novel = false, retainDeleted = false, missingFile = false } = {}) {
+  const f = fixture(t);
+  const write = text => fs.writeFileSync(path.join(f.repo, 'mode.js'), text);
+  const commit = message => { f.git('add', '.'); f.git('commit', '-m', message); };
+  write('legacyMode();\n');
+  commit('legacy mode');
+  f.git('checkout', '-b', 'rescue/draft');
+  const shared = ['function nativeSandboxMode() {', 'const mode = "native";', 'record(mode);', 'return mode;', '}'];
+  write(shared.join('\n') + '\n');
+  commit('draft mode');
+  f.git('checkout', 'main');
+  if (missingFile) f.git('rm', 'mode.js');
+  else write((retainDeleted ? 'legacyMode();\n' : '') + (novel ? 'unrelatedFeature();\n' : shared.join('\n') + '\nrecordLaneMode();\n'));
+  commit('revised main mode');
+  return f;
+}
+
+test('main が同じ箇所を改訂済みなら covered-in-main に分類する', t => {
+  const f = supersededFixture(t);
+  assert.notEqual(f.git('diff', 'main...rescue/draft'), '');
+  const b = byBranch(scanRescueBranches({ repo: f.repo, main: 'main' }))['rescue/draft'];
+  assert.equal(b.status, 'covered-in-main');
+  assert.equal(b.coveredInMain.addedRatio, 1);
+  assert.equal(b.coveredInMain.deletedStillInMainRatio, 0);
+  const script = path.join(dirOf(import.meta.url), 'rescue-review-scan.mjs');
+  const args = [script, '--repo', f.repo, '--main', 'main'];
+  const out = execFileSync(process.execPath, args, { encoding: 'utf8' });
+  assert.match(out, /covered-in-main: 1/);
+  assert.ok(out.includes('covered-in-main\trescue/draft\t1\t5+/1-\t(added 5/5 in main, deleted 0/1 still in main)'));
+  const json = JSON.parse(execFileSync(process.execPath, [...args, '--json'], { encoding: 'utf8' }));
+  assert.equal(json.summary.coveredInMain, 1);
+});
+
+test('追加行が main に存在しない新規機能は unique のまま', t => {
+  const f = supersededFixture(t, { novel: true });
+  const b = byBranch(scanRescueBranches({ repo: f.repo, main: 'main' }))['rescue/draft'];
+  assert.equal(b.status, 'unique');
+  assert.equal(b.coveredInMain, undefined);
+});
+
+test('追加行が main にあっても削除行が残存すれば unique のまま', t => {
+  const f = supersededFixture(t, { retainDeleted: true });
+  const b = byBranch(scanRescueBranches({ repo: f.repo, main: 'main' }))['rescue/draft'];
+  assert.equal(b.status, 'unique');
+});
+
+test('変更ファイルが main に存在しなければ unique に残す', t => {
+  const f = supersededFixture(t, { missingFile: true });
+  const b = byBranch(scanRescueBranches({ repo: f.repo, main: 'main' }))['rescue/draft'];
+  assert.equal(b.status, 'unique');
 });
