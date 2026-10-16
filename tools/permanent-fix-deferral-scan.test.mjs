@@ -208,3 +208,17 @@ test('疑問節つきの「可否」は引き続きP4で検出する', () => {
   ]) assert.ok(detect(quote).some(found => found.pattern === 'P4'), quote);
 });
 
+test('検証報告が監査IDを参照して引用した待機文は再検出しない', () => {
+  const excerpt = "**やったこと**: handoff-audit:3677714a0b69aad0（W / TJP-09「Codex の完了を待っています」）を実物検証し、runs/2026-10-14-2.summary.md に記録。**再発なし、かつ W ヒット自体が偽陽性**と確定 — 当該行は `verdict=skipped/reasonCodes=['stop_hook_active']`（Stop";
+  assert.deepEqual(detect(excerpt), [], excerpt);
+});
+test('角括弧なしの off-audit 参照でも引用を監査引用とみなす', () => {
+  const quote = 'off-audit:0123456789abcdef（W / TJP-09「Codex の完了を待っています」）を実物検証した。';
+  assert.deepEqual(detect(quote), [], quote);
+});
+test('監査参照を知らない素の待機文・引用外の待機文は引き続きWとして検出する', () => {
+  for (const quote of [
+    'TJP-09 はまだ実装中です。Codex（DeepSeek 経由）の完了を待っています。 次に kim がすること: なし（待つだけで大丈夫です）',
+    '今日の報告で「Codex の完了を待っています」と書いてしまった。'
+  ]) assert.deepEqual(detect(quote).map(found => found.pattern), ['W'], quote);
+});

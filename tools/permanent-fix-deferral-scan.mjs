@@ -29,16 +29,21 @@ const P1 = {
     return null;
   }
 };
-const AUDIT_MARKER = /\[handoff-audit:[0-9a-f]{16}\]|恒久修正の先送り文を検出（/;
+// 監査IDの参照は角括弧つき（handoff-audit の TODO 行）と角括弧なし（検証報告の本文）の両方がある。
+// 検証セッションの完了報告は `handoff-audit:<id>（W / TJP-09「…」）を実物検証し` の形で
+// 監査項目のタイトルを引用するため、括弧なし形を知らないと引用内の待機語を W と誤検出し、
+// 「検証の検証」を毎晩積む自己言及ループが再発する（2026-10-13T15:45 / session 0c5f9631 が実例）。
+const AUDIT_MARKER = /\[?handoff-audit:[0-9a-f]{16}\]?|\[?off-audit:[0-9a-f]{16}\]?|恒久修正の先送り文を検出（/;
 function isAuditCitation(text, index) {
   const quoteStart = text.lastIndexOf('「', index);
   if (quoteStart < 0 || text.indexOf('」', quoteStart + 1) < index) return false;
-  const before = text.slice(Math.max(0, quoteStart - 40), quoteStart);
-  if (AUDIT_MARKER.test(before)) return true;
-  // 実物の TODO はマーカーと引用の間に日時・session ID・判定を挟む。
   const lineStart = Math.max(text.lastIndexOf('\n', quoteStart - 1) + 1, 0);
-  return AUDIT_MARKER.test(text.slice(lineStart, quoteStart)) &&
-    /（[^\r\n「」]*\）$/.test(text.slice(lineStart, quoteStart));
+  if (!AUDIT_MARKER.test(text.slice(lineStart, quoteStart))) return false;
+  // 監査IDの近傍（80字以内）にある引用は、その項目の抜粋を引いたもの。
+  // 40字だと `handoff-audit:<16hex>（W / TJP-09` で ID の先頭が切れて認識できない。
+  if (AUDIT_MARKER.test(text.slice(Math.max(0, quoteStart - 80), quoteStart))) return true;
+  // 実物の TODO はマーカーと引用の間に日時・session ID・判定を挟む。
+  return /（[^\r\n「」]*）$/.test(text.slice(lineStart, quoteStart));
 }
 function auditAwareFind(regex, text) {
   for (const match of text.matchAll(new RegExp(regex, 'g'))) {
