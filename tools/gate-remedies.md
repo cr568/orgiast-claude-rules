@@ -65,7 +65,7 @@ tools/automation-routes.json の既存経路を実行してから証拠を示す
 
 ## internal-recipient-gmail-guard
 
-社内宛はチャットに宛先/用件/本文を提示。GitHubコメントの内部ハンドルは@を除く。
+社内宛は `node ~/orgiast-claude-rules/tools/discord-dm.mjs "<名前 or メール>" --body "<本文>"` で Discord DM を送る（送れない時だけチャットに宛先/用件/本文を提示）。GitHubコメントの内部ハンドルは@を除く。
 
 ## lane-abandonment-gate
 
