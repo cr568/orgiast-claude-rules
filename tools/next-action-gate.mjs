@@ -10,6 +10,10 @@ const MULTIPLE_ACTIONS_PATTERN = /[、,，・]/;
 const WAITING_PATTERN = /(完了通知|待ち|実行中|バックグラウンド|cron|定期実行|CI)/i;
 const BACKGROUND_PATTERN = /(バックグラウンド|実行中|完了通知|Codex が|走ってい)/i;
 const COMPLETE_PATTERN = /^なし\s*[（(]\s*完了\s*[）)]$/;
+const DEFERRAL_PATTERN = /(恒久策|恒久化|恒久的|次セッション|次回セッション|後日|先送り)/;
+const IMPLEMENTATION_PATTERN = /(実装|修正|改修|修復|作り直)/;
+const DELIVERY_PATTERN = /着地|マージ|\bPR\b|push|ブランチ|main に/;
+const DEFERRAL_REASON = '[NEXT-ACTION-DEFERRAL] 「次に kim がすること」に恒久修正の先送り（実装・修正・恒久化・次セッション対応）が書かれています。同じ文面は夜間監査 permanent-fix-deferral-scan が P3 として検出します（2026-10-14〜10-15 に 6 件）。kim に渡してよいのは「人が一度だけ実行できる具体的手順」だけです。自分で潰せるものはこのターン内に実装して着地させ、実行不能なら実行したコマンドと終了コードを本文に記録したうえで、移せる経路（例: Codex が生きている受信PCへの fleet-mail --exec codex 便）へ流してください。どうしても人にしかできない物理操作のときだけ、先送り語（恒久策・次セッション等）を使わず具体的な1手順だけを書いてください。';
 // kim が毎回同じ文で判断できるよう、表記ゆれを許さない完全一致の定型文にする（2026-09-25 kim 指示）。
 // 「閉じてよい」だけでは /session-close をこれからするのか、済んだので消してよいのかが分からない
 // （2026-10-01 kim 指示）ので、/session-close の状態とタブを閉じてよいかを1文に両方書く。
@@ -127,6 +131,9 @@ export function judgeNextAction(text, transcriptRaw = '') {
   }
   if (sessionState === 'closed' && !hasSessionCloseEvidence(source, transcriptRaw)) {
     return { decision: 'block', code: 'SESSION-CLOSE-NO-EVIDENCE', reason: `「このセッション: ${SESSION_PHRASES.closed}」とありますが、本文または会話に /session-close を実行した形跡がありません。/session-close を実行するか、「${SESSION_PHRASES.pending}」にしてください。` };
+  }
+  if (footer.nextAction !== 'なし' && (DEFERRAL_PATTERN.test(footer.nextAction) || (IMPLEMENTATION_PATTERN.test(footer.nextAction) && DELIVERY_PATTERN.test(body)))) {
+    return { decision: 'block', code: 'NEXT-ACTION-DEFERRAL', reason: DEFERRAL_REASON };
   }
   return { decision: 'pass', reason: 'valid-footer' };
 }

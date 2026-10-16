@@ -37,6 +37,41 @@ test('kimの作業が2件ならblock', () => {
   assert.equal(result.code, 'NEXT-ACTION-MULTIPLE');
 });
 
+test('唯一の恒久策を kim に渡す実文はblock', () => {
+  const text = `${body}\n次に kim がすること: 本PCで gh auth login を1回実行する（唯一の恒久策）\nこの後の自動進行: なし（完了）\nこのセッション: ${SESSION_PHRASES.delete}`;
+  const result = judgeNextAction(text);
+  assert.equal(result.decision, 'block');
+  assert.equal(result.code, 'NEXT-ACTION-DEFERRAL');
+});
+
+test('恒久策として gh auth login を求める実文はblock', () => {
+  const text = `${body}\n次に kim がすること: 恒久策として gh auth login を本PCで1回だけ実行すると移送が不要になります\nこの後の自動進行: なし（完了）\nこのセッション: ${SESSION_PHRASES.delete}`;
+  const result = judgeNextAction(text);
+  assert.equal(result.decision, 'block');
+  assert.equal(result.code, 'NEXT-ACTION-DEFERRAL');
+});
+
+test('本文の着地語と nextAction の修正語が揃う実文はblock', () => {
+  const text = `${body} この PC で認証しない限り本PCの修正は main に着地しません。\n次に kim がすること: 本PCの修正を完了させる\nこの後の自動進行: なし（完了）\nこのセッション: ${SESSION_PHRASES.delete}`;
+  const result = judgeNextAction(text);
+  assert.equal(result.decision, 'block');
+  assert.equal(result.code, 'NEXT-ACTION-DEFERRAL');
+});
+
+test('印刷所への電話は正当な人専用タスクとしてpass', () => {
+  const text = `${body}\n次に kim がすること: 印刷所へ電話して納期を確認する\nこの後の自動進行: なし（完了）\nこのセッション: ${SESSION_PHRASES.delete}`;
+  assert.equal(judgeNextAction(text).decision, 'pass');
+});
+
+test('次に kim がすることが「なし」なら先送り判定せずpass', () => {
+  assert.equal(judgeNextAction(`${body}\n${footer}`).decision, 'pass');
+});
+
+test('本文に着地語がない修正版PDFの物理操作はpass', () => {
+  const text = `${body}\n次に kim がすること: 修正版のPDFを印刷して同封する\nこの後の自動進行: なし（完了）\nこのセッション: ${SESSION_PHRASES.delete}`;
+  assert.equal(judgeNextAction(text).decision, 'pass');
+});
+
 test('待ち状態と完了表記が矛盾すればblock', () => {
   const result = judgeNextAction(`${body} Codex の完了通知待ちです。\n${footer}`);
   assert.equal(result.decision, 'block');
