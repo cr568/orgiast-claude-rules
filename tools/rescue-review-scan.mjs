@@ -97,6 +97,51 @@ function fingerprintMapForRefs({ git, dir, main, refs }) {
   return map;
 }
 
+// パッチを再利用し、全変更ファイルの追加・削除行を main と逐語比較する。
+function coverageInMain({ git, dir, main, patch, files }) {
+  const changes = [];
+  let current;
+  let inHunk = false;
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      current = null;
+      inHunk = false;
+    } else if (!inHunk && line.startsWith('+++ b/')) {
+      current = { file: line.slice(6), added: [], deleted: [] };
+      changes.push(current);
+    } else if (line.startsWith('@@ ')) {
+      inHunk = true;
+    } else if (inHunk && current && (line[0] === '+' || line[0] === '-')) {
+      const text = line.slice(1).trim();
+      if (text) current[line[0] === '+' ? 'added' : 'deleted'].push(text);
+    }
+  }
+  // 削除ファイルや binary 等、全ファイルを照合できなければ判定しない。
+  if (changes.length !== files) return null;
+  let addedLines = 0;
+  let addedInMain = 0;
+  let deletedLines = 0;
+  let deletedStillInMain = 0;
+  for (const change of changes) {
+    let lines;
+    try {
+      lines = new Set(git(dir, ['show', `${main}:${change.file}`]).split('\n').map(line => line.trim()));
+    } catch {
+      return null;
+    }
+    addedLines += change.added.length;
+    addedInMain += change.added.filter(line => lines.has(line)).length;
+    deletedLines += change.deleted.length;
+    deletedStillInMain += change.deleted.filter(line => lines.has(line)).length;
+  }
+  if (!addedLines) return null;
+  const addedRatio = addedInMain / addedLines;
+  const deletedStillInMainRatio = deletedLines ? deletedStillInMain / deletedLines : 0;
+  return addedRatio >= 0.8 && deletedStillInMainRatio <= 0.2
+    ? { addedRatio, deletedStillInMainRatio, addedLines, addedInMain, deletedLines, deletedStillInMain }
+    : null;
+}
+
 export function scanRescueBranches({
   repo,
   main = 'origin/main',
@@ -146,7 +191,8 @@ export function scanRescueBranches({
     if (coveredBy) {
       results.push({ branch, files, added, deleted, fingerprint, status: 'covered-by-branch', coveredBy });
     } else {
-      results.push({ branch, files, added, deleted, fingerprint, status: 'unique' });
+      const coveredInMain = coverageInMain({ git, dir, main, patch, files });
+      results.push({ branch, files, added, deleted, fingerprint, status: coveredInMain ? 'covered-in-main' : 'unique', ...(coveredInMain ? { coveredInMain } : {}) });
     }
   }
   results.sort((a, b) => (a.branch < b.branch ? -1 : a.branch > b.branch ? 1 : 0));
@@ -154,9 +200,10 @@ export function scanRescueBranches({
 }
 
 function summarize(branches) {
-  const summary = { unique: 0, duplicate: 0, covered: 0, coveredByBranch: 0, error: 0, total: branches.length };
+  const summary = { unique: 0, duplicate: 0, covered: 0, coveredByBranch: 0, coveredInMain: 0, error: 0, total: branches.length };
   for (const b of branches) {
-    if (b.status === 'covered-by-branch') summary.coveredByBranch += 1;
+    if (b.status === 'covered-in-main') summary.coveredInMain += 1;
+    else if (b.status === 'covered-by-branch') summary.coveredByBranch += 1;
     else if (Object.prototype.hasOwnProperty.call(summary, b.status)) summary[b.status] += 1;
   }
   return summary;
@@ -186,6 +233,10 @@ function formatLine(b) {
   const base = `${b.status}\t${b.branch}\t${b.files}\t${b.added}+/${b.deleted}-`;
   if (b.status === 'duplicate' && b.duplicateOf) return `${base}\t(duplicate of ${b.duplicateOf})`;
   if (b.status === 'covered-by-branch' && b.coveredBy) return `${base}\t(covered by ${b.coveredBy})`;
+  if (b.status === 'covered-in-main') {
+    const c = b.coveredInMain;
+    return `${base}\t(added ${c.addedInMain}/${c.addedLines} in main, deleted ${c.deletedStillInMain}/${c.deletedLines} still in main)`;
+  }
   if (b.status === 'error' && b.error) return `${base}\t(${b.error})`;
   return base;
 }
@@ -210,7 +261,7 @@ function run(argv) {
     return;
   }
   const lines = [
-    `unique: ${summary.unique} / duplicate: ${summary.duplicate} / covered: ${summary.covered} / covered-by-branch: ${summary.coveredByBranch} / error: ${summary.error}`,
+    `unique: ${summary.unique} / duplicate: ${summary.duplicate} / covered: ${summary.covered} / covered-by-branch: ${summary.coveredByBranch} / covered-in-main: ${summary.coveredInMain} / error: ${summary.error}`,
   ];
   for (const b of branches) lines.push(formatLine(b));
   process.stdout.write(`${lines.join('\n')}\n`);
