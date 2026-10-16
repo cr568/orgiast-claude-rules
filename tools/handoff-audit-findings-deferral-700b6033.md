@@ -148,3 +148,24 @@
 |---|---|
 | U5 | `feat/proni-case-dump` を PR 化してよいか、その前に添付セレクタを実スナップショットで検証すべきか（判断は kim）。 |
 | U6 | 3 回のダンプ run の**成果物**（artifact / 出力）が実際に添付を取得できていたか。本セッションは run の status のみ確認し、artifact の中身は開いていない。 |
+
+### 7.6 本記録自体がまだ main に載っていない理由（実測・2026-10-17）
+
+`node tools/pr-merge-eligibility.mjs --repo kimkon1011/orgiast-claude-rules` の実測:
+
+```
+open 34 件: ineligible_author=2 / ineligible_draft=2 / ineligible_fork=25 / manual_merge_required=1 / missing_label=4
+#826 ineligible_fork (BLOCKED)  → head が fork（cr568）のため自動マージ対象外
+#816 ineligible_fork (UNKNOWN)  → 同上
+```
+
+- `gh api repos/kimkon1011/orgiast-claude-rules --jq .permissions` = `{"pull":true,"push":false}`。
+  cr568 は base リポに push できず、`gh pr edit --add-label automerge` も
+  `cr568 does not have the correct permissions` で拒否される（実測）。
+- `auto-merge.yml` は `head_repo != GITHUB_REPOSITORY` を **eligible=false** にする設計なので、
+  **この fork から出た PR はラベルが付いても永久に自動マージされない**（`docs/pr-merge-eligibility-route.md` に既記載。不具合ではない）。
+- 帰結: 本記録も、**§2 の誤検出を直す PR #816 も**、この 25 件の滞留に並んでいる。
+  つまり「先送り検出の誤検出が直らない」の原因は検出器のコードではなく **記録が main に載らないこと**である。
+- 台帳上の fork 滞留は `docs/pr-merge-eligibility-route.md` の時点で 8 件 → 本実測で **25 件**（約 3 倍）。
+  本セッションは **base リポへ push できない**ため、載せ替え（fork 枝 → base 枝）は実行できない。
+  ここは §6 と同じく**人手 1 回に集約**される（kim-PC 側でのマージ、または branch 載せ替えの自動化）。
