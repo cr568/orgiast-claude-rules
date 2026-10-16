@@ -66,6 +66,17 @@
         "repo": "FEEDBACK_BBB271DAAB67_REPO",
         "appDir": "FEEDBACK_BBB271DAAB67_APP_DIR"
       }
+    },
+    {
+      "appName": "学会制作最終チェック",
+      "kind": "gas",
+      "intake": "relay",
+      "refs": {
+        "url": "FEEDBACK_RELAY_URL",
+        "secret": "FEEDBACK_RELAY_SECRET",
+        "repo": "FEEDBACK_53423A14CB08_REPO",
+        "appDir": "FEEDBACK_53423A14CB08_APP_DIR"
+      }
     }
   ]
 }
