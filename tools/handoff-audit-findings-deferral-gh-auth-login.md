@@ -114,3 +114,62 @@ node tools/permanent-fix-deferral-scan.mjs --since 2026-10-16T00:00:00Z
 ---
 
 作成: 2026-10-17 / 検証: `tools/permanent-fix-deferral-scan.mjs`・`node --test`・`git worktree` による pristine 比較
+
+---
+
+## 追検証（2026-10-17 / DESKTOP-63MQR3L・`1449168b` を対象に）
+
+対象 `[handoff-audit:a1737a575ff7e67f]`（`2026-10-14T18:30:18.122Z / 1449168b / P3`）は
+本記録 §2 の表の2行目＝**同一型**（「このPC（cafe015-PC）で1回 `gh auth login` を実行するか、
+GitHub トークンを keyserve に」）。検出器・台帳を実物で再走査した。
+
+### 再発なし（空振りでないことの確認つき）
+
+```
+node tools/permanent-fix-deferral-scan.mjs --since 2026-10-15T18:00:00Z
+```
+
+| 台帳 | hits / total | 窓内の行数 |
+|---|---|---|
+| `stop-gate-runner-ledger.jsonl` | **0** / 326 | 67（`18:00:13Z`〜`10-16T15:53Z`） |
+| `handoff-audit-ledger.jsonl` | **0** / 491 | 97（`18:00:12Z`〜`10-16T15:53Z`） |
+| `handoff-audit-nightly-ledger.jsonl` | **0** / 1 | — |
+
+窓内に計 164 行があるので「0 件」は行が無いことによる空振りではない。
+同条件で歴史窓 `--since 2026-10-14T00:00:00Z --until 2026-10-15T18:00:00Z` を回すと **6 件**
+（P3:5 / P2:1）を再検出し、対象 `2026-10-14T18:30:18.122Z 1449168b` も含まれる
+＝**検出器は生きており、直近の 0 件は本物**。最後の `gh auth login` 先送りは `2026-10-15T17:09:28Z`。
+
+### このPCも同じ詰まり（実測・修正文書の前提を裏づけ）
+
+| 実測 | コマンド | 結果 |
+|---|---|---|
+| `gh` が無い | `command -v gh` / `where gh` | 該当なし（未インストール） |
+| 資格情報が無い | `GCM_INTERACTIVE=never GIT_TERMINAL_PROMPT=0 git credential fill` | **exit 128**「could not read Username」 |
+| ハングする | `timeout 15 git credential fill` | **exit 124** |
+| 保管なし | `cmdkey /list`（github） | エントリなし |
+| SSH 不可 | `ssh -T git@github.com` | Permission denied (publickey)／`~/.ssh` に鍵なし |
+| push 不可 | `GIT_TERMINAL_PROMPT=0 git push -u origin <branch>` | **exit 124（ハング）** |
+| 取得は可 | `git fetch origin main` | 成功（公開リポジトリ） |
+
+→ `gh auth login` を kim に頼む文面は、この PC でも **実行不能な唯一の経路**を指していた（原文の型の再発条件そのもの）。
+
+### 書込み時の恒久策を追加（この型を配信前に止める）
+
+夜間検出は**翌晩**なので、先送りは kim へ配信済みでしか気づけない。同じ定義を
+配信前の Stop ゲートに移した:
+
+- `tools/next-action-gate.mjs` に `NEXT-ACTION-DEFERRAL` を追加（`93202e7`）。
+  規則A＝`次に kim がすること` に 恒久策/恒久化/恒久的/次セッション/次回セッション/後日/先送り。
+  規則B＝同値に 実装/修正/改修/修復/作り直 かつ本文に着地語（着地/マージ/PR/push/ブランチ/main に）。
+- 検証: `tools/next-action-gate.test.mjs` 41 pass（新規6件）。実文 `1449168b`・`462a3318` で block を実測、
+  正当な人専用タスク（印刷所へ電話）と物理操作（修正版PDFを印刷して同封）は pass のまま。
+  `tools/*.test.mjs` の fail 12 は既知の既存赤 `tools/fleet-mail-v2.test.mjs`（`origin/main` と同数）。
+
+### 残り（この PC から着地できない）
+
+`auto/20261017-gh-auth-deferral`（`origin/main` = `7354040` に rebase 済み・2コミット）は
+**未push**。この PC には push 経路が無い（上表）。fleet-mail の `--exec codex` 便も
+`looksLikeInstallRequest` ガード（exit 5「全PCの設定変更は setup --converge 経由」）と
+本文 20,000 文字上限（patch が 28KB）で今回は積めなかった。
+→ 資格情報のある PC（例: w018-PC／kim-PC）での `git am` + push + PR が必要（残TODOに記録）。
