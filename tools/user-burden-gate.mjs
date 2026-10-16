@@ -12,6 +12,33 @@ const explicitCommandRequest = /(?:コマンド|貼る|貼り付け)[^。\r\n]{0
 const tried = /試した|試行|実行|拒否|失敗|403|classifier|不可|不能/i;
 const directAttempt = /Claude|自身|直接|①|CLI|PowerShell|Bash/i;
 const alternateAttempt = /MCP|CLI|定期ジョブ|fleet|自己修復|別経路|②/i;
+const unresolvedFact = /未確認|不明|わからない|分からない|要確認|持ち主|未特定/;
+
+function unresolvedHandoffLines(prose, nextActions) {
+  const lines = prose.split(/\r?\n/);
+  const handoff = new Set(nextActions.map(match => match[0].trim()));
+  let handoffSection = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^[ \t]*(?:手順|場所)[ \t]*[:：]?[ \t]*$/.test(line)) {
+      handoffSection = true;
+      continue;
+    }
+    if (!line.trim()) {
+      handoffSection = false;
+      continue;
+    }
+    const numbered = /^[ \t]*(?:\d+|[０-９]+)[.)．、][ \t]+/.test(line);
+    if (numbered && (handoffSection || /手順|場所/.test(line))) {
+      handoff.add(line.trim());
+      for (let next = index + 1; next < lines.length && /^\s+\S/.test(lines[next]); next += 1) handoff.add(lines[next].trim());
+    } else if (!numbered && !/^\s+\S/.test(line)) {
+      handoffSection = false;
+    }
+  }
+  return [...handoff].filter(line => unresolvedFact.test(line));
+}
+
 export function judgeUserBurden(text, humanText = '') {
   const source = String(text || '');
   // コマンドや引用例を依頼・監査・例外宣言として解釈しない。
@@ -24,6 +51,11 @@ export function judgeUserBurden(text, humanText = '') {
     || /(?:確認|選択|保存|送信|ダウンロード|インストール|再起動|操作|コピー|貼り付け)(?:し)?て[ \t]*(?:ください|下さい|ほしい|もらえ)/.test(prose)
     || /(?:開いて|押して|貼って|選んで|進んで)[ \t]*(?:ください|下さい|ほしい|もらえ)/.test(prose);
   if (!triggered) return { decision: 'pass', triggered: false, missing: [] };
+  const unresolved = unresolvedHandoffLines(prose, nextActions);
+  if (unresolved.length) {
+    const missing = unresolved.map(line => `[UNRESOLVED-IN-HANDOFF] 手渡しの中に未確認の事実が残っています: 「${line}」。user に調べさせず、Gmail（業者名で receipts/notifications/invoice を検索）・memory の reference_*・keyserve・vendor API で特定してから渡してください。`);
+    return { decision: 'block', triggered: true, missing, code: 'UNRESOLVED-IN-HANDOFF', reason: missing.join('\n') };
+  }
   if (/\[BURDEN-OK\][ \t]+\S[^\r\n]*/.test(prose)) {
     return { decision: 'pass', triggered: true, missing: [], reason: 'burden-ok' };
   }

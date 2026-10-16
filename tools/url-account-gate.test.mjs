@@ -71,6 +71,11 @@ test('メール・太字名・ランチャーでアカウントを指定', () =>
   for (const annotation of ['**開いてください**', 'アカウントで開く', 'open-url-as.ps1']) assert.deepEqual(judge(`${studio} ${annotation}`).missing, [studio]);
 });
 
+test('未確認を含む曖昧な管理アカウント指定は不採用', () => {
+  assert.deepEqual(judge(`${studio} **OpenRouter の管理アカウント（ログインメールは未確認）** で開く`).missing, [studio]);
+  assert.deepEqual(judge(`${studio} **seisaku-team@orgiast.jp** で開く`).missing, []);
+});
+
 test('コードフェンスを無視し、例外もフェンス外のみ有効', () => {
   assert.equal(judge(`\x60\x60\x60text\n${studio}\n\x60\x60\x60`).triggered, false);
   assert.equal(judge(`${studio}\n[URL-ACCOUNT-OK]`).triggered, false);
