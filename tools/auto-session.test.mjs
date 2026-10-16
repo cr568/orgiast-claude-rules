@@ -1000,6 +1000,18 @@ test('buildPrompt は PR に automerge ラベルを付け、CI 緑を待たず�
   assert.ok(prompt.includes('gh pr merge --squash'));
 });
 
+test('buildPrompt は GitHub 経路を実測し、不能なら先送りせず exec codex 便へ移送させる', () => {
+  const prompt = buildPrompt('実装する', {}, '/repo', '/tmp/run.summary.md', 60);
+  assert.ok(prompt.includes('command -v gh'));
+  assert.ok(prompt.includes('where gh'));
+  assert.ok(prompt.includes('timeout 15'));
+  assert.ok(prompt.includes('exit 124'));
+  assert.ok(prompt.includes('gh auth login'));
+  assert.ok(prompt.includes('w018-PC'));
+  assert.ok(prompt.includes('--exec codex'));
+  assert.ok(prompt.includes('先送りを書かず'));
+});
+
 test('localDate は Date のローカル日付を YYYY-MM-DD で返す', () => {
   const date = new Date('2026-08-26T18:20:00Z');
   const expected = [
