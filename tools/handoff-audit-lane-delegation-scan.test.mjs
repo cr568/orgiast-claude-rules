@@ -6,11 +6,11 @@ import path from 'node:path';
 import { detect, firstMatch, selftest, scan, stripBanners, CONTROLS } from './handoff-audit-lane-delegation-scan.mjs';
 
 // 走査結果の「0 件」は、検出器が動いていなければ意味を持たない。
-// 対照（陽性6・陰性6）が全通過することを先に固定する。
-test('検出器の対照が全通過する（陽性6・陰性6）', () => {
+// 対照（陽性7・陰性6）が全通過することを先に固定する。
+test('検出器の対照が全通過する（陽性7・陰性6）', () => {
   const r = selftest();
   assert.equal(r.passed, r.total, JSON.stringify(r.failures));
-  assert.equal(r.total, 12);
+  assert.equal(r.total, 13);
   assert.ok(CONTROLS.some((c) => c.want === true), '陽性対照が無いと 0 件が無意味になる');
   assert.ok(CONTROLS.some((c) => c.want === false), '陰性対照が無いと常時 true の検出器を見逃す');
 });
@@ -25,6 +25,19 @@ test('委譲語と実行中語が近接したときだけ陽性', () => {
 test('委譲しても完了していれば陽性にしない（実行中語が無い）', () => {
   assert.equal(detect('Codex に委譲して実装完了、テスト全件 PASS しました。'), false);
   assert.equal(detect('委譲判定: 実装=Codex（完了）→ 監督 verify 完了。'), false);
+});
+
+// 「委譲語＋完了待ち」は、委譲先の完了を実測せず報告を閉じる型なので陽性にする。
+// 「完了」単体（実装完了・verify 完了）は上で陰性のまま＝語を広げすぎていないことを固定する。
+test('委譲先の完了待ちは陽性（通知を挟まない variant を含む）', () => {
+  assert.equal(detect('実装レーン（codex-do → Gemini フォールバック）の完了待ちです。'), true);
+  assert.equal(detect('Codex の T1〜T3 と Drive アップロードの完了を待っています。'), true);
+});
+
+// 限界の明示: 実行中語が入っても DELEG 語（裸の「Gemini」は DELEG ではない）が
+// 80 文字以内に無ければ陰性のまま。02:17:35Z の「終了通知を待ちます」単独がその実例。
+test('DELEG 語が近傍に無い完了待ちは陰性（裸の Gemini は DELEG ではない）', () => {
+  assert.equal(detect('Gemini は引き続きシェル拒否のまま進行中です。終了通知を待ちます。'), false);
 });
 
 test('実行中語だけ（委譲語が無い）は陽性にしない', () => {
