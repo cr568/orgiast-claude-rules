@@ -316,3 +316,96 @@ open 34 件: ineligible_author=2 / ineligible_draft=2 / ineligible_fork=25 / man
 |---|---|
 | U9 | 追加語彙（`完了待ち` 系）が、検証記録の自己引用以外に FP を生むか。本セッションは台帳+transcript の窓を人手で分類しただけで、全履歴の機械分類はしていない。 |
 | U10 | 変更した検出器が `origin/main` に載って初めて次回以降の走査に効く（fork 枝・`push:false` のため人手マージが必要。§7.6 と同じ 1 回に集約）。 |
+
+---
+
+## 10. 兄弟 TODO `c3fa3e7e50ae5bc0`（他AIレーンの失敗・拒否を放置して別レーン/Sonnetへ引き継ぐ）の個別検証（2026-10-17 追記）
+
+### 10.1 原文（一次証拠）
+
+`W`（先送り文）ではなく **夜間の handoff 監査（rule 13）** から出た 1 件。出典は次の 2 ファイルで、同じ夜・同じ session の別パターン。
+
+| 出典 | 実測 |
+|---|---|
+| `~/.claude/handoff-audit-nightly-ledger.jsonl` | `ts=2026-10-15T18:01:42.572Z` / `observation=5fbb1db5ede53cc4942c4cbc2774dfdcd0135031b97db07bc9fa8e87b14167cb` / `sessionId=700b6033-3e9a-40d0-a57a-5cef9cb84937` / **`verdict=block`** / `provider=deepseek` |
+| `~/.claude/handoff-audit-promotions.jsonl`（1 行のみ） | `ts=2026-10-15T18:01:42.445Z` / `pattern=他AIレーン（Gemini等）の失敗・拒否を放置して別レーン/Sonnetへ引き継ぐ` / **`route=codex-do.mjs`** / `confidence=high` |
+
+同 `verdict=block` に記録された違反は 3 件（原文の quote は次表）。**起票日時＝2026-10-15T18:01:42Z（JST 2026-10-16 03:01）**と確定できる。
+
+| rule | quote（原文） | 求められた fix |
+|---|---|---|
+| 13 | 「Gemini レーンはシェル実行を拒否され続けています（git・pnpm・gh が使えない状態）。」 | lane-doctor で復旧→生存レーンへ再委譲。当ターンに lane-doctor の tool_use が無いまま Claude 本体/Sonnet へ戻るのは禁止。全滅時のみ `[LANE-FALLBACK]` 理由を明記 |
+| 12 | 「Gnome レーンはシェル実行を拒否され続けています（git・pnpm・gh が使えない状態）」（引用の誤記だが同一文を指す） | 「拒否され続けている」の根拠となる当ターンの tool_result を確認。未試行なら該当経路を実際に試す |
+| 2 | 「未完分は Sonnet エージェントへ引き継ぎます。」 | Sonnet に渡す前に失敗レーンを lane-doctor で復旧して生存レーンへ再委譲 |
+
+＝ §7〜§9 の `W` 4 件（すべて deferral-scan 由来）とは**発生源が別**で、session 700b6033 の同じ夜の監査から同時に出ている。
+
+### 10.2 再発の有無（実物の台帳を全走査）
+
+| 走査 | 実測（2026-10-17 本セッション） |
+|---|---|
+| `~/.claude/course-corrections-ledger.jsonl` の起票後（`ts > 2026-10-15T18:01:42.445Z`） | **100 行** = `lane-abandonment` **pass 99** + `course-correction` warn 1。**`block` は 0 件** |
+| 同 warn 1 件（`2026-10-16T00:06:08.023Z` / session `279db814` / `id=CC-001`） | **偽陽性**（10.2.1）。`textHit=false` の evidence-only 一致＝設計上 `warn` どまり |
+| `node tools/handoff-audit-*` の text 規則を独立に再走査（起票後の transcript 15 ファイル / assistant text） | **text hit 0 件** |
+| `~/.claude/handoff-audit-nightly-ledger.jsonl` の起票後 | `2026-10-15T18:01:57.324Z`（`rule4+rule4+rule10` ＝別パターン）1 行のみ。**rule 13 の新規 verdict は 0** |
+
+**真の再発は 0 件。** ただし後述のとおり「行が無い」ことによる 0 が 1 つ混じる（10.5）。
+
+### 10.2.1 唯一の warn が偽陽性である根拠（session 279db814）
+
+`CC-001` の `detectEvidence`（`全候補が失敗|demote中|usage limit|HTTP 429|credits are depleted|RESOURCE_EXHAUSTED`）が、
+**レーンの実障害ではなく「そのターンに読んでいたソース・ログ本文」に一致**した。
+
+| # | tool_result 内の一致部分（実測） | 実体 |
+|---|---|---|
+| 1 | `// 実体は z.ai Coding Plan の weekly/monthly 上限到達(HTTP 429 / error.code 1310, "Weekly/Monthly Limit Exhausted")。` | `tools/delegation-health-check.mjs` のコメントを Read |
+| 2 | `feat(lanes): 使えないAIレーンを放置しない — WSL不在時は native codex 既定… (#793)` | `git log` 出力 |
+| 3 | `✔ detectQuotaLimit: U+2019 の引用符つき usage limit 文言を検出する` | `node --test` の出力 |
+
+### 10.3 起票の前後（同日に型は動いていた）
+
+| ts | session | verdict | 中身（実測） |
+|---|---|---|---|
+| `2026-10-15T12:26:50.039Z` | `8ee4682f` | block | **FP**。failure 信号の実体は `next-session.md` の TODO 文（`[delegation-health:codex_lane_unavailable] …Codex のログインを…`）を Read した結果で、報告文は session-close のもの |
+| `2026-10-15T13:01:25.050Z` | `6fb16e18` | block | 同上（**FP**） |
+| `2026-10-16T00:06:08.023Z` | `279db814` | warn | **FP**（10.2.1） |
+
+起票（10-15T18:01Z）以降の `block` は 0 件。10-12〜10-13 の real な block（`🚨 WSL ディストリが見つかりませんでした` 系 6 件）は**起票前**。
+
+### 10.4 経路（`codex-do.mjs`）は実在するか
+
+- 起票が名指しした route の恒久修正は同日に main へ入っている:
+  `09eae00 feat(lanes): 使えないAIレーンを放置しない — WSL不在時は native codex 既定・stale✅廃止・オートチャージ故障の検知 (#793)`
+  （2026-10-15 09:24:54Z）。`git merge-base --is-ancestor 09eae00 origin/main` = **YES**（実測）。
+- `tools/codex-do.mjs`（1159 行）側の実装（実測）:
+  - `wslCodexLaunchPlan()` — WSL 経路が使えないとき **native codex を既定**にし、native も不可なら `abort`（黙って Claude 本体へ戻らない）。
+  - codex が `usage_limit` クールダウン中 — 起動を飛ばして fallback 連鎖へ渡す（`codex_cooldown…のため codex を起動せず代替バックエンドへ回します`）。
+  - `isBackendExhausted()`（429/413/quota）— 次バックエンドへ落とす。
+  - `recordLaneMode()` — `~/.claude/lane-mode.json` にレーン状態（mode/sandbox/verifiedAt）を記録。
+  - `~/.claude/codex-fallback-order.json` で fallback 順を上書き可。
+  - `tools/delegation-health-check.mjs` に `lane_outage_unrepaired`（未修理全滅）検出がある。
+
+＝ 「使えないAIレーンを放置しない」は文書だけでなく**実行経路として実装済み**。
+
+### 10.5 検出器側の隙間（記録のみ・コードは変えない）
+
+| # | 隙間（実測にもとづく） |
+|---|---|
+| G1 | 行動ベースの `lane-abandonment-gate` は `eligible = /fable\|opus/i.test(currentModel) && failedAt>=0`。**Claude 本体（Fable/Opus）でしか block しない**。ヘッドレス自動セッションは cheap-code（deepseek）で回るため、この型は自動セッション内では行動ベースでは捕まらない |
+| G2 | 自動セッションを覆うのは **text 規則 CC-001**（`course-correction-gate`。免除は `sonnet\|haiku` のみ＝ deepseek 等は対象）。ただし ledger は**当たった時だけ**追記するため「行が無い＝0 件」は弱い（起票後は 10.2 の独立再走査で 0 を補強した） |
+| G3 | 夜間 LLM 監査は 2026-10-15T18:01Z 以降、行を出していない。次回は 10-17 03:01 JST のため、**10-16 夜の rule 13 判定は未確認**（「0 件」ではなく「行が無い」） |
+| G4 | `CC-001` の evidence-only 一致は実測 3 件すべて FP（10.2.1）。evidence 正規表現が「読んだソース/ログ本文」に当たる。恒久修正（例: 実行系コマンドの tool_result に限定）は**今回行わない**（§4 / §8.4 と同じ判断でまず記録） |
+
+### 10.6 結論
+
+`[handoff-audit:c3fa3e7e50ae5bc0]` は**起票後に再発していない**（実測: 行動ベース block 0 / text 0 / 独立再走査 0）。
+名指しされた経路 `codex-do.mjs` は main に実装済みで、「失敗レーンを放置せず再委譲する」が実行経路として存在する。
+残るのは **G1〜G4 の検出器側の隙間**（いずれも記録のみ・コード変更なし）と、**§7.6 と同じ PR #826 の人手マージ 1 回**。
+
+### 10.7 未確認（追記分）
+
+| # | 未確認事項 |
+|---|---|
+| U11 | 10-16 夜の夜間監査（rule 13）の結果。本セッションの時点で行が無い（G3）。 |
+| U12 | G1（行動ベース gate が Fable/Opus 限定）を広げた場合の FP 率。広げずに記録のみとした（§4 と同じ判断）。 |
+| U13 | G4 の恒久修正（evidence を実行系 tool_result に限定）の実装。今回は記録のみ。 |
