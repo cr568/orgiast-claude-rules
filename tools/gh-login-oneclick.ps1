@@ -1,4 +1,4 @@
-# GitHub 認証を「1回だけ」行い、そのまま溜まっている未pushブランチを着地させる。
+﻿# GitHub 認証を「1回だけ」行い、そのまま溜まっている未pushブランチを着地させる。
 # きっかけ: このPCは gh 未インストール・GCM に保存済み資格情報なし・SSH 鍵なしで、
 #   git push が資格情報プロンプトでハングし、未pushブランチが main に着地しない状態が続いていた。
 #   資格情報の取得だけは GitHub アカウントの持ち主（kim）の同意が必須＝他の全工程はここで自動化する。
@@ -10,8 +10,19 @@ if (-not (Test-Path $gcm)) { Write-Host "NG: Git Credential Manager が見つか
 
 # 着地させる対象。1行 = <repo パス>|<ブランチ名>。空行と # 始まりは無視。
 $queueFile = Join-Path $env:USERPROFILE '.claude\github-landing-queue.txt'
-# 認証の検証に使うリポジトリ（push が実際に通るかを確かめる）
-$probeRepo = 'C:\Users\kimko\.claude\nightly-repo'
+# 認証の検証に使うリポジトリ（push が実際に通るかを確かめる）。
+# このPC専用パスを書かない: キュー先頭のリポジトリ → 既知の候補 の順に、実在するものを使う。
+$probeCandidates = @()
+if (Test-Path $queueFile) {
+  $probeCandidates += Get-Content -LiteralPath $queueFile -Encoding UTF8 |
+    Where-Object { $_.Trim() -ne '' -and -not $_.Trim().StartsWith('#') } |
+    ForEach-Object { ($_.Split('|')[0]).Trim() }
+}
+$probeCandidates += @(
+  (Join-Path $env:USERPROFILE '.claude\nightly-repo'),
+  (Join-Path $env:USERPROFILE 'orgiast-claude-rules')
+)
+$probeRepo = $probeCandidates | Where-Object { $_ -and (Test-Path (Join-Path $_ '.git')) } | Select-Object -First 1
 
 Write-Host '=== GitHub の認証を1回だけ行います ==='
 Write-Host 'ブラウザが開いたら GitHub にサインインし、画面に出たコードを貼り付けてください。'
@@ -22,8 +33,12 @@ Write-Host ''
 & $gcm github login --device
 if ($LASTEXITCODE -ne 0) { Write-Host "NG: 認証に失敗しました (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
 
-# ハング防止: 以降の git は資格情報が無ければプロンプトせず即失敗させる
+# ハング防止: 以降の git は資格情報が無ければプロンプトせず即失敗させる。
+# ※ GIT_TERMINAL_PROMPT=0 だけでは GCM の GUI プロンプトが開いて push が固まる（実測: 45秒タイムアウト）。
+#   credential.interactive=false / guiPrompt=false を併用すると 1秒未満で失敗する（実測 exit=128）。
 $env:GIT_TERMINAL_PROMPT = '0'
+$env:GCM_INTERACTIVE = 'never'
+$gitNoPrompt = @('-c', 'credential.interactive=false', '-c', 'credential.guiPrompt=false')
 
 # --- STEP 2: 資格情報が保存されたか（保存先から読み戻して確認） ---
 $probe = "protocol=https`nhost=github.com`n`n" | & $gcm get
@@ -32,8 +47,16 @@ Write-Host 'OK: 認証情報を Windows 資格情報マネージャーに保存�
 
 # --- STEP 3: 「push が本当に通るか」を実物で検証（読み取りでは公開リポジトリのため通ってしまう） ---
 Write-Host ''
-Write-Host '--- push の実疎通を確認中 ---'
-& git -C $probeRepo push --dry-run origin HEAD 2>&1 | ForEach-Object { Write-Host $_ }
+if (-not $probeRepo) {
+  Write-Host "NG: push 疎通の検証に使えるリポジトリが見つかりません (候補: $($probeCandidates -join ', '))"
+  exit 1
+}
+Write-Host "--- push の実疎通を確認中 ($probeRepo) ---"
+# HEAD をそのまま push すると、ローカルが origin/main より遅れているだけで
+# 非fast-forward になり「認証は通っているのに NG」になる。毎回ユニークな一時ブランチ名へ
+# --dry-run するので、リモートを汚さずローカル状態にも依存しない。
+$probeBranch = '__auth-probe-' + [guid]::NewGuid().ToString('N')
+& git @gitNoPrompt -C $probeRepo push --dry-run origin "HEAD:refs/heads/$probeBranch" 2>&1 | ForEach-Object { Write-Host $_ }
 if ($LASTEXITCODE -ne 0) {
   Write-Host "NG: push の疎通に失敗しました (exit $LASTEXITCODE)。上のメッセージを確認してください。"
   exit $LASTEXITCODE
@@ -65,7 +88,7 @@ foreach ($line in $lines) {
   if ($LASTEXITCODE -ne 0 -or -not $url) { Write-Host "FAIL: origin を取得できません ($repo)"; $failed++; continue }
   $slug = ($url -replace '^.*github\.com[:/]', '') -replace '\.git$', ''
 
-  & git -C $repo push -u origin $branch 2>&1 | ForEach-Object { Write-Host $_ }
+  & git @gitNoPrompt -C $repo push -u origin $branch 2>&1 | ForEach-Object { Write-Host $_ }
   if ($LASTEXITCODE -ne 0) { Write-Host "FAIL: push できません ($branch)"; $failed++; continue }
 
   $headers = @{ Authorization = "Bearer $token"; 'User-Agent' = 'orgiast-oneclick' }
