@@ -4,6 +4,12 @@
 #   資格情報の取得だけは GitHub アカウントの持ち主（kim）の同意が必須＝他の全工程はここで自動化する。
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# 実行ログを残す。このPCは無人セッションが後から結果を確認する必要があるため、
+# 黒い画面を閉じても何が起きたか分かるようにする（トークンは出力しない）。
+$logFile = Join-Path $env:USERPROFILE '.claude\gh-login-oneclick.log'
+try { Start-Transcript -LiteralPath $logFile -Append -Force | Out-Null } catch { }
 
 $gcm = 'C:\Program Files\Git\mingw64\bin\git-credential-manager.exe'
 if (-not (Test-Path $gcm)) { Write-Host "NG: Git Credential Manager が見つかりません ($gcm)"; exit 1 }
@@ -42,7 +48,10 @@ $gitNoPrompt = @('-c', 'credential.interactive=false', '-c', 'credential.guiProm
 
 # --- STEP 2: 資格情報が保存されたか（保存先から読み戻して確認） ---
 $probe = "protocol=https`nhost=github.com`n`n" | & $gcm get
-if ($probe -notmatch 'password=') { Write-Host 'NG: 認証情報が保存されませんでした'; exit 1 }
+# ⚠ $probe は「行の配列」。配列に -notmatch を使うと「一致しなかった行」が返るため、
+#   資格情報が正しく保存されていても常に truthy になり NG 終了する（2026-10-18 実測）。
+$probeLine = $probe | Where-Object { $_ -match '^password=' } | Select-Object -First 1
+if (-not $probeLine) { Write-Host 'NG: 認証情報が保存されませんでした'; exit 1 }
 Write-Host 'OK: 認証情報を Windows 資格情報マネージャーに保存しました。'
 
 # --- STEP 3: 「push が本当に通るか」を実物で検証（読み取りでは公開リポジトリのため通ってしまう） ---
@@ -70,7 +79,7 @@ if (-not (Test-Path $queueFile)) {
   exit 0
 }
 
-$token = (($probe -split "`n") | Where-Object { $_ -like 'password=*' } | Select-Object -First 1) -replace '^password=', ''
+$token = ($probeLine -replace '^password=', '').Trim()
 if (-not $token) { Write-Host 'NG: トークンを取り出せませんでした'; exit 1 }
 
 $lines = Get-Content -LiteralPath $queueFile -Encoding UTF8 |
@@ -93,16 +102,30 @@ foreach ($line in $lines) {
 
   $headers = @{ Authorization = "Bearer $token"; 'User-Agent' = 'orgiast-oneclick' }
   $body = @{ title = $branch; head = $branch; base = 'main'; body = '自動セッションの成果物。CI が緑になれば automerge でマージされます。' } | ConvertTo-Json -Compress
+  $pr = $null
   try {
     $pr = Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$slug/pulls" -Headers $headers -ContentType 'application/json' -Body $body
     Write-Host "OK: PR #$($pr.number) $($pr.html_url)"
-    Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$slug/issues/$($pr.number)/labels" -Headers $headers -ContentType 'application/json' -Body (@{ labels = @('automerge') } | ConvertTo-Json -Compress) | Out-Null
-    Write-Host 'OK: automerge ラベルを付与しました。'
     $done++
   } catch {
     $msg = $_.ErrorDetails.Message
-    if ($msg -match 'A pull request already exists') { Write-Host "OK: PR は既に存在します（push 済み）"; $done++ }
-    else { Write-Host "FAIL: PR 作成に失敗 ($branch): $msg"; $failed++ }
+    if ($msg -match 'A pull request already exists') {
+      Write-Host 'OK: PR は既に存在します（push 済み）'
+      $done++
+    } else {
+      Write-Host "FAIL: PR 作成に失敗 ($branch): $msg"
+      $failed++
+      continue
+    }
+  }
+  # ラベル付与は PR 作成の成否と切り離す（ラベルが無いだけで「失敗」に数えない）。
+  if ($pr) {
+    try {
+      Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$slug/issues/$($pr.number)/labels" -Headers $headers -ContentType 'application/json' -Body (@{ labels = @('automerge') } | ConvertTo-Json -Compress) | Out-Null
+      Write-Host 'OK: automerge ラベルを付与しました。'
+    } catch {
+      Write-Host "WARN: automerge ラベルを付けられませんでした（PR は作成済み）: $($_.ErrorDetails.Message)"
+    }
   }
 }
 
