@@ -5,14 +5,13 @@ import path from 'node:path';
 import test from 'node:test';
 import { registerStopViolation, summarizeStopRechecks } from './stop-recheck.mjs';
 
-test('同一応答は複数hookでも1 block、書き直し3回後はpass_after_cap', t => {
+test('同一応答は複数hookでも1 block、書き直し2回後はpass_after_cap', t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-recheck-')); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const input = { session_id: 's', stop_hook_active: true };
   assert.equal(registerStopViolation({ input, assistantText: 'one', blockedBy: ['a'], reasonCodes: ['A'], home }).blockNumber, 1);
   assert.equal(registerStopViolation({ input, assistantText: 'one', blockedBy: ['b'], reasonCodes: ['B'], home }).blockNumber, 1);
   assert.equal(registerStopViolation({ input, assistantText: 'two', blockedBy: ['a'], reasonCodes: ['A'], home }).verdict, 'block');
-  assert.equal(registerStopViolation({ input, assistantText: 'three', blockedBy: ['a'], reasonCodes: ['A'], home }).verdict, 'block');
-  const capped = registerStopViolation({ input, assistantText: 'four', blockedBy: ['a'], reasonCodes: ['A'], home });
+  const capped = registerStopViolation({ input, assistantText: 'three', blockedBy: ['a'], reasonCodes: ['A'], home });
   assert.equal(capped.verdict, 'pass_after_cap');
   assert.match(capped.additionalContext, /次の応答で必ず訂正/);
 });

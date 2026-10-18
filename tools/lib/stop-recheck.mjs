@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-export const MAX_BLOCKS_PER_TURN = 3;
+// Existing runner contract: initial block plus two rewritten responses.
+export const MAX_BLOCKS_PER_TURN = 2;
 export const CAP_CONTEXT = 'Stop ゲートの同一ターン上限に達したため今回は送信します。残った違反を次の応答で必ず訂正してください。';
 
 const defaultHome = () => process.env.ORGIAST_HOME || process.env.USERPROFILE || os.homedir();

@@ -32,24 +32,23 @@ test('複数gateの理由を1つのblockへ合流する', () => {
   assert.ok(record.blockedBy.includes('handoff-info-guard'));
 });
 
-test('同一ターンは3回blockし4回目からpass_after_capで残存違反を返す', t => {
+test('同一ターンは既存上限の3回目からpass_after_capを台帳に残す', t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-runner-cap-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   assert.equal(JSON.parse(invoke(home, 'cap', request).stdout).decision, 'block');
   assert.equal(JSON.parse(invoke(home, 'cap', request).stdout).decision, 'block');
-  assert.equal(JSON.parse(invoke(home, 'cap', request).stdout).decision, 'block');
   assert.match(JSON.parse(invoke(home, 'cap', request).stdout).systemMessage, /次の応答で必ず訂正.*残存コード/);
   const records = fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8').trim().split(/\r?\n/).map(JSON.parse);
-  assert.deepEqual(records.map(({ verdict }) => verdict), ['block', 'block', 'block', 'pass_after_cap']);
-  assert.deepEqual(records.map(({ sameTextRetries }) => sameTextRetries), [1, 2, 3, 4]);
+  assert.deepEqual(records.map(({ verdict }) => verdict), ['block', 'block', 'pass_after_cap']);
+  assert.deepEqual(records.map(({ sameTextRetries }) => sameTextRetries), [1, 2, 3]);
   const state = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-state.json'), 'utf8'));
-  assert.equal(state.cap.blocks, 4);
+  assert.equal(state.cap.blocks, 3);
   assert.equal(state.cap.lastHash, crypto.createHash('sha256').update(request).digest('hex').slice(0, 16));
 });
 
 for (const [name, texts, counts] of [
-  ['本文A・B・Cは同一ターンのblockとして累積', [request, `${request} B`, `${request} C`], [1, 2, 3]],
-  ['本文変更を含め4回目は上限通過', [request, request, `${request} B`, `${request} B`], [1, 2, 3, 4]],
+  ['本文A・Bは同一ターンのblockとして累積', [request, `${request} B`], [1, 2]],
+  ['本文変更を含め3回目は上限通過', [request, request, `${request} B`], [1, 2, 3]],
 ]) {
   test(name, t => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-runner-reset-'));
@@ -58,12 +57,12 @@ for (const [name, texts, counts] of [
       const result = invoke(home, 'reset', text);
       assert.equal(result.status, 0, result.stderr);
       const output = JSON.parse(result.stdout);
-      if (counts.at(-1) === 4 && index === texts.length - 1) assert.match(output.systemMessage, /次の応答で必ず訂正/);
+      if (counts.at(-1) === 3 && index === texts.length - 1) assert.match(output.systemMessage, /次の応答で必ず訂正/);
       else assert.equal(output.decision, 'block');
     }
     const records = fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     assert.deepEqual(records.map(record => record.sameTextRetries), counts);
-    assert.equal(records.filter(record => record.retryCap).length, counts.at(-1) === 4 ? 1 : 0);
+    assert.equal(records.filter(record => record.retryCap).length, counts.at(-1) === 3 ? 1 : 0);
   });
 }
 

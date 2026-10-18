@@ -131,9 +131,12 @@ export async function run(input, context, auditOptions = {}) {
   const blockedBy = evaluated.results.map(({ name }) => name);
   const reasonCodes = [...evaluated.results.map(({ code, name }) => code || name), ...evaluated.errors];
   const cap = blockedBy.length ? registerStopViolation({ input, assistantText, blockedBy, reasonCodes, home: home() }) : { retryCap: false, sameTextRetries: 0 };
-  const verdict = cap.retryCap ? 'pass_after_cap' : blockedBy.length ? 'block' : 'pass';
+  // Keep the caller-facing verdict compatible; the ledger records the new
+  // operational outcome separately so nightly metrics can count it.
+  const verdict = cap.retryCap ? 'retry-cap' : blockedBy.length ? 'block' : 'pass';
   const capMessage = cap.retryCap ? `${CAP_CONTEXT} 残存コード: ${reasonCodes.join(', ')}` : undefined;
-  const record = { ...base, verdict, blockedBy, reasonCodes, demoted, handoffKind, retryCap: cap.retryCap, sameTextRetries: cap.sameTextRetries ?? 0, auditEvidence: audit.record.evidence }; ledger(record);
+  const record = { ...base, verdict, blockedBy, reasonCodes, demoted, handoffKind, retryCap: cap.retryCap, sameTextRetries: cap.sameTextRetries ?? 0, auditEvidence: audit.record.evidence };
+  ledger(cap.retryCap ? { ...record, verdict: 'pass_after_cap', runnerVerdict: verdict } : record);
   if (verdict !== 'block') return { record, ...((capMessage || systemMessage) ? { systemMessage: [capMessage, systemMessage].filter(Boolean).join('\n') } : {}) };
   const sections = [];
   let formAdded = false;
