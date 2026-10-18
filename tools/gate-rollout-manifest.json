@@ -147,6 +147,11 @@
       "rollout": "deny",
       "legacy": true
     },
+    "japanese-response-gate": {
+      "rollout": "deny",
+      "distributedAt": "2026-10-18T00:00:00Z",
+      "denyAfter": "2026-10-18T00:00:00Z"
+    },
     "shallow-answer-gate": {
       "rollout": "deny",
       "distributedAt": "2026-10-10T00:00:00Z",

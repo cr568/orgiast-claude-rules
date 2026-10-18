@@ -135,6 +135,10 @@ node tools/lane-doctor.mjs --probe で状態更新し、node tools/codex-do.mjs 
 
 質問対象を既存のAPI/ファイル/CLIで調べ、取得済み情報を提示する。
 
+## japanese-response-gate
+
+同じ内容を日本語で書き直す。コード・コマンド・固有名詞・URL は英字のままでよい。user が英語での返答を明示した場合だけ本文に [EN-OK] を書く。応答言語は settings.json の `"language": "japanese"`（register-hooks が全PCへ配布）でも固定している。
+
 ## shallow-answer-gate
 
 件名・一覧・ファイル名だけでなく、候補となるメッセージ・ファイルの中身を開いて確認（read_file_content / get_message / WebFetch 等）した上で回答する。どうしても確認不能な場合は本文に [DEPTH-OK: 理由] を書く。
