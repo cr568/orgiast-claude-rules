@@ -199,6 +199,18 @@ test('stall-sweeper の実行時成果物は追跡されず gitignore される'
     '.stall-sweeper/ は worktree を dirty にしない（救済ブランチを作らせない）');
 });
 
+test('.fleet-ig-post/ の IG 投稿一時ファイルは追跡されず gitignore される', t => {
+  const { repo, git } = fixture(t);
+  fs.writeFileSync(path.join(repo, '.gitignore'), fs.readFileSync(new URL('../.gitignore', import.meta.url), 'utf8'));
+  fs.mkdirSync(path.join(repo, '.fleet-ig-post'));
+  fs.writeFileSync(path.join(repo, '.fleet-ig-post', 'part1.b64'), 'AAAA');
+  fs.writeFileSync(path.join(repo, 'still-dirty'), 'x');
+  const status = git(repo, ['status', '--porcelain', '--untracked-files=all']);
+  assert.equal(status.includes('.fleet-ig-post'), false,
+    '.fleet-ig-post/ は worktree を dirty にしない（rescue の重複 PR churn を止める）');
+  assert.ok(status.includes('still-dirty'), '他の untracked は従来どおり dirty（テストが空振りしていない）');
+});
+
 test('routing-table.json は追跡されず gitignore される', () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const git = (...args) => execFileSync('git', ['-C', repoRoot, ...args], { encoding: 'utf8' }).trim();
