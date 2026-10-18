@@ -118,7 +118,7 @@ export async function runNativeWriteProbe({ home, timeoutMs }) {
   try {
     const init = await run('git', ['init', '--quiet']);
     if (init.code) return init;
-    const result = await run(process.execPath, [path.join(repo, 'tools/codex-do.mjs'), 'WRITE_OK.txt を作成し、内容を WRITE_OK にしてください。その後ファイルを読み返して確認してください。', '--cwd', cwd, '--force-native', '--no-fallback', '--no-escalate', '--timeout', String(Math.max(1, Math.floor(timeoutMs / 1000)))]);
+    const result = await run(process.execPath, [path.join(repo, 'tools/codex-do.mjs'), 'WRITE_OK.txt を作成し、内容を WRITE_OK にしてください。その後ファイルを読み返して確認してください。', '--cwd', cwd, '--force-native', '--kind', 'implement', '--no-fallback', '--no-escalate', '--timeout', String(Math.max(1, Math.floor(timeoutMs / 1000)))]);
     let ok = false;
     try { ok = fs.readFileSync(path.join(cwd, 'WRITE_OK.txt'), 'utf8').trim() === 'WRITE_OK'; } catch {}
     return { code: result.code === 0 && ok ? 0 : 1, text: ok ? 'WRITE_OK' : '書き込み確認失敗' };
