@@ -18,7 +18,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { isEntry } from './is-entry.mjs';
 
 /** ゲートを構成する3テーブル（このいずれかが >0 でゲート開）。 */
@@ -101,7 +100,7 @@ export function shouldFire({ gate, signature, marker }) {
 
 /**
  * playwright の起動方法を決める。
- * Windows では `spawnSync('npx.cmd', args)` が EINVAL で即死する（Node の CVE-2024-27980 対応で
+ * Windows では `spawnSync` で `npx.cmd` を直接起動すると EINVAL で即死する（Node の CVE-2024-27980 対応で
  * .cmd は shell 経由でないと起動できない）。shell 経由は引数がエスケープされないので、
  * まず worktree 内の CLI JS を node で直接叩き、無い時だけ npx に落とす。
  */
@@ -176,6 +175,7 @@ export function runPlaywright(cmd) {
     env: { ...process.env, ...env },
     encoding: 'utf8',
     shell: spawn.shell,
+    windowsHide: true,
     timeout: 15 * 60 * 1000,
   });
   const output = `${res.stdout ?? ''}${res.stderr ?? ''}`;
