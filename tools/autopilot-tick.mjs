@@ -345,7 +345,7 @@ function rememberObjective(state, objective, now) {
   state.objectiveHistory = state.objectiveHistory.slice(-20);
 }
 function resumeState(state) {
-  state.status = 'running'; state.pausedReason = null; state.pendingQuestion = null;
+  state.status = 'running'; state.pausedReason = null; state.pendingQuestion = null; state.pendingQuestionExpiresAt = null;
   // Explicit human continuation gives a stalled objective one fresh attempt.
   state.consecutiveNoop = 0;
   state.consecutiveRunnerErrors = 0;
@@ -450,7 +450,7 @@ async function execute(command, args, ctx) {
       }
       else if (parsed.command === 'run') {
         if (state.status !== 'done') resumeState(state);
-      } else { state.status = parsed.command === 'stop' ? 'stopped' : 'paused'; state.pausedReason = `control_${parsed.command}`; state.pendingQuestion = null; }
+      } else { state.status = parsed.command === 'stop' ? 'stopped' : 'paused'; state.pausedReason = `control_${parsed.command}`; state.pendingQuestion = null; state.pendingQuestionExpiresAt = null; }
       rememberObjective(state, objective, now);
       if (!state.lastControlMessageId || compareId(message.id, state.lastControlMessageId) > 0) state.lastControlMessageId = message.id;
     }
@@ -472,6 +472,28 @@ async function execute(command, args, ctx) {
         state.runnerErrorRetryAt = null;
         state.consecutiveNoop = 0;
       }
+    }
+    // A question that carries its own reply deadline must not freeze the run forever
+    // when nobody answers by that deadline. The standing instruction attached to a
+    // timed question is "do nothing if no reply arrives by then", so drop the question
+    // (nothing is executed) and let the normal resume rules take over. Questions
+    // without a deadline keep waiting for the human, as before.
+    if (state.pendingQuestion && state.pendingQuestionExpiresAt) {
+      const expiresAt = Date.parse(state.pendingQuestionExpiresAt);
+      if (Number.isFinite(expiresAt) && now.getTime() >= expiresAt) {
+        state.lastExpiredQuestion = { question: state.pendingQuestion, expiredAt: state.pendingQuestionExpiresAt };
+        state.pendingQuestion = null;
+        state.pendingQuestionExpiresAt = null;
+      }
+    }
+    // Daily caps are resumable by design (autoResumes). Nothing else clears them:
+    // watchdog() returns early unless the status is 'running', so a capped run
+    // stayed paused forever and every later tick was skipped. Recompute the cap
+    // and lift the pause once it no longer applies (next JST day, or a quiet gap).
+    // A pending question must survive: resumeState() clears it, so wait for the answer.
+    if (state.status === 'paused' && autoResumes(state.pausedReason) && !state.pendingQuestion
+      && !capReason(state, objective, summarize(log, todayKey))) {
+      resumeState(state);
     }
     // No candidate and no command: leave a completed run byte-for-byte intact.
     if (state.status !== 'done' || control) {
@@ -579,8 +601,14 @@ async function execute(command, args, ctx) {
     state.lastDigestAt = now.toISOString();
     state.lastDigestIteration = state.totalIterations;
     save();
-    await sendNotice(text, ctx);
-    return { ok: true, slot, text };
+    // Record what actually happened, not just that no error was logged:
+    // sendNotice swallows delivery failures, so "no error in run.log" is not
+    // evidence that the DM arrived (2026-10-17 実測)。呼び出し側が run.log に
+    // delivered を残せるよう、結果を戻り値と state の両方に載せる。
+    const delivery = await sendNotice(text, ctx);
+    state.lastDigestDelivered = delivery?.delivered ?? 'unknown';
+    save();
+    return { ok: true, slot, text, delivered: state.lastDigestDelivered };
   }
   if (['stop', 'pause', 'resume'].includes(command)) {
     if (command === 'resume') {
@@ -589,11 +617,15 @@ async function execute(command, args, ctx) {
     } else if (!(command === 'pause' && args.question && !args.reason)) {
       state.status = command === 'stop' ? 'stopped' : 'paused';
       state.pausedReason = args.reason || `manual_${command}`;
-      if (command === 'stop') state.pendingQuestion = null;
+      if (command === 'stop') { state.pendingQuestion = null; state.pendingQuestionExpiresAt = null; }
     }
     const previousQuestion = state.pendingQuestion;
     if (command === 'pause' && args.question) {
       state.pendingQuestion = oneLine(args.question);
+      // An unanswered timed question expires by itself; an untimed one waits indefinitely.
+      const rawDeadline = args['question-deadline'] ?? args.questionDeadline;
+      const deadline = rawDeadline ? Date.parse(rawDeadline) : NaN;
+      state.pendingQuestionExpiresAt = Number.isFinite(deadline) ? new Date(deadline).toISOString() : null;
       // Asking never overrides a manual/control stop, a cap, or runner errors.
       if (state.status === 'paused' && state.pausedReason === 'needs_kim') { state.status = 'running'; state.pausedReason = null; }
     }
@@ -654,7 +686,7 @@ export async function runAutopilot(command, args = {}, options = {}) {
 
 export async function main(argv = process.argv.slice(2)) {
   try {
-    const options = Object.fromEntries(['objective', 'done', 'max-iter-per-day', 'max-hours-per-day', 'max-noop', 'max-total-iter', 'summary', 'progress', 'tokens-out', 'next-delay', 'reason', 'question', 'evidence', 'unverified', 'id', 'result', 'note', 'detail'].map((key) => [key, { type: 'string' }]));
+    const options = Object.fromEntries(['objective', 'done', 'max-iter-per-day', 'max-hours-per-day', 'max-noop', 'max-total-iter', 'summary', 'progress', 'tokens-out', 'next-delay', 'reason', 'question', 'question-deadline', 'evidence', 'unverified', 'id', 'result', 'note', 'detail'].map((key) => [key, { type: 'string' }]));
     for (const key of ['noop', 'codex', 'pretty']) options[key] = { type: 'boolean' };
     const { values, positionals } = parseArgs({ args: argv, options, allowPositionals: true });
     const result = await runAutopilot(positionals[0], values);
