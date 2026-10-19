@@ -116,10 +116,11 @@ excerpt（200 字）の全文は次のとおり（原文は 799 字、以下は�
 当ターンで追加実装すべき残件がない。検出器の W は既存テストが仕様として固定している待機クラスであり、
 本件はその仕様どおりの検出なので、検出器の変更も行っていない。
 
-関連テスト（現 origin/main の検出器）:
+関連テスト（現 origin/main の検出器。本変更は Markdown 1 ファイルの追加のみのため、
+全スイートではなく関連 2 スイートを実行）:
 
-- `node --test tools/permanent-fix-deferral-scan.test.mjs` → **26 pass / 0 fail**
-  （`委譲の完了待ちはW(待機)であって先送り(P1-P4)ではない` を含む）
+- `node --test tools/permanent-fix-deferral-scan.test.mjs tools/handoff-audit-nightly.test.mjs`
+  → **44 pass / 0 fail**（`委譲の完了待ちはW(待機)であって先送り(P1-P4)ではない` を含む）
 
 ## 5. 未確認
 
