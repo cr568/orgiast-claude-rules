@@ -206,6 +206,12 @@
       "reason": "要確認"
     },
     {
+      "path": "tools/gate-remedies.md",
+      "scope": "kim-only",
+      "step": null,
+      "reason": "ドキュメントで実行体なし（~/.claude 設定名の記載による誤検出を許容）"
+    },
+    {
       "path": "tools/install-handoff-gate.mjs",
       "scope": "kim-only",
       "step": null,

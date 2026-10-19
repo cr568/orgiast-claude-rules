@@ -41,9 +41,16 @@ export function judge(text) {
   };
 }
 
+// hook 入力は JSON。tool_input.command などの英字を応答本文と誤認しないよう、
+// 応答本文（assistant_text / text）だけを判定し、block のときだけ出力する。
 if (isEntry(import.meta.url)) {
-  let input = '';
+  let raw = '';
   process.stdin.setEncoding('utf8');
-  for await (const chunk of process.stdin) input += chunk;
-  console.log(JSON.stringify(judge(input)));
+  for await (const chunk of process.stdin) raw += chunk;
+  try {
+    const input = JSON.parse(raw);
+    const text = input.assistant_text || input.text || '';
+    const result = judge(text);
+    if (result.decision === 'block') console.log(JSON.stringify(result));
+  } catch {}
 }
