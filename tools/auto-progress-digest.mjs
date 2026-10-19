@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { isEntry } from './is-entry.mjs';
-import { notifyKim } from './notify-kim.mjs';
+import { notifyOwner } from './notify-owner.mjs';
 import { ledgerFile, readLedger, latestOpenPromises } from './auto-progress-ledger.mjs';
 import { resolveFleetLabel } from './lib/fleet-label.mjs';
 
@@ -80,7 +80,8 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
   if (dryRun) return { sent: false, count: rows.length, text, messages };
   let error = '';
   for (const message of messages) {
-    const result = await (io.notify ?? notifyKim)(message, { home, webhookFallback: false });
+    const owner = rows.find(row => row.owner)?.owner || '';
+    const result = io.notify ? await io.notify(message, { home, webhookFallback: false }) : await notifyOwner(owner, message, { home });
     if (result?.delivered !== 'dm') { error = result?.reason || 'DM not delivered'; break; }
   }
   if (error) {

@@ -6,7 +6,7 @@ import test, { after } from 'node:test';
 import vm from 'node:vm';
 import { main as registerTasks } from './register-auto-progress-task.mjs';
 import { extractPromise, extractNextKim, applyPromise, buildRecord, record, readLedger, ledgerFile } from './auto-progress-ledger.mjs';
-import { run as watch, parseVerdict, deterministicVerdict, judge, GRACE_MS, postSheet, resumeSession } from './auto-progress-watch.mjs';
+import { run as watch, parseVerdict, deterministicVerdict, judge, GRACE_MS, RESUME_INTERVAL_MS, MAX_RESUMES, postSheet, resumeSession, recentFiles } from './auto-progress-watch.mjs';
 import { run as digest, selectRows, formatDigest } from './auto-progress-digest.mjs';
 import { runRegisterPs1 } from './lib/run-register-ps1.mjs';
 
@@ -62,7 +62,7 @@ test('parseVerdict と決定論フォールバック', () => {
   assert.equal(parseVerdict('よく分かりません'), null);
   const now = Date.now();
   assert.equal(deterministicVerdict({ any: false }, now).verdict, 'stalled');
-  assert.equal(deterministicVerdict({ any: true, lastEvidenceAt: now - H }, now).verdict, 'in_progress');
+  assert.equal(deterministicVerdict({ any: true, lastEvidenceAt: now - H / 2 }, now).verdict, 'in_progress');
   assert.equal(deterministicVerdict({ any: true, lastEvidenceAt: now - 8 * H }, now).verdict, 'stalled');
 });
 
@@ -72,7 +72,7 @@ test('judge: LLM 全滅(null/例外)なら決定論へ。証拠なしは LLM を
   const row = { promise: 'p', ts: new Date(now - 10 * H).toISOString() };
   assert.equal(judge(row, ev, now, { askLlm: () => null }).source, 'deterministic');
   assert.equal(judge(row, ev, now, { askLlm: () => { throw new Error('x'); } }).verdict, 'stalled');
-  assert.deepEqual(judge(row, ev, now, { askLlm: () => 'done | 完了' }), { verdict: 'done', reason: '完了', source: 'llm' });
+  assert.deepEqual(judge(row, { ...ev, transcript: { ...ev.transcript, snippets: ['完了しました'] } }, now, { askLlm: () => 'done | 完了' }), { verdict: 'done', reason: '完了', source: 'llm' });
   let called = false;
   judge(row, { ...ev, any: false }, now, { askLlm: () => { called = true; return 'done'; } });
   assert.equal(called, false);
@@ -85,13 +85,13 @@ function seed(home, rows) {
 const baseIo = (extra = {}) => ({ sheetConfig: () => ({ url: 'u', token: 't' }), cwdExists: () => true, digest: async () => ({ sent: false, count: 0 }), ...extra });
 const evAny = (now) => ({ transcript: { count: 1, lastAt: now - 8 * H, snippets: [] }, files: { names: [], lastAt: 0 }, runs: { names: [] }, lastEvidenceAt: now - 8 * H, any: true });
 
-test('watch: 猶予6時間未満は判定しない', async () => {
+test('watch: 猶予1時間未満は判定しない', async () => {
   const home = tmp(); const now = Date.now();
-  seed(home, [{ sessionId: 's', ts: new Date(now - 5 * H).toISOString(), status: 'open', promise: 'p', cwd: home, pc: 'PC' }]);
+  seed(home, [{ sessionId: 's', ts: new Date(now - H / 2).toISOString(), status: 'open', promise: 'p', cwd: home, pc: 'PC' }]);
   const calls = [];
   const s = await watch({ home, now, io: baseIo({ gatherEvidence: undefined, transcriptEvidence: () => { calls.push(1); return { count: 0, lastAt: 0, snippets: [] }; } }) });
   assert.equal(s.graced, 1); assert.equal(s.checked, 0); assert.equal(calls.length, 0);
-  assert.equal(GRACE_MS, 6 * H);
+  assert.equal(GRACE_MS, H);
 });
 
 test('watch: done は閉じ、stalled は再開1回＋Sheet報告、同日2回目は再開しない', async () => {
@@ -102,7 +102,7 @@ test('watch: done は閉じ、stalled は再開1回＋Sheet報告、同日2回�
   seed(home, [mk('a'), mk('b')]);
   const posts = []; const resumed = [];
   const io = baseIo({
-    transcriptEvidence: () => ({ count: 1, lastAt: now - 8 * H, snippets: ['x'] }), recentFiles: () => ({ lastAt: 0, names: [] }), autoSessionRuns: () => ({ lastAt: 0, names: [] }),
+    transcriptEvidence: () => ({ count: 1, lastAt: now - 8 * H, snippets: ['完了しました'] }), recentFiles: () => ({ lastAt: 0, names: [] }), autoSessionRuns: () => ({ lastAt: 0, names: [] }),
     askLlm: (prompt) => (prompt.includes('p-a') ? 'done | 完了' : 'stalled | 止まっている'),
     resume: async (row) => { resumed.push(row.sessionId); return { outcome: 'progressed', reason: 'ok' }; },
     postSheet: async (_c, kind, body) => { posts.push({ kind, body }); return { ok: true }; },
@@ -117,6 +117,25 @@ test('watch: done は閉じ、stalled は再開1回＋Sheet報告、同日2回�
   assert.equal(rows.find((r) => r.sessionId === 'b').status, 'resumed');
   const s2 = await watch({ home, now: now + H, io });
   assert.equal(s2.resumed, 0); assert.equal(s2.reported, 0); assert.equal(resumed.length, 1);
+});
+
+test('watch: needs_user/done 遷移、1h grace・2h resume・上限8', async () => {
+  assert.equal(GRACE_MS, H); assert.equal(RESUME_INTERVAL_MS, 2 * H); assert.equal(MAX_RESUMES, 8);
+  const now = Date.parse('2026-10-19T12:00:00Z');
+  for (const [state, expected] of [['needs_user', 'waiting_user'], ['done', 'done']]) {
+    const home = tmp(); seed(home, [{ sessionId: state, owner: 'cr@orgiast.jp', ts: new Date(now - 3 * H).toISOString(), status: 'open', promise: state, cwd: home, pc: 'PC' }]);
+    const notices = [];
+    await watch({ home, now, io: noEvidenceIo({ resume: async () => ({ outcome: state, state, reason: '成果', artifact: 'out.txt' }), notifyOwner: async (...args) => { notices.push(args); return { delivered: 'dm' }; } }) });
+    assert.equal(readLedger(ledgerFile(home))[0].status, expected);
+    if (state === 'needs_user') assert.equal(notices.length, 1);
+  }
+});
+
+test('recentFiles: cwd の他session更新は証拠にせず transcript 指定パスだけを見る', () => {
+  const home = tmp(), foreign = path.join(home, 'foreign.txt'), own = path.join(home, 'own.txt');
+  fs.writeFileSync(foreign, 'x'); fs.writeFileSync(own, 'x');
+  assert.deepEqual(recentFiles(home, 0, { paths: [] }).names, []);
+  assert.deepEqual(recentFiles(home, 0, { paths: [own] }).names, [own]);
 });
 
 test('watch: Sheet 失敗は errors に残り、次回再送できる', async () => {
@@ -225,7 +244,7 @@ test('resumeSession: 古い成果JSONは再利用しない', async () => {
   const home = tmp(); fs.mkdirSync(path.join(home, '.claude'));
   fs.writeFileSync(path.join(home, '.claude', 'auto-progress-resume-session.json'), '{"progressed":true,"evidence":"old"}');
   const result = await resumeSession({ sessionId: 'session', cwd: home, promise: 'p' }, { home, io: { executable: 'mock', runChild: async () => ({ status: 'success' }) } });
-  assert.equal(result.outcome, 'no-progress');
+  assert.equal(result.outcome, 'blocked');
 });
 
 test('buildRecord: hostname と OS username の既定値を記録', () => {
@@ -298,7 +317,7 @@ test('watch: 同一sessionの最新だけを選び、旧open/stalled/resumedを�
 
 test('watch: 最新宣言が猶予中なら同sessionの古い約束を再開しない', async () => {
   const home = tmp(), now = Date.parse('2026-10-17T12:00:00Z');
-  seed(home, [10, 1].map(hours => ({ sessionId: 's', ts: new Date(now - hours * H).toISOString(), status: 'open', cwd: home })));
+  seed(home, [10, 0.5].map(hours => ({ sessionId: 's', ts: new Date(now - hours * H).toISOString(), status: 'open', cwd: home })));
   const result = await watch({ home, now, io: noEvidenceIo({ resume: async () => assert.fail('must not resume') }) });
   assert.equal(result.checked, 0);
   assert.equal(result.graced, 1);
@@ -327,10 +346,11 @@ test('digest: 未巡回も数え、重複/完了/期限切れを除外し、11�
   assert.match(preview.text, /^未処理の約束 11件・最古 11日前（詰まり警告）/);
 });
 
-test('schedule: watchは4回・4件分の時間枠を確保し既存PCも日次更新する', () => {
+test('schedule: watchは毎時・4件分の時間枠を確保し既存PCも更新する', () => {
   const script = fs.readFileSync(new URL('./register-auto-progress-task.ps1', import.meta.url), 'utf8');
   const triggers = script.match(/\$watchTriggers = (.*)/)[1];
-  assert.deepEqual([...triggers.matchAll(/-At '([^']+)'/g)].map(m => m[1]), ['09:00', '13:00', '18:00', '22:00']);
+  assert.deepEqual([...triggers.matchAll(/-At '([^']+)'/g)].map(m => m[1]), ['00:00']);
+  assert.match(triggers, /New-TimeSpan -Hours 1/);
   assert.match(script, /-ExecutionTimeLimit \(New-TimeSpan -Minutes 120\)/);
   const poller = fs.readFileSync(new URL('./fleet-poller.ps1', import.meta.url), 'utf8');
   assert.match(poller, /if \(\$Dry\) \{ DrySkip 'register-auto-progress-task.ps1/);

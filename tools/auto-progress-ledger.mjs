@@ -7,6 +7,7 @@ import path from 'node:path';
 import { isEntry } from './is-entry.mjs';
 import { readAssistantText } from './lib/assistant-text.mjs';
 import { readStdinWithTimeout } from './lib/hook-stdin.mjs';
+import { resolveOwner } from './notify-owner.mjs';
 
 const NONE = /^(?:なし|無し|ナシ|—|–|-|－|ー|―|n\/a|none)$/i;
 // 「**この後の自動進行**: text」「- この後の自動進行：text」など装飾付きにも一致させる。
@@ -55,7 +56,7 @@ export function writeLedger(file, rows) {
   fs.renameSync(temp, file);
 }
 
-export const OPEN_STATUSES = new Set(['open', 'stalled', 'resumed']);
+export const OPEN_STATUSES = new Set(['open', 'stalled', 'resumed', 'waiting_user']);
 
 // Timestamp order is authoritative; equal timestamps prefer the later ledger line.
 export function latestOpenPromises(rows) {
@@ -76,25 +77,25 @@ export function applyPromise(rows, record) {
   return next;
 }
 
-export function buildRecord(input, text, { now = Date.now(), hostname = os.hostname(), user = safeUser() } = {}) {
+export function buildRecord(input, text, { now = Date.now(), hostname = os.hostname(), user = safeUser(), owner = resolveOwner() } = {}) {
   const promise = extractPromise(text);
   if (!promise) return null;
   const transcriptPath = input?.transcript_path || input?.transcriptPath || '';
   const sessionId = input?.session_id || input?.sessionId || path.basename(transcriptPath, '.jsonl');
   if (!sessionId) return null;
   return {
-    ts: new Date(now).toISOString(), pc: hostname, user, sessionId, cwd: input?.cwd || process.cwd(), transcriptPath,
+    ts: new Date(now).toISOString(), pc: hostname, user, owner, sessionId, cwd: input?.cwd || process.cwd(), transcriptPath,
     promise, nextKim: extractNextKim(text), status: 'open',
   };
 }
 
 function safeUser() { try { return os.userInfo().username; } catch { return ''; } }
 
-export function record(input, { home, now, hostname, user, readText = (p) => readAssistantText(p).text } = {}) {
+export function record(input, { home, now, hostname, user, owner, readText = (p) => readAssistantText(p).text } = {}) {
   const text = typeof input?.last_assistant_message === 'string' && input.last_assistant_message.trim()
     ? input.last_assistant_message
     : readText(input?.transcript_path || input?.transcriptPath);
-  const row = buildRecord(input, text, { now, hostname, user });
+  const row = buildRecord(input, text, { now, hostname, user, owner });
   if (!row) return null;
   const file = ledgerFile(home);
   writeLedger(file, applyPromise(readLedger(file), row));
