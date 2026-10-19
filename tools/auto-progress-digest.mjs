@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 各PCのローカル台帳から、完了・進行中・停滞/再開・期限超過を kim の DM へ定期報告する。
+// 各PCのローカル台帳から、完了・進行中・停滞/再開・期限超過を 持ち主の DM へ定期報告する。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -73,15 +73,21 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
   const rows = selectRows((io.readLedger ?? readLedger)(ledgerFile(home)), now, since);
   if (!rows.length) return { sent: false, count: 0 };
   const text = formatDigest(rows, now, label);
-  const digest = createHash('sha256').update(text).digest('hex').slice(0, 16);
+  const digest = createHash('sha256').update(JSON.stringify(rows.map(row => row.owner || '')) + text).digest('hex').slice(0, 16);
   const slotKey = `${new Date(now).toLocaleDateString('sv-SE')}|${slot || defaultSlot(now)}|${digest}`;
   if ((state.sentKeys || []).includes(slotKey)) return { skipped: 'already-sent', sent: false, count: rows.length };
-  const messages = splitMessages(text);
+  const groups = new Map();
+  for (const row of rows) {
+    const owner = row.owner || '';
+    if (!groups.has(owner)) groups.set(owner, []);
+    groups.get(owner).push(row);
+  }
+  const deliveries = [...groups].flatMap(([owner, ownedRows]) => splitMessages(formatDigest(ownedRows, now, label)).map(message => ({ owner, message })));
+  const messages = deliveries.map(({ message }) => message);
   if (dryRun) return { sent: false, count: rows.length, text, messages };
   let error = '';
-  for (const message of messages) {
-    const owner = rows.find(row => row.owner)?.owner || '';
-    const result = io.notify ? await io.notify(message, { home, webhookFallback: false }) : await notifyOwner(owner, message, { home });
+  for (const { owner, message } of deliveries) {
+    const result = io.notify ? await io.notify(message, { home, webhookFallback: false, owner }) : await (io.notifyOwner ?? notifyOwner)(owner, message, { home });
     if (result?.delivered !== 'dm') { error = result?.reason || 'DM not delivered'; break; }
   }
   if (error) {

@@ -198,7 +198,8 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
     if (row.status === 'waiting_user') {
       if (!dryRun && now - (Date.parse(row.ownerNotifiedAt || 0) || 0) >= 24 * 3600 * 1000) {
         try {
-          await (io.notifyOwner ?? notifyOwner)(row.owner, `自動進行が判断待ちです: ${row.promise}\n${row.reason || ''}`, { home });
+          const delivery = await (io.notifyOwner ?? notifyOwner)(row.owner, `自動進行が判断待ちです: ${row.promise}\n${row.reason || ''}`, { home });
+          if (delivery?.delivered !== 'dm') throw new Error(delivery?.reason || 'DM not delivered');
           patch(rowKey(row), { ownerNotifiedAt: new Date(now).toISOString() });
         } catch (error) { summary.errors.push(`notify-owner: ${String(error?.message ?? error).slice(0, 120)}`); }
       }
@@ -230,7 +231,8 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
       (io.appendInbox ?? appendInbox)(home, row.sessionId, { at: new Date(now).toISOString(), state, evidence: outcome.reason, artifact: outcome.artifact || '' });
       if (state === 'needs_user' && now - (Date.parse(row.ownerNotifiedAt || 0) || 0) >= 24 * 3600 * 1000) {
         try {
-          await (io.notifyOwner ?? notifyOwner)(row.owner, `自動進行が判断待ちです: ${row.promise}\n${outcome.reason}`, { home });
+          const delivery = await (io.notifyOwner ?? notifyOwner)(row.owner, `自動進行が判断待ちです: ${row.promise}\n${outcome.reason}`, { home });
+          if (delivery?.delivered !== 'dm') throw new Error(delivery?.reason || 'DM not delivered');
           patch(rowKey(row), { ownerNotifiedAt: new Date(now).toISOString() });
         } catch (error) { summary.errors.push(`notify-owner: ${String(error?.message ?? error).slice(0, 120)}`); }
       }

@@ -13,3 +13,11 @@ test('DM 解決不能時は kim 宛に宛先を明記する', async () => {
   let call; const result = await notifyOwner('cr@orgiast.jp', '結果', { home: 'Z:/missing', directory: {}, notify: async (text, options) => { call = { text, options }; return { delivered: 'dm' }; } });
   assert.equal(result.delivered, 'dm'); assert.match(call.text, /^宛先: cr@orgiast.jp（DM 未解決）/); assert.equal(call.options.userId, KIM_DISCORD_USER_ID);
 });
+
+
+test('owner directory reads queries cache and refuses ambiguous email matches', () => {
+  const directory = { queries: { cr: { members: [{ id: '42', emails: ['cr@orgiast.jp'] }] } } };
+  assert.equal(resolveOwnerDiscordId('cr@orgiast.jp', { directory }), '42');
+  directory.queries.other = { members: [{ id: '43', emails: ['cr@orgiast.jp'] }] };
+  assert.equal(resolveOwnerDiscordId('cr@orgiast.jp', { directory }), '');
+});

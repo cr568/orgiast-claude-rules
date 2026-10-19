@@ -368,3 +368,34 @@ test('watch: 同一session・同一時刻の重複でも最後の行だけ再開
   assert.deepEqual(resumed, ['latest']);
   assert.deepEqual(readLedger(ledgerFile(home)).map(r => r.status), ['superseded', 'resumed']);
 });
+
+
+test('digest routes each promise only to its owner', async () => {
+  const now = Date.now(), calls = [];
+  const rows = ['a', 'b'].map(owner => ({ owner, sessionId: owner, status: 'open', promise: `private-${owner}`, ts: new Date(now - H).toISOString() }));
+  const result = await digest({ home: tmp(), now, io: {
+    label: 'PC', readLedger: () => rows, readState: () => ({}), writeState() {},
+    notifyOwner: async (owner, text) => { calls.push({ owner, text }); return { delivered: 'dm' }; },
+  } });
+  assert.equal(result.sent, true);
+  assert.deepEqual(calls.map(c => c.owner), ['a', 'b']);
+  assert.match(calls[0].text, /private-a/); assert.doesNotMatch(calls[0].text, /private-b/);
+  assert.match(calls[1].text, /private-b/); assert.doesNotMatch(calls[1].text, /private-a/);
+});
+
+test('watch retries undelivered needs_user notification without waiting 24 hours', async () => {
+  const home = tmp(), now = Date.now(); let attempts = 0;
+  seed(home, [{ sessionId: 'waiting', owner: 'a', status: 'open', promise: 'p', cwd: home, ts: new Date(now - 3 * H).toISOString() }]);
+  const io = noEvidenceIo({
+    resume: async () => ({ state: 'needs_user', reason: 'approval' }),
+    notifyOwner: async () => { attempts++; return attempts === 1 ? { delivered: 'none' } : { delivered: 'dm' }; },
+  });
+  const first = await watch({ home, now, io });
+  assert.equal(first.errors.length, 1);
+  assert.equal(readLedger(ledgerFile(home))[0].ownerNotifiedAt, undefined);
+  await watch({ home, now: now + H, io });
+  assert.equal(attempts, 2);
+  assert.equal(readLedger(ledgerFile(home))[0].ownerNotifiedAt, new Date(now + H).toISOString());
+  await watch({ home, now: now + 2 * H, io });
+  assert.equal(attempts, 2);
+});

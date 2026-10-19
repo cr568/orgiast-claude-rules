@@ -22,9 +22,10 @@ export function resolveOwner({ home = os.homedir(), label = resolveFleetLabel(ho
 export function resolveOwnerDiscordId(owner, { home = os.homedir(), directory } = {}) {
   const wanted = String(owner || '').trim().toLowerCase();
   const data = directory ?? readJson(path.join(home, '.claude', 'orgiast-discord-members.json'));
-  const rows = Array.isArray(data) ? data : Object.values(data || {}).flatMap(v => Array.isArray(v?.members) ? v.members : []);
-  const match = rows.find(row => (row.emails || []).some(email => String(email).toLowerCase() === wanted));
-  if (match?.id) return String(match.id);
+  const rows = Array.isArray(data) ? data : Object.values(data?.queries || data || {}).flatMap(v => Array.isArray(v?.members) ? v.members : []);
+  const matches = [...new Set(rows.filter(row => wanted && (row.emails || []).some(email => String(email).toLowerCase() === wanted)).map(row => row.id).filter(Boolean).map(String))];
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) return '';
   const localOwner = resolveOwner({ home }).toLowerCase();
   return wanted && wanted === localOwner ? readText(path.join(home, '.claude', 'orgiast-discord-user-id.txt')) : '';
 }

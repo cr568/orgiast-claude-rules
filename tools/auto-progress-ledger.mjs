@@ -95,7 +95,7 @@ export function record(input, { home, now, hostname, user, owner, readText = (p)
   const text = typeof input?.last_assistant_message === 'string' && input.last_assistant_message.trim()
     ? input.last_assistant_message
     : readText(input?.transcript_path || input?.transcriptPath);
-  const row = buildRecord(input, text, { now, hostname, user, owner });
+  const row = buildRecord(input, text, { now, hostname, user, owner: owner ?? resolveOwner({ home }) });
   if (!row) return null;
   const file = ledgerFile(home);
   writeLedger(file, applyPromise(readLedger(file), row));
