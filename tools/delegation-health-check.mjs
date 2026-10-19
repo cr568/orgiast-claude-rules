@@ -7,6 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { normalizeExecutorStatus } from './executor-status.mjs';
 import { isEntry } from './is-entry.mjs';
+import { judgeTimeoutRows } from './timeout-waste-judge.mjs';
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
@@ -222,6 +223,18 @@ export function collectFindings({ home, now = new Date(), codexUsedPercent = nul
   // 上限後に別の窓へ進んでいたら、その低い使用率は反証にならない（windowResetsAfterLimit の説明を参照）。
   const supersededWindow = windowResetsAfterLimit(limitRows, metric);
   const findings = [];
+  // #773(600→900秒＋連鎖予算)以降の timeout が上限を超えて秒数を捨てたかは、
+  // Claude セッションを待たず夜間で判定する。判定器は台帳全体（配備前を含む）を見る必要が
+  // あるため、24時間窓の usageRows ではなく executor-usage.jsonl を全件読む。
+  // (2026-10-20: 判定器が CLI 専用で、台帳が伸びても人手で実行するまで判定が止まっていた)
+  const timeoutWaste = judgeTimeoutRows(readJsonl(path.join(claudeDir, 'executor-usage.jsonl')));
+  if (timeoutWaste.verdict === 'waste-exceeds-cap') findings.push({
+    id: 'timeout_waste_exceeds_cap',
+    severity: 'high',
+    title: 'タイムアウトで捨てた秒数が上限超過（#773 の回帰）',
+    evidence: [`${timeoutWaste.overCapRows}件`, `最大試行 ${timeoutWaste.maxAttemptSecs}秒`, `上限 ${timeoutWaste.capSecs}秒`],
+    fixTask: 'killProcessTree と fallbackBackendTimeoutSecs(#773)が効いていない。timeout 行の chain[].secs を実測し、上限を超えた試行のバックエンドと起動経路を特定して修正・テスト追加',
+  });
   if (limitRows.length && metric && !supersededWindow && metric.usedPercent < 90) findings.push({
     id: 'codex_false_usage_limit', severity: 'high', title: 'Codex 上限検出の偽陽性',
     evidence: [`usage_limit記録 ${limitRows.length}件`, `実測 used_percent ${metric.usedPercent}`, `window ${metric.windowMinutes ?? '不明'}分`, `resets_at ${metric.resetsAt ?? '不明'}`],

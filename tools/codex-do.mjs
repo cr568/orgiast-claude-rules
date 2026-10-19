@@ -510,14 +510,38 @@ function cheapCodeBackend(name, homeDir) {
   return { kind: 'cheap-code', name, provider, model: provider === 'glm' ? 'glm-5.3' : 'deepseek-v4-flash' };
 }
 
-export function resolveFallbackBackends(homeDir) {
+export function findExecutable(name, { env = process.env, platform = process.platform, existsImpl = fs.existsSync } = {}) {
+  try {
+    const searchPath = env.PATH || env.Path || '';
+    const delimiter = platform === 'win32' ? ';' : path.delimiter;
+    const pathImpl = platform === 'win32' ? path.win32 : path;
+    const extensions = platform === 'win32'
+      ? String(env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
+      : [''];
+    for (const dir of searchPath.split(delimiter).filter(Boolean)) {
+      for (const extension of extensions) {
+        const candidate = pathImpl.resolve(dir, `${name}${extension}`);
+        if (existsImpl(candidate)) return candidate;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+export function resolveFallbackBackends(homeDir, options = {}) {
+  const executableAvailable = options.executableAvailable || ((cmd) => Boolean(findExecutable(cmd, options)));
   const geminiKey = loadGeminiKey(homeDir);
   const openrouterKey = loadEnvKey(homeDir, 'openrouter.env', 'OPENROUTER_API_KEY');
   const deepseekKey = loadDeepseekKey(homeDir);
   const preferFree = process.env.CODEX_DO_PREFER_FREE === '1';
-  const gemini = geminiKey && { kind: 'gemini', name: 'gemini-cli', model: process.env.CODEX_DO_GEMINI_MODEL || 'gemini-3.7-flash', apiKey: geminiKey };
-  const deepseek = deepseekKey && { kind: 'qwen', name: 'deepseek', model: 'deepseek-chat', baseUrl: 'https://api.deepseek.com/v1', apiKey: deepseekKey };
-  const openrouter = openrouterKey && { kind: 'qwen', name: 'openrouter-free', model: process.env.CODEX_DO_FREE_MODEL || 'cohere/north-mini-code:free', baseUrl: 'https://openrouter.ai/api/v1', apiKey: openrouterKey };
+  const geminiAvailable = !geminiKey || executableAvailable('gemini');
+  const qwenAvailable = !(deepseekKey || openrouterKey) || executableAvailable('qwen');
+  if (geminiKey && !geminiAvailable) console.error('[codex-do] gemini-cli の CLI(gemini) が見つからないため候補から外します');
+  if (deepseekKey && !qwenAvailable) console.error('[codex-do] deepseek の CLI(qwen) が見つからないため候補から外します');
+  if (openrouterKey && !qwenAvailable) console.error('[codex-do] openrouter-free の CLI(qwen) が見つからないため候補から外します');
+  const gemini = geminiKey && geminiAvailable && { kind: 'gemini', name: 'gemini-cli', model: process.env.CODEX_DO_GEMINI_MODEL || 'gemini-3.7-flash', apiKey: geminiKey };
+  const deepseek = deepseekKey && qwenAvailable && { kind: 'qwen', name: 'deepseek', model: 'deepseek-chat', baseUrl: 'https://api.deepseek.com/v1', apiKey: deepseekKey };
+  const openrouter = openrouterKey && qwenAvailable && { kind: 'qwen', name: 'openrouter-free', model: process.env.CODEX_DO_FREE_MODEL || 'cohere/north-mini-code:free', baseUrl: 'https://openrouter.ai/api/v1', apiKey: openrouterKey };
   const byName = {
     'gemini-cli': () => gemini,
     'qwen': () => deepseek,
@@ -540,8 +564,8 @@ export function resolveFallbackBackends(homeDir) {
   return ordered.filter(Boolean);
 }
 
-export function resolveQwenBackends(homeDir) {
-  return resolveFallbackBackends(homeDir);
+export function resolveQwenBackends(homeDir, options = {}) {
+  return resolveFallbackBackends(homeDir, options);
 }
 
 // 429/413 はコード上の行番号(例: "foo.ts:429:12")と衝突するため、コロンで数字に
@@ -562,6 +586,23 @@ export function isBackendExhausted(output, stderr) {
   const patterns = ['rate limit', 'rate-limited', 'quota', 'insufficient', 'request too large'];
   if (patterns.some((p) => lower.includes(p))) return true;
   return merged.split(/\r?\n/).some((line) => isHttpStatusCodeLine(line, '429') || isHttpStatusCodeLine(line, '413'));
+}
+
+export function isBackendCliMissing(output, stderr) {
+  const merged = `${output || ''}\n${stderr || ''}`;
+  if (/not recognized as an internal or external command|内部コマンドまたは外部コマンド|command not found|\/bin\/sh: .*: not found/i.test(merged)) return true;
+  if (/^\s*['"]?[^\s:'"]+['"]?\s*:\s*not found\s*$/im.test(merged)) return true;
+  // 素の ENOENT はアプリのビルドエラーにも現れる。spawn 失敗の文言と同時に出た時だけ拾う。
+  if (/\bspawn\b[^\n]*\bENOENT\b|\bENOENT\b[^\n]*\bspawn\b/i.test(merged)) return true;
+  return false;
+}
+
+export function shouldAdvanceToNextBackend({ timedOut, status, exhausted, cliMissing } = {}) {
+  if (timedOut) return { advance: true, outcome: 'timeout' };
+  if (cliMissing) return { advance: true, outcome: 'cli_missing' };
+  if (exhausted) return { advance: true, outcome: 'exhausted' };
+  if (status === 0) return { advance: false, outcome: 'ok' };
+  return { advance: false, outcome: 'failed' };
 }
 
 // WSL codex の起動確認は「codex が無い」と「一過性で起動できない」を分けて扱う。
@@ -600,10 +641,11 @@ const noFallback = args.includes('--no-fallback');
 // WSL 経路が使えず codex を起動できなかったか。true のときは再試行/昇格をせず、
 // 既存のフォールバック連鎖へそのまま渡す（2026-09-19）。
 let launchUnavailable = false;
-// codex が usage_limit クールダウン中で、代替バックエンド(deepseek/glm/gemini-cli)が使えるとき true。
+// codex が usage_limit クールダウン中か無人枠上限で、代替バックエンド(deepseek/glm/gemini-cli)が使えるとき true。
 // 保留(exit 75)で終わらせず、codex 起動を飛ばしてフォールバック連鎖へ渡す（2026-10-10 実害: autopilot が
 // 4日先の cooldown で deferred を返され、監督が自分で実装する羽目になった）。
 let cooldownSkipCodex = false;
+let skipCodexReason = '';
 // Codex が認証失敗(401 / 未ログイン)で死んだか。再試行では直らないので即フォールバックへ回す。
 let authFailed = false;
 const review = args.includes('--review');
@@ -758,10 +800,16 @@ if (useCodex && !forceNative && !process.env.NODE_TEST_CONTEXT && process.env.CO
 }
 if (useCodex) {
   const gate = decideCodexGate({ home, origin });
-  if (gate.deferred && gate.reason === 'codex_cooldown' && !noFallback && resolveFallbackBackends(home).length > 0) {
+  if (gate.deferred && ['codex_cooldown', 'unattended_budget'].includes(gate.reason) && !noFallback && resolveFallbackBackends(home).length > 0) {
     cooldownSkipCodex = true;
+    skipCodexReason = gate.reason;
     launchUnavailable = true;
-    console.error(`[codex-do] codex_cooldown（${new Date(gate.retryAt).toLocaleString()} まで）のため codex を起動せず代替バックエンドへ回します`);
+    const retryAt = new Date(gate.retryAt).toLocaleString();
+    if (skipCodexReason === 'unattended_budget') {
+      console.error(`[codex-do] unattended_budget（無人枠 ${gate.used}/${gate.limit} 件、${retryAt} 以降に回復）のため codex を起動せず代替バックエンドへ回します`);
+    } else {
+      console.error(`[codex-do] codex_cooldown（${retryAt} まで）のため codex を起動せず代替バックエンドへ回します`);
+    }
   } else if (gate.deferred) {
     recordDeferred(gate);
     console.error(`[codex-do] 保留: ${gate.reason}（${new Date(gate.retryAt).toLocaleString()} 以降に再試行）`);
@@ -1004,7 +1052,7 @@ function isFastFail(result, elapsedSecs) {
 
 async function executeCodex() {
   if (cooldownSkipCodex) {
-    return { status: 3, outputChars: 0, output: '', stderr: 'codex_cooldown', timedOut: false, launched: false };
+    return { status: 3, outputChars: 0, output: '', stderr: skipCodexReason || 'codex_cooldown', timedOut: false, launched: false };
   }
   const codexArgs = buildCodexExecArgs({ ...selectedLane, review });
   let result = null, attempts = 0, seconds = 0;
@@ -1082,7 +1130,8 @@ if (quotaCheck.matched && selectedLane.slug !== ASTRA) {
     try { writeCodexCooldownFile(claudeFile(home, 'codex-cooldown.json'), parseUsageLimitUntil(limitText)); } catch {}
   }
 }
-const fallbackReason = cooldownSkipCodex ? 'Codex usage limit クールダウン中'
+const fallbackReason = skipCodexReason === 'unattended_budget' ? 'Codex 無人枠の日次上限に到達'
+  : cooldownSkipCodex ? 'Codex usage limit クールダウン中'
   : authFailed ? 'Codex 未ログイン(認証失敗)'
   : launchUnavailable ? 'WSL 経路が無く codex を起動できない'
   : quotaCheck.matched ? 'Codex usage limit を検出' : 'Astra 昇格後も失敗';
@@ -1142,16 +1191,10 @@ if (quotaCheck.matched || escalationFailed || launchUnavailable || authFailed) {
           result.status = 1;
         }
         const spawnFailed = originalStatus === null;
-        let outcome = 'failed';
-        if (spawnFailed) {
-          outcome = 'spawn_failed';
-        } else if (result.timedOut === true) {
-          outcome = 'timeout';
-        } else if (result.status === 0) {
-          outcome = 'ok';
-        } else if (isBackendExhausted(result.output, result.stderr)) {
-          outcome = 'exhausted';
-        }
+        const cliMissing = isBackendCliMissing(result.output, `${result.stderr || ''}\n${result.error?.message || ''}`);
+        const exhausted = isBackendExhausted(result.output, result.stderr);
+        const decision = shouldAdvanceToNextBackend({ timedOut: result.timedOut === true, status: result.status, exhausted, cliMissing });
+        const outcome = decision.outcome;
 
         fallbackChain.push({
           backend: backend.name,
@@ -1165,18 +1208,17 @@ if (quotaCheck.matched || escalationFailed || launchUnavailable || authFailed) {
           outcome
         });
 
-        if (outcome === 'timeout') recordFallbackBackendOutcome(home, { backend: backend.name, outcome });
-        if (result.timedOut) {
+        if (outcome === 'timeout' || outcome === 'cli_missing') recordFallbackBackendOutcome(home, { backend: backend.name, outcome });
+        if (outcome === 'timeout') {
           console.error(`[codex-do] backend=${backend.name} が ${backendTimeout} 秒でタイムアウトしたため次のバックエンドへ移ります`);
-          continue;
-        }
-        if (result.status === 0) {
-          fallbackBackend = backend;
-          break;
-        }
-        if (isBackendExhausted(result.output, result.stderr)) {
+        } else if (outcome === 'cli_missing') {
+          console.error(`[codex-do] backend=${backend.name} の CLI が見つからないため次のバックエンドへ移ります`);
+        } else if (outcome === 'exhausted') {
           console.error(`[codex-do] backend=${backend.name} が上限/エラーで使えないため次へ`);
-          continue;
+        }
+        if (decision.advance) continue;
+        if (outcome === 'ok') {
+          fallbackBackend = backend;
         }
         // 上限/エラー以外の失敗(実装エラー等)は次のバックエンドへ落とさず、この結果で止める。
         break;

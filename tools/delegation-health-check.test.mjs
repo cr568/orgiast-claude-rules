@@ -888,3 +888,24 @@ test('低成果の chain 行だけでは fallback_low_yield を起票しない',
   const findings = collectFindings({ home: dir, now: NOW });
   assert.equal(findings.filter((f) => f.id === 'fallback_low_yield').length, 0);
 });
+
+test('#773 以降の timeout が上限を超えたら夜間に high で検出する', () => {
+  const dir = home();
+  write(dir, 'executor-usage.jsonl', row({
+    t: '2026-10-18T10:08:59Z', provider: 'fallback', status: 'timeout', secs: 1800,
+    chain: [{ backend: 'gemini-cli', outcome: 'timeout', secs: 1500 }, { backend: 'cheap-code:deepseek', outcome: 'ok', secs: 300 }],
+  }));
+  const findings = collectFindings({ home: dir, now: new Date('2026-10-19T12:00:00Z'), codexUsedPercent: null });
+  const finding = findings.find((f) => f.id === 'timeout_waste_exceeds_cap');
+  assert.equal(finding?.severity, 'high');
+  assert.deepEqual(finding.evidence, ['1件', '最大試行 1500秒', '上限 900秒']);
+});
+
+test('#773 以降の timeout が上限内なら timeout_waste_exceeds_cap を出さない', () => {
+  const dir = home();
+  write(dir, 'executor-usage.jsonl', row({
+    t: '2026-10-19T17:34:53Z', provider: 'codex', status: 'timeout', secs: 600.502, exitCode: 124,
+  }));
+  const findings = collectFindings({ home: dir, now: new Date('2026-10-19T20:00:00Z'), codexUsedPercent: null });
+  assert.equal(findings.find((f) => f.id === 'timeout_waste_exceeds_cap'), undefined);
+});

@@ -433,3 +433,20 @@ test('副作用の告知だけならStopで差し戻し、直後に対処を書�
   assert.equal(repaired.status, 0, repaired.stderr);
   assert.equal(repaired.stdout, '');
 });
+
+test('完了待ちと将来作業をStopで差し戻し、完了報告なら通す', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-runner-deferral-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const result = invoke(home, 'deferral', '営業アプリは GitHub 通知を取り込まなくなる。\nCodex の実装完了を待っています（終わると通知が来ます）。');
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.decision, 'block');
+  assert.match(output.reason, /### deferral-wait-gate/);
+  const record = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8'));
+  assert.ok(record.reasonCodes.includes('DEFERRAL-WAIT'));
+  assert.ok(record.blockedBy.includes('side-effect-left-gate'));
+  assert.equal(record.blockedBy.indexOf('deferral-wait-gate'), record.blockedBy.indexOf('side-effect-left-gate') + 1);
+  const repaired = invoke(home, 'deferral', '作業はすべて完了しました。テストは全件 PASS、本番反映済みです。');
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.equal(repaired.stdout, '');
+});

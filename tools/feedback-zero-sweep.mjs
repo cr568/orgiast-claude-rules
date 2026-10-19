@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { isEntry } from './is-entry.mjs';
-import { parseEnvText, ensureFeedbackIssue, loadFeedbackApps, runGh } from './feedback-to-issues.mjs';
+import { parseEnvText, ensureFeedbackIssue, loadFeedbackApps, runGh, DEDICATED_PIPELINE_APPS } from './feedback-to-issues.mjs';
 import { decideCodexGate, parseDeferred, nextLocalMidnight } from './lib/executor-gate.mjs';
 import { notifyKim } from './notify-kim.mjs';
 import { main as doneNotify } from './feedback-done-notify.mjs';
@@ -149,7 +149,9 @@ export async function sweep({registryFile=path.join(here,'feedback-zero-registry
             } catch(e) {row.errors.push(e.message);row.status='未取得（Issue照合失敗）';row.remaining++;continue;}
           }
           row.remaining++;
-          if(dryRun){row.queued++;continue;}
+          // Dedicated intake owns implementation; keep backlog and existing Issue checks above.
+          if(DEDICATED_PIPELINE_APPS.has(entry.appName))continue;
+          if(dryRun){if(!repo && !issue)row.errors.push('反映先 repo 参照キー未設定');else row.queued++;continue;}
           if(!issue) {
             if(!repo){row.errors.push('反映先 repo 参照キー未設定');continue;}
             try {issue=ensureIssue(item,repo,{home,gh});}catch(e){row.errors.push('Issue化失敗: '+e.message);continue;}
@@ -192,10 +194,21 @@ export async function sweep({registryFile=path.join(here,'feedback-zero-registry
     return {dryRun,remaining,unknown,launched,rows,notification};
   } finally {if(locked)fs.rmSync(lock,{force:true});}
 }
+export function sweepExitCode(result) {
+  // Empty queues do not prove success: intake/configuration failures count as unknown.
+  if(result.unknown > 0) return 1;
+  if(!result.dryRun) {
+    const {delivered,reason}=result.notification;
+    // A clean empty sweep intentionally skips notification (none without a reason).
+    if(delivered!=='dm' && (result.remaining>0 || delivered!=='none' || reason)) return 1;
+  }
+  return 0;
+}
+
 if(isEntry(import.meta.url)) {
   try {
     const args=process.argv.slice(2);if(args.some(a=>a!=='--dry-run'))throw new Error('引数は --dry-run のみ');
     const result=await sweep({dryRun:args.includes('--dry-run')});console.log(JSON.stringify(result,null,2));
-    if(result.unknown || (!result.dryRun && result.remaining>0 && result.notification.delivered!=='dm'))process.exitCode=1;
+    process.exitCode=sweepExitCode(result);
   }catch(e){console.error('feedback-zero-sweep: '+e.message);process.exitCode=1;}
 }
