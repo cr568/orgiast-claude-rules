@@ -408,6 +408,23 @@ test('返信1回の依頼ではFULL-STEPSとUSER-BURDENを出さない', t => {
   assert.equal(record.handoffKind, 'reply-only'); assert.ok(record.demoted.includes('manual-request-fullsteps-gate')); assert.ok(record.demoted.includes('user-burden-gate'));
   assert.doesNotMatch(result.stdout, /FULL-STEPS|USER-BURDEN/);
 });
+
+test('恒久策必須は返信のみでも形式gateと一緒に降格しない', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-permanent-fix-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const text = '一言返信してください。\n次に kim がすること: 返信してください\nこの後の自動進行: なし（完了）\nこのセッション: /session-close は不要なので、このセッションを閉じてよい';
+  const result = invoke(home, 'permanent-fix', text);
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.decision, 'block');
+  assert.match(output.reason, /### next-action-gate[\s\S]*恒久策:/);
+  const record = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8'));
+  assert.equal(record.handoffKind, 'reply-only');
+  assert.ok(record.demoted.includes('user-burden-gate'));
+  assert.ok(!record.demoted.includes('next-action-gate'));
+  assert.ok(record.blockedBy.includes('next-action-gate'));
+  assert.ok(record.reasonCodes.includes('PERMANENT-FIX-REQUIRED'));
+});
 test('MacroDroidの検索不足を先に示し形式は1セクションにまとめる', t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-past-log-')); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const transcript_path = path.join(home, 't.jsonl'); fs.writeFileSync(transcript_path, JSON.stringify({ type: 'user', message: { content: 'MacroDroid を使いたい' } }));
