@@ -383,6 +383,24 @@ test('完了報告の引用に反応した形式gateは台帳だけに降格す�
   assert.equal(record.handoffKind, 'none'); assert.ok(record.demoted.includes('manual-request-fullsteps-gate')); assert.ok(record.demoted.includes('user-burden-gate'));
   assert.ok(!record.blockedBy.includes('manual-request-fullsteps-gate')); assert.doesNotMatch(result.stdout, /FULL-STEPS/);
 });
+
+test('Sheets書き込み後に第三者へ再送を頼むとhandoff-action-gateでblockする', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-runner-restore-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const transcript = path.join(home, 'transcript.jsonl');
+  fs.writeFileSync(transcript, [
+    { type: 'user', message: { role: 'user', content: 'フォーム回答を確認してください' } },
+    { type: 'assistant', message: { role: 'assistant', content: [
+      { type: 'tool_use', name: 'mcp__booth___debug_writeAndRead', input: { ssId: 'sheet', a1Cell: 'A1', formula: '="test"' } },
+    ] } },
+  ].map(entry => JSON.stringify(entry)).join('\n'));
+  const text = '上書きして消してしまいました。私の側からは元に戻せません。\n> お心当たりがあれば、もう一度フォームから送っていただけますか。';
+  const result = invoke(home, 'restore-gate-test', text, { transcript_path: transcript });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).decision, 'block');
+  const record = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8').trim().split('\n').at(-1));
+  assert.ok(record.blockedBy.includes('handoff-action-gate'));
+});
 test('返信1回の依頼ではFULL-STEPSとUSER-BURDENを出さない', t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-reply-')); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const result = invoke(home, 'reply', '一言返信してください。\n次に kim がすること: 返信してください');
