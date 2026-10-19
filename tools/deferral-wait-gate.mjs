@@ -1,0 +1,46 @@
+export const GATE_CONTRACT = {"name": "deferral-wait-gate", "remedies": [{"kind": "repo-file", "ref": "tools/gate-remedies.md", "section": "deferral-wait-gate"}]};
+
+import { detect } from './permanent-fix-deferral-scan.mjs';
+
+// 「完了を待つ」と「その完了後にやる作業」が近接しているときだけ、ターンを閉じる先送りと判定する。
+// 本文全体を見る: 実際の違反は本文の途中に「完了を待っています」があり、その後に
+// 「次に kim がすること: なし」の定型文が続く。末尾だけを見ると取りこぼす
+// （2026-10-18T07:32:28.656Z / 49d68696 の実文がその形）。
+const FUTURE_WORK = /終わり次第|終わったら|終わると|終了後|完了後|でき次第|出来次第|通知が(?:来|届)|終えたら|上がったら|返ってきたら/;
+// 実測 5 件はいずれも 40 字以内に後続作業が続く（`（終わり次第…）` / `（終わると…）` / `（通知が来たら…）`）。
+// 離れた位置の言及（ツールの説明文など）を拾わないための距離。
+const FUTURE_WINDOW = 160;
+
+export function enabled() {
+  return process.env.ORGIAST_DEFERRAL_WAIT_GATE !== '0';
+}
+
+// 引用行と fenced code block は、回答本文ではなく例示・引用なので判定から外す。
+function proseLines(text) {
+  let fence;
+  return String(text || '').split(/\r?\n/).map(line => {
+    if (/^\s*>/.test(line)) return '';
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = undefined;
+      return '';
+    }
+    if (marker) { fence = marker[1]; return ''; }
+    return line;
+  }).join('\n');
+}
+
+export function judge(text) {
+  if (!enabled()) return { decision: 'pass' };
+  const prose = proseLines(text);
+  const wait = detect(prose).find(result => result.pattern === 'W');
+  if (!wait) return { decision: 'pass' };
+  const from = wait.match.index;
+  const nearby = prose.slice(Math.max(0, from - FUTURE_WINDOW), from + wait.match[0].length + FUTURE_WINDOW);
+  if (!FUTURE_WORK.test(nearby)) return { decision: 'pass' };
+  return {
+    decision: 'block',
+    code: 'DEFERRAL-WAIT',
+    reason: '完了を待つのではなく、当ターン内に完了まで進めてください。待機が不要なら、待たずに次の作業へ進めて結果まで報告してください。',
+  };
+}
