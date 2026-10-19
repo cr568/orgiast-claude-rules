@@ -222,6 +222,8 @@ GASはclaspとGitHubで管理し、実行・read-backまでClaudeが行う。
 Apps Script Web エディタに直接コードを書かない。ソースはGitHub管理、`.clasp.json`で`clasp push -f`反映。Web Appデプロイは既存 `deploymentId` を再利用（URL維持）。手作業コピペ・「エディタで保存→再デプロイしてください」案内は禁止。
 bound scriptのscriptId不明時はDrive MCPで`mimeType='application/vnd.google-apps.script'`検索等の発見手順あり。詳細: `https://raw.githubusercontent.com/kimkon1011/orgiast-claude-rules/main/rules-extracted/gas-clasp-workflow.md`
 
+**GAS のテンプレート .html はコメント内でも `<?` `?>` を書かない（2026-10-15 倉庫アプリ本番@64が約1.5時間全停止）**: テンプレートは場所を問わず `<?= ?>` を評価するため、JSコメント内の記述でも `evaluate()` が SyntaxError になり全画面が落ちる。push 前に `grep -nE '<\?' current-app/*.html` と `test/template-scriptlet.test.js` で検査し、deploy 直後は実ブラウザで JS エラーが無いことを確認する。詳細: `https://raw.githubusercontent.com/kimkon1011/orgiast-claude-rules/main/rules-extracted/gas-clasp-workflow.md`
+
 **1.4 GAS の実行を Claude 側で完結させる**
 
 `clasp push -f`だけでなく関数実行も自動化しないと「▶実行してください」が繰り返し発生する。初回1clickのOAuth同意でtime-basedトリガーを仕込めば以降は無人化できる。
