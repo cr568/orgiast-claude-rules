@@ -84,7 +84,7 @@ export function judge(input, { ledgerPath = shareLedgerPath(), now = Date.now() 
   const shared = input.transcript_path && fs.existsSync(input.transcript_path) ? transcriptIds(fs.readFileSync(input.transcript_path, 'utf8')) : new Set();
   const missing = pending.filter(id => !shared.has(id));
   if (!missing.length) return { decision: 'pass' };
-  return { decision: 'block', reason: missing.map(id => `送信前に相手へ共有してください: node tools/drive-share.mjs --id ${id} --to <相手のメール>（社内は編集者・社外はコメント可が既定）。共有済みのファイルなら同コマンドで記録されます（既存権限はスキップ）。`).join('\n') };
+  return { decision: 'block', reason: missing.map(id => `送信前に相手へ共有してください: node tools/drive-share.mjs --id ${id} --to <相手のメール>（社内は編集者・社外はコメント可が既定）。社員宛てなら --to syain@orgiast.jp で全社員に共有できます。共有済みのファイルなら同コマンドで記録されます（既存権限はスキップ）。`).join('\n') };
 }
 export async function main() {
   try {
