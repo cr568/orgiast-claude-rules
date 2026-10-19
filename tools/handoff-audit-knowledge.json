@@ -43,7 +43,7 @@
   },
   {
     "pattern": "GAS の関数実行が要る",
-    "route": "clasp run / コマンドキュー経由で Claude 側から実行。『▶実行してください』は違反",
+    "route": "GAS の関数実行は、登録済みコマンドなら cr-PC で `node ~/.claude/tools-local/booth-cmd.mjs <コマンド名> '[args]'` を実行してコマンドキューへ投入し、時間主導トリガーに実行させる。clasp run は org の executionApi 設定により所有者以外は失敗するので「不可」と断定しない。未登録の関数は `src/CommandQueue.js` の `_cmdQueue_commands` へ登録して push した後に投入する。戻り値の本文は 403 で読めないので、result ファイルの生成を実行成立の証拠として扱い、値は別経路で read-back する。『▶実行してください』や kim-PC への代行依頼は違反",
     "confidence": "high",
     "source": "§1.4"
   },
