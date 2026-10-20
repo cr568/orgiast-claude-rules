@@ -86,6 +86,35 @@ test('processed migration marks only existing inbox ids done and removes the leg
   assert.equal(fs.existsSync(file), false); assert.equal(f.read('mail-original').status, 'done'); assert.equal(f.read('mail-failed').status, 'failed');
   assert.equal(f.read('mail-unprocessed').status, 'delivered'); assert.equal(fs.existsSync(path.join(f.inbox, 'mail-missing.json')), false);
 });
+
+function growiFixture(t, { hub = true, body = JSON.stringify({ growiAppend: [{ path: '/手順', anchor: '目印', lines: '追記' }] }) } = {}) {
+  const f = fixture(t);
+  fs.appendFileSync(path.join(f.dir, 'fleet-sheet.env'), `FLEET_HUB=${hub ? receiver : sender}\n`);
+  fs.writeFileSync(path.join(f.dir, 'growi.env'), '存在確認専用');
+  f.save(mail({ why: '[growi-append] 手順更新', body }));
+  f.deps.growiAppend = async item => ({ ok: true, path: item.pagePath, insertedLines: 1 });
+  return f;
+}
+
+test('Growi 中継はハブかつ growi.env ありなら処理して返信する', async t => {
+  const f = growiFixture(t); await pollOnce(f.deps);
+  const sent = f.calls.find(call => call.kind === 'mail-send');
+  assert.equal(sent.payload.replyTo, 'mail-original'); assert.match(sent.payload.body, /"ok":true/);
+  assert.match(sent.payload.id, /^mail-reply-growi-[0-9a-f]{24}$/); // サーバーの mail-send は id 必須
+  assert.ok(f.read('mail-original').growiAppendDoneAt);
+});
+test('Growi 中継はハブでなければ処理しない', async t => {
+  const f = growiFixture(t, { hub: false }); await pollOnce(f.deps);
+  assert.equal(f.calls.some(call => call.kind === 'mail-send'), false); assert.equal(f.read('mail-original').growiAppendDoneAt, undefined);
+});
+test('Growi 中継は処理済みメールを二重処理しない', async t => {
+  const f = growiFixture(t); await pollOnce(f.deps); await pollOnce(f.deps);
+  assert.equal(f.calls.filter(call => call.kind === 'mail-send').length, 1);
+});
+test('Growi 中継は不正 JSON でも失敗理由を返信する', async t => {
+  const f = growiFixture(t, { body: '{不正' }); await pollOnce(f.deps);
+  const sent = f.calls.find(call => call.kind === 'mail-send'); assert.match(sent.payload.body, /"ok":false/); assert.ok(f.read('mail-original').growiAppendDoneAt);
+});
 test('interactive done/failed/expired prompts and already-started prompts are never re-executed', async t => {
   const f = fixture(t);
   for (const status of TERMINAL_STATUSES) f.save(mail({ id: `mail-${status}`, status, kind: 'prompt' }));

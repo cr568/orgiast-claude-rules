@@ -626,6 +626,18 @@
       "reason": "fleet-mail v2 の提示・通知・初回移行を全PCへ配布"
     },
     {
+      "path": "tools/growi-manual.mjs",
+      "scope": "fleet",
+      "step": "task:fleet-mail",
+      "reason": "fleet-mail の Growi 追記処理が使う実行時 import 依存。top-level 依存は Node 組み込みと配布済み is-entry.mjs のみ"
+    },
+    {
+      "path": "tools/lib/drive-auth.mjs",
+      "scope": "fleet",
+      "step": "task:fleet-mail",
+      "reason": "growi-manual の同期・索引発行機能が遅延読込する依存。npm パッケージ不要で、認証ファイルは import 時には読まない"
+    },
+    {
       "path": "skills/fleet-mail/SKILL.md",
       "scope": "fleet",
       "step": "task:fleet-mail",

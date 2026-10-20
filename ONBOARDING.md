@@ -1005,6 +1005,7 @@ Claude Code / Codex / 安いLLM はすべて **API があるものしか触れ�
 
 - **運用**: Claude Code は user に手作業を頼もうとした時点で、まず「これは Grok Bot のスキルにできないか」を検討し、できるなら**手順書ではなく Bot 用の指示文**を出す。Bot に渡した作業は `~/.claude/grokbot-skills.md` に「スキル名・対象アカウント・承認が要る箇所」を記録し、二重に人へ頼まない。
 - **禁止**: 認証情報を Bot に渡す判断を Claude が勝手に進めないこと。どのサービスに何の権限でログインさせるかは必ず user に明示して合意を取る（§1.1 の「安全機構の解除誘導・説明なしの一括設定は禁止」に該当）。
+- Growi 追記はハブへ `node tools/fleet-mail.mjs --send --to <ハブ> --kind note --why "[growi-append] <要約>" --body-file <json>` で中継し、user に貼り付けを頼まない。
 
 ## 他AIは「積極的に使う」のが既定（kim 2026-10-09 厳命・全PC全アカウント）
 
@@ -1020,7 +1021,8 @@ Codex／Gemini／DeepSeek／Groq／Kimi／Mistral／OpenRouter／GLM などの�
 3. 修復できなかった場合は、原因・試した手段・**残る user 操作 1 件**を kim に fleet-mail または Discord で送る（放置しない）。
 4. **手渡し前の代替検証**: user に支払い・ログイン・設定を頼む前に、同じ能力を持つ生存レーンで実行して結果を示す。生存レーンがあるのに頼んだら違反（substitute-capability-gate が block）。user がそのプロバイダを名指しで要求した場合だけ `[SUBSTITUTE-OK]` で例外。
 5. URL のアカウント表記は人が分かるメール/ラベル（例 seisaku-team@orgiast.jp）。内部 ID（user_xxx）は不可。カタログ `tools/ai-subscription-catalog.json` の `account` が正本。
-6. 由来: 2026-10-15 cr 指摘「codex が WSL 不在で 3 日放置」「OpenRouter 入金依頼（xAI で代替可だった）」「ユーザーID 表記」。kim の最上位原則（§1.1「削減していいのは Claude のコストだけ」）の具体化。
+6. **他PC・他人・他レーンの返事待ちは手渡し理由にならない**: 依頼先が止まったら、Claude が催促し、別経路（§1.18.2 Grok Bot・ハブ中継・資格の正規配布）を試し、詰まった経路そのものを直す（例: Growi の書き込み資格がハブにしか無い→ `[growi-append]` 中継で全PCから追記可能にした）。user には状況の報告だけをし、手作業は頼まない。handoff-investigation-gate が [WAIT-STALL] で block する（2026-10-19 cr 指摘「ユーザーの手間 > Claude の効率」が無視された実害）。
+7. 由来: 2026-10-15 cr 指摘「codex が WSL 不在で 3 日放置」「OpenRouter 入金依頼（xAI で代替可だった）」「ユーザーID 表記」。kim の最上位原則（§1.1「削減していいのは Claude のコストだけ」）の具体化。
 
 ### 1.19 マキモノと画像デザイン／見せる資料はハイブリッド企画書モデル
 

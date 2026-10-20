@@ -15,6 +15,7 @@ import { relayQuestions, readQuestion, clearResume, reconcileResumes, collectQue
 import { resolveFleetLabel } from './lib/fleet-label.mjs';
 import { LANE_HEALTH_KIM_PC, parseLaneDoctorOutput, deadLanes, repairAdvice, laneHealthSignature, buildLaneHealthMail } from './lib/lane-health.mjs';
 import { dailyRuleCompliance } from './fleet-rule-compliance-daily.mjs';
+import { appendAfterFromEnv } from './growi-manual.mjs';
 export { resolveFleetLabel, dailyRuleCompliance };
 
 const ownRepo = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -904,6 +905,8 @@ export async function pollOnce(deps = {}) {
     const lastPollFile = path.join(dir, '.fleet-mail-last-poll.json');
     writeJson(lastPollFile, { ...readJson(lastPollFile, {}), at: new Date(now()).toISOString() });
     let promptHandled = false;
+    let growiAppendHandled = false;
+    const fleetMembers = deps.pcMap ?? readJson(new URL('../fleet-pc-map.json', import.meta.url), {});
     for (const pending of readInbox(home, { unreadOnly: false })) {
       let mail = pending;
       try {
@@ -934,6 +937,32 @@ export async function pollOnce(deps = {}) {
               log('sent', { action: 'decision-ack', id: mail.id, decisionId: latest.decisionId });
             } catch (error) { log('decision-ack-failed', { id: mail.id, error: redactSecrets(error.message) }); }
           }
+          continue;
+        }
+        const growiRequest = Object.hasOwn(fleetMembers, mail.from) && label === config.FLEET_HUB && fs.existsSync(path.join(dir, 'growi.env'))
+          && mail.kind === 'note' && /^\[growi-append\]/.test(String(mail.why ?? '')) && !mail.growiAppendDoneAt;
+        if (growiRequest && !growiAppendHandled) {
+          growiAppendHandled = true;
+          const results = [];
+          try {
+            const parsed = JSON.parse(mail.body);
+            if (!Array.isArray(parsed?.growiAppend) || parsed.growiAppend.length < 1 || parsed.growiAppend.length > 5) throw new Error('growiAppend は1〜5件の配列にしてください');
+            for (const item of parsed.growiAppend) {
+              if (!item || typeof item.path !== 'string' || !item.path.startsWith('/') || typeof item.anchor !== 'string' || !item.anchor || typeof item.lines !== 'string') throw new Error('各 growiAppend には path・anchor・lines が必要です');
+              try {
+                results.push(await (deps.growiAppend ?? appendAfterFromEnv)({ pagePath: item.path, anchor: item.anchor, lines: item.lines,
+                  envFile: path.join(dir, 'growi.env'), timeoutMs: 120000 }));
+              } catch (error) { results.push({ ok: false, path: item.path, error: redactSecrets(error.message) }); }
+            }
+          } catch (error) { results.push({ ok: false, error: redactSecrets(error.message) }); }
+          try {
+            checked(await request('mail-send', { id: `mail-reply-growi-${createHash('sha256').update(`${mail.id}\n${label}`).digest('hex').slice(0, 24)}`,
+              from: label, to: mail.from, replyTo: mail.id, messageKind: 'note', auto: true,
+              hop: nextHop(mail), priority: 'normal', why: '[回答・返信不要] growi-append 結果', body: JSON.stringify(results),
+              expiresAt: new Date(now() + 72 * 3600000).toISOString() }));
+            updateInbox(mail.id, current => current && ({ ...current, growiAppendDoneAt: new Date(now()).toISOString() }), { home });
+            handled.push(mail.id);
+          } catch { err('fleet-mail: growi-append 返信再送待ち=1'); }
           continue;
         }
         if (mail.kind !== 'prompt') { if (fresh.has(mail.id)) handled.push(mail.id); continue; }
