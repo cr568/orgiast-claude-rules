@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseHandoff } from './auto-session.mjs';
-import { applyAutoHeal, authRestoredAfter, collectFindings, emptyOutputReason, isCooldownSkippedRow, isQuotaLimitedRow, lowYieldBackends, parseRateLimitsFromText, readCodexUsedPercent, upsertFixTasks, windowResetsAfterLimit } from './delegation-health-check.mjs';
+import { applyAutoHeal, authRestoredAfter, collectFindings, emptyOutputReason, isCooldownSkippedRow, isEmptyDiffEscalationRow, isQuotaLimitedRow, lowYieldBackends, parseRateLimitsFromText, readCodexUsedPercent, upsertFixTasks, windowResetsAfterLimit } from './delegation-health-check.mjs';
 
 const NOW = new Date('2026-09-09T12:00:00.000Z');
 const homes = [];
@@ -752,6 +752,40 @@ test('上限/レート制限だけで全滅したレーンは lane_outage_unrepa
   // 証拠は catch-all の no_output ではなく、台帳に書かれた失敗の種類をそのまま出す
   // (「no_output(3件)」では上限到達が原因不明の故障に見える。2026-10-13 診断)。
   assert.equal(limit.evidence[1], 'quota_limited(3件)');
+});
+
+// 2026-10-19 実測: fallback の「直近3件すべて失敗」は、gemini が応答を返した(chain outcome=ok)が
+// 作業ツリーを1行も変えなかった行だった。バックエンドは動いており、レーン障害ではない。
+// codex-do が付ける reason:'empty_diff' で識別し、high の未修理全滅として起票しない。
+test('fallback の空diff昇格行はレーン全滅ではなく low の可視化にする', () => {
+  const dir = home();
+  const emptyDiffRows = [
+    { t: '2026-09-09T09:00:00Z', provider: 'fallback', model: 'gemini-cli/gemini-3.7-flash', status: 'error', out: 623, reason: 'empty_diff', stderrTail: 'YOLO mode is enabled.', chain: [{ backend: 'gemini-cli', status: 0, out: 623, outcome: 'ok' }] },
+    { t: '2026-09-09T10:00:00Z', provider: 'fallback', model: 'gemini-cli/gemini-3.7-flash', status: 'error', out: 258, reason: 'empty_diff', stderrTail: 'Ripgrep is not available.', chain: [{ backend: 'gemini-cli', status: 0, out: 258, outcome: 'ok' }] },
+    { t: '2026-09-09T11:00:00Z', provider: 'fallback', model: 'gemini-cli/gemini-3.7-flash', status: 'error', out: 81, reason: 'empty_diff', chain: [{ backend: 'gemini-cli', status: 0, out: 81, outcome: 'ok' }] },
+  ];
+  write(dir, 'executor-usage.jsonl', emptyDiffRows.map(row).join(''));
+  const findings = collectFindings({ home: dir, now: NOW });
+  assert.equal(findings.some((f) => f.id === 'lane_outage_unrepaired'), false);
+  const visible = findings.find((f) => f.id === 'fallback_empty_diff_escalation');
+  assert.equal(visible.provider, 'fallback');
+  assert.equal(visible.severity, 'low');
+  assert.equal(visible.fixTask, undefined);
+  assert.equal(visible.evidence[0], '3件すべて空diff');
+});
+
+test('chain が ok でない fallback 失敗行は従来どおりレーン全滅として起票する', () => {
+  const dir = home();
+  const failed = [
+    { t: '2026-09-09T09:00:00Z', provider: 'fallback', status: 'error', out: 0, reason: 'empty_diff', chain: [{ backend: 'gemini-cli', status: 1, outcome: 'failed' }] },
+    { t: '2026-09-09T10:00:00Z', provider: 'fallback', status: 'error', out: 0, chain: [{ backend: 'gemini-cli', status: 1, outcome: 'failed' }] },
+    { t: '2026-09-09T11:00:00Z', provider: 'fallback', status: 'error', out: 0, chain: [{ backend: 'gemini-cli', status: 1, outcome: 'failed' }] },
+  ];
+  write(dir, 'executor-usage.jsonl', failed.map(row).join(''));
+  assert.equal(isEmptyDiffEscalationRow(failed[0]), false);
+  const outage = collectFindings({ home: dir, now: NOW }).find((f) => f.id === 'lane_outage_unrepaired');
+  assert.equal(outage.provider, 'fallback');
+  assert.equal(outage.severity, 'high');
 });
 
 test('上限行に 1 件でも上限以外の失敗が混ざれば従来どおり high の未修理全滅にする', () => {
