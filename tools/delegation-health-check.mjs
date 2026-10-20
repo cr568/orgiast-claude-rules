@@ -433,9 +433,26 @@ export function upsertFixTasks({ home, findings, now = new Date(), todayStr }) {
   return true;
 }
 
+// 判定結果は「上限超過のときだけ」finding になるため、上限内だった事実は report に残らない。
+// 台帳の配備後 timeout を毎晩そのまま記録し、再発した夜に「捨てた秒数が600秒級に収まったか」を
+// 判定器を叩き直さずに読めるようにする
+// (2026-10-21: #765/#773 の効果判定が再発待ちのまま、判定した証跡がどこにも残らなかった)。
+export function timeoutWasteSummary(rows = []) {
+  const report = judgeTimeoutRows(rows);
+  const lastPostDeploy = report.events.filter((event) => event.postDeploy).map((event) => event.t).sort().at(-1) || null;
+  return {
+    verdict: report.verdict,
+    postDeployTimeoutRows: report.postDeployTimeoutRows,
+    overCapRows: report.overCapRows,
+    maxAttemptSecs: report.maxAttemptSecs,
+    lastPostDeployTimeoutAt: lastPostDeploy,
+  };
+}
+
 export function renderSummary(report) {
   const lines = ['## 🩺 委譲ヘルス（直近24h）'];
   for (const item of report.findings) lines.push(`- ${item.severity} / ${item.title} / 自動修復:${item.autoHealed ? 'あり' : 'なし'} / 起票先:${item.fixTask && ['high', 'medium'].includes(item.severity) ? '~/.claude/next-session.md' : 'なし'}`);
+  if (report.timeoutWaste) lines.push(`- timeout判定: ${report.timeoutWaste.verdict} / 配備後 ${report.timeoutWaste.postDeployTimeoutRows}件 / 上限超過 ${report.timeoutWaste.overCapRows}件 / 最大試行 ${report.timeoutWaste.maxAttemptSecs}秒${report.timeoutWaste.lastPostDeployTimeoutAt ? ` / 最終 ${report.timeoutWaste.lastPostDeployTimeoutAt}` : ''}`);
   if (lines.length < 5) lines.push(`- Codex実測: ${report.codexExhausted ? '上限到達（primary なし）' : report.codexUsedPercent === null ? '計測不能' : `${report.codexUsedPercent}%`}`, `- 生成日時: ${report.generatedAt}`, '- high があっても夜間処理は継続');
   return `${lines.slice(0, 15).join('\n')}\n`;
 }
@@ -446,7 +463,7 @@ export function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv), metric = readCodexUsedPercent({});
   const findings = collectFindings({ home: args.home, now: args.now, codexUsedPercent: metric });
   if (!args.dryRun) { fs.mkdirSync(path.join(args.home, '.claude'), { recursive: true }); applyAutoHeal({ home: args.home, findings, now: args.now }); upsertFixTasks({ home: args.home, findings, now: args.now }); }
-  const report = { generatedAt: args.now.toISOString(), codexUsedPercent: measured(metric)?.usedPercent ?? null, codexExhausted: metric?.exhausted === true, findings };
+  const report = { generatedAt: args.now.toISOString(), timeoutWaste: timeoutWasteSummary(readJsonl(path.join(args.home, '.claude', 'executor-usage.jsonl'))), codexUsedPercent: measured(metric)?.usedPercent ?? null, codexExhausted: metric?.exhausted === true, findings };
   const summary = renderSummary(report);
   if (!args.dryRun) { fs.writeFileSync(path.join(args.home, '.claude', 'delegation-health.json'), `${JSON.stringify(report, null, 2)}\n`); fs.writeFileSync(path.join(args.home, '.claude', 'delegation-health.md'), summary); }
   process.stdout.write(summary);
