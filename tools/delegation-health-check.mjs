@@ -150,6 +150,17 @@ export function isCooldownSkippedRow(row = {}) {
   return String(row?.status ?? '').toLowerCase() === 'cooldown';
 }
 
+// fallback バックエンド自体は走って応答を返した(chain の outcome が ok)のに、作業ツリーを
+// 1行も変えなかった行。codex-do が reason:'empty_diff' を付ける。
+// これはレーン(バックエンド)の全滅ではなく、昇格元(codex sol→astra)が空diffだった作業を
+// 代替が実装しなかった＝成果の失敗。全滅の分母に入れると、代替が正常に動いているのに
+// 毎晩 high の「未修理」が積まれる(2026-10-19 実測: fallback の3件が全てこれ)。
+export function isEmptyDiffEscalationRow(row = {}) {
+  if (row?.provider !== 'fallback' || String(row?.reason || '') !== 'empty_diff') return false;
+  const chain = Array.isArray(row?.chain) ? row.chain : [];
+  return chain.some((item) => item?.outcome === 'ok');
+}
+
 // フォールバック先の子プロセスが OS エラーで起動できなかった行(例: spawn ENAMETOOLONG / ENOENT)。
 // 1件で発火させる: 低成果(2件閾値)では単発の故障が翌朝 healthy と判定されてしまった (2026-09-21)。
 const SPAWN_FAILED = /syscall: 'spawn'|\bspawn E[A-Z]+\b|code: 'E[A-Z]{4,}'/;
@@ -325,12 +336,20 @@ export function collectFindings({ home, now = new Date(), codexUsedPercent = nul
     // 全滅の分母は「実際に投げた回(attempts)」。cooldown 行は上限中で投げなかった記録なので
     // 分母から外す。外さないと上限到達の実体が「N件すべて失敗」の high 未修理全滅に見える
     // (2026-10-13 診断: glm の11件 = cooldown 5件 + http_429 6件)。
-    const attempts = rows.filter((row) => !isCooldownSkippedRow(row));
+    const emptyDiffRows = rows.filter(isEmptyDiffEscalationRow);
+    const attempts = rows.filter((row) => !isCooldownSkippedRow(row) && !isEmptyDiffEscalationRow(row));
     // 24h 窓が cooldown だけで埋まる＝上限中で一度も試行していない。レーンは止まっているが
     // 原因は上限側で、コードの欠陥ではない。low の可視化だけ残す(high にすると上限が明けるまで
     // 毎晩同じ偽の修理タスクが積まれる。黙って消すと止まっている事実自体が見えなくなる)。
     if (!attempts.length) {
-      if (rows.length >= 3) {
+      // 窓が「代替は応答したが1行も変えなかった」行だけで埋まった場合も、レーン障害ではない。
+      // 止まっている事実は low で可視化し、修理タスク(high)にはしない。
+      if (emptyDiffRows.length === rows.length && rows.length >= 3) {
+        const times = rows.map(row => row.t).sort((a, b) => Date.parse(a) - Date.parse(b));
+        findings.push({ id: 'fallback_empty_diff_escalation', provider, severity: 'low', title: `${provider} の昇格先は応答したが作業ツリーを変更できていない（レーン障害ではない）`,
+          evidence: [`${rows.length}件すべて空diff`, `最初 ${times[0]}`, `最後 ${times.at(-1)}`,
+            'chain の outcome は ok（バックエンドは起動・応答している）'] });
+      } else if (rows.length >= 3) {
         const state = cooldown[provider], until = Number(state?.until);
         const skipped = rows.map(row => row.t).sort((a, b) => Date.parse(a) - Date.parse(b));
         findings.push({ id: 'provider_cooldown_skipped', provider, severity: 'low', title: `${provider} は cooldown 中で試行されていない（欠陥ではない）`,

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, detectCodexAuthFailure, isCodexAuthFailure, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, findExecutable, isBackendCliMissing, shouldAdvanceToNextBackend, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, detectCodexAuthFailure, isCodexAuthFailure, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, findExecutable, isBackendCliMissing, shouldAdvanceToNextBackend, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS, wantsEdit } = await import('./codex-do.mjs');
 
 const runDirs = [];
 function workDir() {
@@ -308,6 +308,19 @@ test('shouldFlagEmptyFallbackDiff returns false when treeChanged is true', () =>
     diffText: '',
     treeChanged: true,
   }), false);
+});
+
+// 2026-10-19 実測: fallback の「直近3件すべて失敗」のうち2件は kind:verify だった。
+// 「〜を修正したか検証して」を implement と誤認して wantedEdit=true にし、空diff→astra昇格→
+// gemini fallback まで走らせて error として台帳に残していた。読み取り専用の kind は編集を要求しない。
+test('wantsEdit は kind=implement のときだけ真になる', () => {
+  assert.equal(wantsEdit('implement', 'この不具合を修正してください'), true);
+  assert.equal(wantsEdit('verify', 'この不具合を修正したか検証してください'), false);
+  assert.equal(wantsEdit('investigate', '修正箇所を調べて'), false);
+  assert.equal(wantsEdit('classify', 'この修正依頼を分類して'), false);
+  assert.equal(wantsEdit('summarize', '修正内容を要約して'), false);
+  assert.equal(wantsEdit('implement', 'この不具合を修正してください', true), false);
+  assert.equal(wantsEdit('implement', '一覧を出して'), false);
 });
 
 test('snapshotWorkingTree non-git directory: snapshot changes when file is added', () => {

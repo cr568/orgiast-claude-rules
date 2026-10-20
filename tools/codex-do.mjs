@@ -322,6 +322,16 @@ export function snapshotWorkingTree(cwd, spawnImpl = spawnSync) {
   }
 }
 
+// 指示文が編集を求めているかを kind と文面の両方で判定する。
+// kind=verify/investigate/classify/summarize は読み取り専用の依頼なので、文面に「修正」等が
+// 入っていても編集を要求していない。文面だけで判定すると「〜を修正したか検証して」が wantedEdit に
+// なり、空diff→codex の不要な astra 昇格→gemini fallback まで走って failure として台帳に残る
+// (2026-10-19 実測: fallback の直近3件中2件が kind:verify の空diff)。kind を優先する。
+const EDIT_HINT = /実装|作って|修正|直して|追加して|リファクタ|refactor|fix|implement/i;
+export function wantsEdit(kind, instruction, review = false) {
+  return kind === 'implement' && !review && EDIT_HINT.test(String(instruction || ''));
+}
+
 export function shouldFlagEmptyFallbackDiff({ executorName, wantedEdit, timedOut, diffText, treeChanged }) {
   if (treeChanged === true) {
     return false;
@@ -822,7 +832,11 @@ if (useCodex) {
 // 下の「空diffなら書き込めていない」判定が一度も発火しないため（2026-09-03 実害）。
 const treeSnapshot = () => snapshotWorkingTree(cwd);
 const treeBefore = treeSnapshot();
-const wantedEdit = !review && /実装|作って|修正|直して|追加して|リファクタ|refactor|fix|implement/i.test(instruction);
+// kind=verify/investigate/classify/summarize は読み取り専用の依頼なので、文面に「修正」等が
+// 入っていても編集を要求していない。文面だけで判定すると「〜を修正したか検証して」が wantedEdit に
+// なり、空diff→codex の不要な astra 昇格→gemini fallback まで走って failure として台帳に残る
+// (2026-10-19 実測: fallback の直近3件中2件が kind:verify の空diff)。kind を優先する。
+const wantedEdit = wantsEdit(taskKind, instruction, review);
 const started = Date.now();
 let mockIndex = 0;
 
@@ -894,6 +908,10 @@ let lastBackend = null;
 let fallbackChain = [];
 
 let escalated = false;
+// 失敗の理由を台帳へ残す。これが無いと、fallback 行はバックエンドの stderr(YOLO mode is enabled…
+// などの情報行)だけが stderrTail に残り、delegation-health は「全滅」の原因を stderrTail から
+// 特定できない(2026-10-19 実測: fallback 3件の stderrTail は全て無害な情報行だった)。
+let ledgerReason = '';
 function recordUsage(result, modelName, seconds, provider = 'codex', attempts = 1, chain = null) {
   try {
     const ledger = path.join(home, '.claude', 'executor-usage.jsonl');
@@ -902,6 +920,8 @@ function recordUsage(result, modelName, seconds, provider = 'codex', attempts = 
     // stderr は空のままなので、放っておくと台帳からは「codex が走って何も出さなかった」と区別できない
     // （2026-10-04 診断: 直近24hの codex out=0 のうち3件がこの形）。spawnError として必ず残す。
     const spawnError = result?.error ? String(result.error.message ?? result.error).replace(/\s+/g, ' ').trim().slice(-200) : '';
+    const backendTail = String(result?.stderr || spawnError || '').replace(/\s+/g, ' ').trim().slice(-160);
+    const stderrTail = [ledgerReason, backendTail].filter(Boolean).join(' | ').slice(-200);
     fs.appendFileSync(ledger, `${JSON.stringify({
       t: new Date().toISOString(), provider, model: modelName,
       lane: selectedLane.reason, escalated,
@@ -912,7 +932,8 @@ function recordUsage(result, modelName, seconds, provider = 'codex', attempts = 
       origin, kind: taskKind,
       exitCode: result?.status ?? null,
       cwd,
-      stderrTail: String(result?.stderr || spawnError || '').replace(/\s+/g, ' ').trim().slice(-200),
+      stderrTail,
+      ...(ledgerReason ? { reason: ledgerReason } : {}),
       ...(spawnError ? { spawnError } : {}),
       fastFail: result?.timedOut !== true && Number(result?.status) !== 0 && (result?.outputChars || 0) === 0,
       attempts,
@@ -1245,6 +1266,7 @@ if (executorName === 'codex') {
 if (shouldFlagEmptyFallbackDiff({ executorName, wantedEdit, timedOut: result.timedOut, diffText: diff.stdout, treeChanged: !treeUnchanged })) {
   const printedUsage = /^\s*(Usage|使い方)[:：]|--approval-mode\s+Set the approval mode/m.test(result.output || result.stderr || '');
   const fallbackName = reportedFallbackBackend?.name ?? 'unknown';
+  ledgerReason = printedUsage && reportedFallbackBackend?.kind === 'gemini' ? 'fallback_usage_help' : 'empty_diff';
   console.error(reportedFallbackBackend?.kind === 'gemini' && printedUsage
     ? '🚨 Gemini が使い方(ヘルプ)を表示して終了しました＝指示が届いていません。引数の渡し方を確認してください'
     : `🚨 フォールバック(${fallbackName})は作業ツリーを1行も変更していません。指示が届いたか確認してください`);
