@@ -97,10 +97,52 @@ foreach ($line in $lines) {
   if ($LASTEXITCODE -ne 0 -or -not $url) { Write-Host "FAIL: origin を取得できません ($repo)"; $failed++; continue }
   $slug = ($url -replace '^.*github\.com[:/]', '') -replace '\.git$', ''
 
+  $headers = @{ Authorization = "Bearer $token"; 'User-Agent' = 'orgiast-oneclick' }
+
+  # 同じ枝名の open PR が既にあるなら push も PR 作成もしない（内容が同一 tree のときだけ skip）。
+  # ただし fork 由来の PR（head.repo が base と別）は auto-merge.yml の eligible=false で永久に着地しない。
+  # その場合は同じ内容を origin 枝として push し直し、same-repo PR として自動着地させる。
+  $existingPr = $null
+  $forkPr = $null
+  try {
+    $openPrs = Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$slug/pulls?state=open&per_page=100" -Headers $headers
+    $existingPr = $openPrs | Where-Object { $_.head.ref -eq $branch -and $_.head.repo.full_name -eq $slug } | Select-Object -First 1
+    # fork 由来の同名 PR（head が base と別リポジトリ）。auto-merge.yml の eligible=false で
+    # 自動着地しないため、同内容を origin 枝として push し直して same-repo PR を作る。
+    # fork 側は閉じない（別セッションの作業状態を壊さない）。URL を出して人が判断できるようにする。
+    $forkPr = $openPrs | Where-Object { $_.head.ref -eq $branch -and $_.head.repo -and $_.head.repo.full_name -ne $slug } | Select-Object -First 1
+  } catch {
+    Write-Host "WARN: 既存PRの照会に失敗しました（重複判定なしで続行）: $($_.ErrorDetails.Message)"
+  }
+  if ($forkPr) {
+    Write-Host "INFO: 同名の fork PR #$($forkPr.number) が open です（自動着地の対象外）: $($forkPr.html_url)"
+    Write-Host '      → 同じ内容を origin 枝として push し、same-repo PR を作ります。fork 側は閉じません。'
+  }
+  if ($existingPr) {
+    $sameTree = $false
+    & git -C $repo fetch --quiet origin "refs/pull/$($existingPr.number)/head" 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+      $localTree = (& git -C $repo rev-parse "$branch^{tree}").Trim()
+      $remoteTree = (& git -C $repo rev-parse 'FETCH_HEAD^{tree}').Trim()
+      if ($localTree -eq $remoteTree) { $sameTree = $true }
+    }
+    if ($sameTree) {
+      Write-Host "SKIP: 同内容の open PR #$($existingPr.number) が既にあります（重複PRを作らないため push しません）: $($existingPr.html_url)"
+      try {
+        Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$slug/issues/$($existingPr.number)/labels" -Headers $headers -ContentType 'application/json' -Body (@{ labels = @('automerge') } | ConvertTo-Json -Compress) | Out-Null
+        Write-Host 'OK: 既存PRへ automerge ラベルを付与しました。'
+      } catch {
+        Write-Host "WARN: 既存PRに automerge ラベルを付けられませんでした（権限不足の可能性）: $($_.ErrorDetails.Message)"
+      }
+      $done++
+      continue
+    }
+    Write-Host "WARN: 同じ枝名の open PR #$($existingPr.number) がありますが内容が異なるため、通常どおり push します。"
+  }
+
   & git @gitNoPrompt -C $repo push -u origin $branch 2>&1 | ForEach-Object { Write-Host $_ }
   if ($LASTEXITCODE -ne 0) { Write-Host "FAIL: push できません ($branch)"; $failed++; continue }
 
-  $headers = @{ Authorization = "Bearer $token"; 'User-Agent' = 'orgiast-oneclick' }
   $body = @{ title = $branch; head = $branch; base = 'main'; body = '自動セッションの成果物。CI が緑になれば automerge でマージされます。' } | ConvertTo-Json -Compress
   $pr = $null
   try {
