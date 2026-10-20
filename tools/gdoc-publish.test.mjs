@@ -181,8 +181,8 @@ test('--share shares the created document and records recipients using the same 
   const source = '本文';
   const result = await publishDocument({ title: '共有文書', source, authuser: 'a@orgiast.jp', share: 'a@orgiast.jp,b@example.com' }, mockApi(renderDocument(source)));
   assert.equal(result.id, 'doc-id');
-  assert.deepEqual(writes.map(p => p.role), ['writer', 'commenter']);
+  assert.deepEqual(writes.map(p => p.role), ['writer', 'commenter', 'writer']);
   const rows = readFileSync(join(home, '.claude/share-ledger.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-  assert.deepEqual(rows.map(r => r.fileId), ['doc-id', 'doc-id']);
-  assert.equal(output.length, 2);
+  assert.deepEqual(rows.map(r => r.fileId), ['doc-id', 'doc-id', 'doc-id']);
+  assert.equal(output.length, 3);
 });

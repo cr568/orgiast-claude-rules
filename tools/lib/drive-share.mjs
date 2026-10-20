@@ -19,11 +19,14 @@ export function extractFileId(value) {
 }
 
 export const defaultRole = email => /@orgiast\.jp$/i.test(email.trim()) ? 'writer' : 'commenter';
+const EMPLOYEE_GROUP = 'syain@orgiast.jp';
+const KNOWN_GROUPS = new Set([EMPLOYEE_GROUP]);
 export function shareRecipients(emails, role) {
   if (role !== undefined && !['reader', 'commenter', 'writer'].includes(role)) throw new Error('共有ロールは reader|commenter|writer を指定してください');
   const list = [...new Set((Array.isArray(emails) ? emails : String(emails ?? '').split(',')).map(e => e.trim().toLowerCase()).filter(Boolean))];
   if (!list.length || list.some(e => !/^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/.test(e))) throw new Error('共有先メールアドレスが不正です');
-  return list.map(email => ({ email, role: role ?? defaultRole(email) }));
+  if (list.some(email => /@orgiast\.jp$/i.test(email) && !KNOWN_GROUPS.has(email)) && !list.includes(EMPLOYEE_GROUP)) list.push(EMPLOYEE_GROUP);
+  return list.map(email => ({ email, role: role ?? defaultRole(email), type: KNOWN_GROUPS.has(email) ? 'group' : 'user' }));
 }
 
 /** auth is an existing access-token string or getDriveToken options. */
@@ -45,13 +48,13 @@ export async function shareFile({ fileId, emails, role, auth }) {
     const rank = { reader: 1, commenter: 2, writer: 3, fileOrganizer: 4, organizer: 5, owner: 6 };
     const results = [];
     for (const recipient of recipients) {
-      const exists = permissions.some(p => p.type === 'user' && !p.deleted && p.emailAddress?.toLowerCase() === recipient.email
+      const exists = permissions.some(p => p.type === recipient.type && !p.deleted && p.emailAddress?.toLowerCase() === recipient.email
         && (!p.expirationTime || Date.parse(p.expirationTime) > Date.now()) && rank[p.role] >= rank[recipient.role]);
       if (exists) { results.push({ ...recipient, status: 'exists' }); continue; }
       try {
         await driveApi(token, `${endpoint}?sendNotificationEmail=false&supportsAllDrives=true`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'user', emailAddress: recipient.email, role: recipient.role }),
+          body: JSON.stringify({ type: recipient.type, emailAddress: recipient.email, role: recipient.role }),
         });
         results.push({ ...recipient, status: 'added' });
       } catch (error) { results.push({ ...recipient, status: 'error', error: error.message }); }
