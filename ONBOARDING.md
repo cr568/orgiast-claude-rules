@@ -602,6 +602,10 @@ deny/warnはPC・ゲート・復旧手段の到達状況だけを既存通知経
 
 完了報告で止まらず、目的単位で区切り次セッションへの引継ぎを自動化する。
 
+kim 宛の自動通知は「何が起きたか／次に自動でやること／kim がすること」の 3 点を必ず含む（`tools/lib/kim-notice.mjs`）。
+全件羅列・内部 ID のみの通知は禁止。
+平易化で語を削除しない（原文保持）。
+
 **1.15 完了報告で stop せず自律進行する**
 
 「すすめて」と打たせない。完了報告の後は自動で次のTODO（git commit/vercel prod deploy/Layer2 e2e/memory反映等）に着手する。設計判断・破壊的操作・未承認prod送信・大型リファクタのみAskUserQuestionで待つ。報告末尾に「残TODO」セクションを付ける。詳細・自動着手チェックリスト: `https://raw.githubusercontent.com/kimkon1011/orgiast-claude-rules/main/rules-extracted/autonomy-and-reporting.md`

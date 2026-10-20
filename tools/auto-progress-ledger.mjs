@@ -24,12 +24,20 @@ function lastMatch(re, text) {
   return found ? cleanValue(found[1]) : null;
 }
 
+// 完了宣言に続く説明を、新しい自動進行の約束として扱わない。
+export function isNoopPromise(text) {
+  const value = cleanValue(text);
+  const first = value.split('。', 1)[0].replace(/[.．\s]+$/g, '').replace(/\s*[（(].*[）)]$/, '').trim();
+  return NONE.test(first) || first === '特にありません' ||
+    /^完了済み。\s*追加の自動進行なし(?:[。\s]|$)/.test(value) ||
+    /(?:作業|自動進行|自動処理|進行|対応)(?:は|が)?(?:ありません|無い|ない|なし)$/.test(first);
+}
+
 // 「なし」系（空・None 相当）は null。それ以外は宣言本文を返す。
 export function extractPromise(text) {
   const value = lastMatch(PROMISE_RE, text);
   if (!value) return null;
-  const bare = value.replace(/[。.．\s]+$/g, '').replace(/\s*[（(].*[）)]$/, '').trim();
-  return !bare || NONE.test(bare) ? null : value;
+  return isNoopPromise(value) ? null : value;
 }
 
 export function extractNextKim(text) {
@@ -55,6 +63,8 @@ export function writeLedger(file, rows) {
   fs.writeFileSync(temp, rows.map((row) => JSON.stringify(row)).join('\n') + (rows.length ? '\n' : ''));
   fs.renameSync(temp, file);
 }
+
+export const MAX_RESUMES = 8; // 1件あたりの自動再開の累計上限（watch/digest 共用。循環 import 回避のためここに置く）
 
 export const OPEN_STATUSES = new Set(['open', 'stalled', 'resumed', 'waiting_user']);
 
@@ -111,3 +121,14 @@ async function main() {
 }
 
 if (isEntry(import.meta.url)) { await main(); process.exitCode = 0; }
+
+export const rowKey = (row) => `${row.pc}|${row.user}|${row.sessionId}|${row.ts}`;
+
+export function isUnattendedRow(row, home) {
+  const normalize = value => String(value || '').replace(/\\/g, '/').replace(/^\/mnt\/([a-z])\//i, '$1:/').replace(/\/+$/, '').toLowerCase();
+  const cwd = normalize(row.cwd), root = normalize(home);
+  return /(?:^|\/)\.stall-sweeper(?:\/|$)/.test(cwd) || ['nightly-repo', 'auto-session', 'scratch'].some(name => {
+    const base = `${root}/.claude/${name}`;
+    return cwd === base || cwd.startsWith(`${base}/`);
+  });
+}
