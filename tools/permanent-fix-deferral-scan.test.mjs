@@ -139,6 +139,20 @@ test('委譲の完了待ちはW(待機)であって先送り(P1-P4)ではない'
   const quote = 'Codex の2本の完了を待っています。';
   assert.deepEqual(detect(quote).map(found => found.pattern), ['W']);
 });
+test('実測の名詞化した待機・完了通知待ちをWとして検出する', () => {
+  for (const quote of [
+    '事故の記録を memory に残しました。修復の書き込みが終わるのを待っています（終わると知らせが届きます）。',
+    '今動いているのは2つで、どちらも終わると知らせが届きます。',
+    'memory への記録は済みました。Codex の実装（ゲート3本・ルール本文・テスト・PR 作成）が終わるのを待っています。終わったら差分…',
+    '書き込みを投入しました（42マス、終わったら5か所を読み戻します）。完了すると知らせが届くので、その時点で読み戻し結果を確認して報告します。'
+  ]) assert.deepEqual(detect(quote).map(found => found.pattern), ['W'], quote);
+});
+test('返信待ち・結果待ちはWと誤検出しない', () => {
+  for (const quote of [
+    'ご返信をお待ちしています。',
+    'サブエージェントの結果を待っています。'
+  ]) assert.deepEqual(detect(quote), [], quote);
+});
 test('handoff-audit TODO の引用内にある待機・修正語を再検出しない', () => {
   const todos = [
     '16. [handoff-audit:655fbad73a29c865] 恒久修正の先送り文を検出（2026-10-12T11:08:57.526Z / a4c12da7 / W）「ィブ Codex が書き込みタスクで exit_null になる原因診断（Sonnet）の完了待ちです。 次に kim がすること: なし（Discord DM」 — この handoff が再発していないかを実物で検証し結果を記録する（再発防止の経路: 違反セッションの先送りを当ターン内に実装まで終える（例: 2026-10-12T11:08:57.526Z / a4c12da7-a178-44cb-af93-3cbb39caaee7））。kimへのDMなし。',
