@@ -15,6 +15,8 @@ Claude Code は「作業者の手間を最小化する自動実行エージェ�
 user の操作はゼロが原則。①Claude 自身が実行 → ②別経路で自動化（MCP・CLI・既存の定期ジョブ・fleet の自己修復など）→ ③それでも安全装置の拒否などで Claude が実行できないものだけ、`tools/make-desktop-launcher.mjs` でデスクトップのダブルクリック用ファイルにしてパスだけを示す。
 PowerShell への貼り付けは頼まない。③にしたときは、①②を試した経路名・結果（拒否・classifier 等）の証拠を `手間監査:` の行に書く（全PC・全アカウント共通、kim 決定 2026-09-26）。
 
+ここでいう user の手間には、依頼者本人だけでなく他メンバー・購買部・倉庫など Claude 以外の全員の手作業・再送・再入力・確認を含む。Claude 自身が壊した・消したデータは、版履歴・フォーム回答・API など Claude 側の経路で復元し、人に再作業を頼まない。
+
 **1.1 できる作業は全部 Claude 側でやる（徹底自動化原則）**
 
 ### 削減していいのは Claude のコストだけ。user の往復は削減の対価にしない（kim 2026-10-10 厳命・全PC全アカウント・絶対）
@@ -316,6 +318,7 @@ kim が読む Doc は `tools/gdoc-publish.mjs --authuser <開く人のメール>
   **このPCの `gh` が nishiOrgiast 認証であることは、その前に `gh auth status` で確認済みだった**
   ＝分かっていたのに条件付きで渡したのが誤り。
   実行主体が自分でも相手でもない第三者なら、渡すのは**コマンドではなく「その人に送る文面」**にする。
+  ただし Claude 側で取得・復元できる内容を第三者に再作業させる文面は禁止（先に §1.1 の経路を試す）。
   \`tools/manual-request-fullsteps-gate.mjs\` が機械検査する（コマンドを含むフェンスがある依頼で
   3点が揃っていないと block）。相手の端末が Windows か Mac か分からないときは、
   **推測で片方だけ書かず両方書く**か、先に1行で聞く。
@@ -601,7 +604,9 @@ deny/warnはPC・ゲート・復旧手段の到達状況だけを既存通知経
 
 「すすめて」と打たせない。完了報告の後は自動で次のTODO（git commit/vercel prod deploy/Layer2 e2e/memory反映等）に着手する。設計判断・破壊的操作・未承認prod送信・大型リファクタのみAskUserQuestionで待つ。報告末尾に「残TODO」セクションを付ける。詳細・自動着手チェックリスト: `https://raw.githubusercontent.com/kimkon1011/orgiast-claude-rules/main/rules-extracted/autonomy-and-reporting.md`
 
-**「この後の自動進行: <内容>」の宣言は台帳に記録され、止まれば自動で拾われる（2026-10-14 追加）**。Stop hook `tools/auto-progress-ledger.mjs` が宣言（「なし」以外）を `~/.claude/auto-progress-ledger.jsonl` に記録する（同一セッションは最新で置換）。各PCの定期タスク `OrgiastAutoProgressWatch` が毎日 09:00/13:00/18:00/22:00 に台帳を巡回し、宣言から6時間以降のものを安いLLMで done / in_progress / stalled に判定する。stalled は 1件1日1回まで自動再開し、共有 Sheet（タブ「自動進行」）へ行を足す。全PCが朝08:40と巡回後に自PC分をDiscord DMする（0件は送らない）。だから宣言は「実際に自動で進む内容」だけ書く。Sheet 側の追加手順は `docs/auto-progress-gas-patch.gs.txt`。
+**「この後の自動進行: <内容>」の宣言は台帳に記録され、止まれば自動で拾われる（2026-10-14 追加）**。Stop hook `tools/auto-progress-ledger.mjs` が宣言（「なし」以外）を `~/.claude/auto-progress-ledger.jsonl` に記録する（同一セッションは最新で置換）。各PCの定期タスク `OrgiastAutoProgressWatch` が毎時台帳を巡回し、宣言から1時間以降のものを判定する。stalled は前回から2時間以上空けて累計8回まで最終成果へ向けて自動再開し、共有 Sheet（タブ「自動進行」）へ行を足す。全PCが朝08:40と巡回後に自PC分をDiscord DMする（0件は送らない）。だから宣言は「実際に自動で進む内容」だけ書く。Sheet 側の追加手順は `docs/auto-progress-gas-patch.gs.txt`。
+
+自動進行の結果はセッションの持ち主に DM とセッション内表示で必ず届く。user に「進捗どう？」と聞かせたら違反（2026-10-19 cr 指摘）。
 
 PR は原則 `gh pr create ... --label automerge` で作り、CI が赤なら Claude が直す。「マージしてください」と user に頼まない。
 workflow・keyserve・secrets・env・fleet 指令ファイルに触る時だけ label を付けず、PR 冒頭に kim の手動マージが必要な理由を書く。
@@ -1109,6 +1114,7 @@ gh pr view <番号> --repo kimkon1011/orgiast-claude-rules --json autoMergeReque
 1. 原因を「型」で1語に言語化する（例: 配布漏れ型・経路取り違え型・観測不能型）。着手前にカタログを検索し、既存の型を再利用する。
 2. 同じ型の既存箇所をリポジトリ横断で検索し、同じ PR で一緒に直す。
 3. 機械ゲートで再発を止める。安い順にテスト＞hook／lint／converge チェック＞人の確認。**文書だけの対策は不可**。
+Stop ゲートは差し戻し後の書き直しも検査する（素通り禁止・書き直し2回まで・上限後は残存違反を記録して次応答で訂正）。各ゲートの直し方の見本は他ゲートの判定も通す（`gate-remedy-consistency.test.mjs`）。
 4. 全PC配布が要るなら B の経路（converge）に載せる。
 5. カタログに型・横展開の検索・ゲートを1行追記する。
 - 完了報告に **「型／横展開した箇所数／追加したゲート」** を含める。

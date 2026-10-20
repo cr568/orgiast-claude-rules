@@ -56,6 +56,12 @@
       "reason": "classifier-settings ステップが allow ルール同期に実行する"
     },
     {
+      "path": "tools/assign-app-gate-fire.mjs",
+      "scope": "kim-only",
+      "step": null,
+      "reason": "D:/ 固定の worktree と .env.local 候補に依存。kim-PC だけで日次実行"
+    },
+    {
       "path": "tools/audit.ps1",
       "scope": "kim-only",
       "step": null,
@@ -458,6 +464,12 @@
       "reason": "要確認"
     },
     {
+      "path": "tools/register-nightly-remediate-task.ps1",
+      "scope": "kim-only",
+      "step": null,
+      "reason": "朝バッチと同じ手動登録対象。converge 経路なし。"
+    },
+    {
       "path": "tools/register-nightly-kpi-task.ps1",
       "scope": "kim-only",
       "step": null,
@@ -857,6 +869,11 @@
       "scope": "fleet",
       "step": "task:fleet-mail",
       "reason": "ルール定義（rule-compliance-mail が読む）"
+    },
+    {
+      "path": "tools/rescue-review-findings.md",
+      "scope": "kim-only",
+      "reason": "ドキュメントで実行体なし（~/.claude 設定名の記載による誤検出を許容）"
     }
   ]
 }

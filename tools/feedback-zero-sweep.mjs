@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { isEntry } from './is-entry.mjs';
-import { parseEnvText, ensureFeedbackIssue, loadFeedbackApps, runGh } from './feedback-to-issues.mjs';
+import { parseEnvText, ensureFeedbackIssue, loadFeedbackApps, runGh, DEDICATED_PIPELINE_APPS } from './feedback-to-issues.mjs';
 import { decideCodexGate, parseDeferred, nextLocalMidnight } from './lib/executor-gate.mjs';
 import { notifyKim } from './notify-kim.mjs';
 import { main as doneNotify } from './feedback-done-notify.mjs';
@@ -21,15 +21,29 @@ export function loadConfig(home, env = process.env, localFile = path.join(here,'
   if(fs.existsSync(dir)) for(const name of fs.readdirSync(dir).filter(n=>n.endsWith('.env')).sort()) Object.assign(config,parseEnvText(fs.readFileSync(path.join(dir,name),'utf8')));
   return {...config,...readJson(localFile,{}),...env};
 }
+function refNames(ref) { return Array.isArray(ref) ? ref : [ref]; }
+function resolveRef(ref, config) {
+  const name=refNames(ref).find(name=>typeof name==='string' && /^[A-Z][A-Z0-9_]*$/.test(name) && config[name]);
+  return name ? config[name] : undefined;
+}
+export function appDirectory(dir, platform=process.platform) {
+  return typeof dir==='string' && platform!=='win32' && /^[A-Za-z]:[\\/]/.test(dir)
+    ? '/mnt/'+dir[0].toLowerCase()+'/'+dir.slice(3).replace(/\\/g,'/') : dir;
+}
 export function appConfig(entry, config) {
-  const local={};const dir=config[entry.refs.appDir];
+  const local={};const dir=appDirectory(resolveRef(entry.refs?.appDir,config));
   if(dir) for(const name of ['.env','.env.local']) {try{Object.assign(local,parseEnvText(fs.readFileSync(path.join(dir,name),'utf8')));}catch(e){if(e.code!=='ENOENT')throw e;}}
-  return {...local,...config};
+  const merged={...local,...config};
+  // Array tails are app-local fallback names; explicit primary overrides keep priority.
+  for(const ref of Object.values(entry.refs || {})) if(Array.isArray(ref)) {
+    for(const name of ref.slice(1)) if(local[name]) merged[name]=local[name];
+  }
+  return merged;
 }
 function requireRef(entry, config, key) {
-  const name=entry.refs?.[key];
-  if(!/^[A-Z][A-Z0-9_]*$/.test(name || '') || !config[name]) throw new Error(`${key} 参照キー未設定`);
-  return config[name];
+  const value=resolveRef(entry.refs?.[key],config);
+  if(!value) throw new Error(`${key} 参照キー未設定`);
+  return value;
 }
 async function request(url, options, fetchImpl) {
   let response;
@@ -64,6 +78,11 @@ export async function fetchPending(entry, config, fetchImpl=fetch) {
     if(entry.intake==='relay') items=items.filter(row=>row.app_name===entry.appName);
   } else throw new Error('未対応 intake');
   if(items.some(row=>!row || typeof row!=='object' || !(row.message_id || row.id || row.key)))throw new Error('原票の識別子なし');
+  if(entry.intake==='supabase') items=items.filter(row=> {
+    const page=typeof row.page_path==='string'?row.page_path:'';
+    return (!entry.pagePathInclude?.length || entry.pagePathInclude.some(prefix=>page.startsWith(prefix)))
+      && !entry.pagePathExclude?.some(prefix=>page.startsWith(prefix));
+  });
   return {items:items.filter(row=>!DONE.has(String(row.status || '').trim().toLowerCase())),partial};
 }
 export function normalizeItem(entry, row) {
@@ -115,7 +134,7 @@ export async function sweep({registryFile=path.join(here,'feedback-zero-registry
         for(const item of raw.values()) {
           const key=item.message_id;
           let job=state.jobs[key];
-          const repo=env[entry.refs.repo] || repoMap[entry.appName];
+          const repo=resolveRef(entry.refs.repo,env) || repoMap[entry.appName];
           const known=job?.issue || tracked.find(i=>String(i.message_id)===key);
           let issue=known;
           if(issue) {
@@ -130,7 +149,9 @@ export async function sweep({registryFile=path.join(here,'feedback-zero-registry
             } catch(e) {row.errors.push(e.message);row.status='未取得（Issue照合失敗）';row.remaining++;continue;}
           }
           row.remaining++;
-          if(dryRun){row.queued++;continue;}
+          // Dedicated intake owns implementation; keep backlog and existing Issue checks above.
+          if(DEDICATED_PIPELINE_APPS.has(entry.appName))continue;
+          if(dryRun){if(!repo && !issue)row.errors.push('反映先 repo 参照キー未設定');else row.queued++;continue;}
           if(!issue) {
             if(!repo){row.errors.push('反映先 repo 参照キー未設定');continue;}
             try {issue=ensureIssue(item,repo,{home,gh});}catch(e){row.errors.push('Issue化失敗: '+e.message);continue;}
@@ -139,7 +160,7 @@ export async function sweep({registryFile=path.join(here,'feedback-zero-registry
           state.jobs[key]=job;persist();
           if(['awaiting-review','running'].includes(job.status))continue;
           if(job.retryAt>now){row.deferred++;continue;}
-          const dir=env[entry.refs.appDir];
+          const dir=appDirectory(resolveRef(entry.refs.appDir,env));
           if(!dir || !fs.existsSync(dir)){job.status='deferred';job.reason='作業ディレクトリ参照キー未設定';job.retryAt=nextLocalMidnight(now);row.deferred++;persist();continue;}
           const decision=gate({home,origin:'unattended',now});
           if(decision.deferred || launched>=maxJobs) {
@@ -173,10 +194,21 @@ export async function sweep({registryFile=path.join(here,'feedback-zero-registry
     return {dryRun,remaining,unknown,launched,rows,notification};
   } finally {if(locked)fs.rmSync(lock,{force:true});}
 }
+export function sweepExitCode(result) {
+  // Empty queues do not prove success: intake/configuration failures count as unknown.
+  if(result.unknown > 0) return 1;
+  if(!result.dryRun) {
+    const {delivered,reason}=result.notification;
+    // A clean empty sweep intentionally skips notification (none without a reason).
+    if(delivered!=='dm' && (result.remaining>0 || delivered!=='none' || reason)) return 1;
+  }
+  return 0;
+}
+
 if(isEntry(import.meta.url)) {
   try {
     const args=process.argv.slice(2);if(args.some(a=>a!=='--dry-run'))throw new Error('引数は --dry-run のみ');
     const result=await sweep({dryRun:args.includes('--dry-run')});console.log(JSON.stringify(result,null,2));
-    if(result.unknown || (!result.dryRun && result.remaining>0 && result.notification.delivered!=='dm'))process.exitCode=1;
+    process.exitCode=sweepExitCode(result);
   }catch(e){console.error('feedback-zero-sweep: '+e.message);process.exitCode=1;}
 }

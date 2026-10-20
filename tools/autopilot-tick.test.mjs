@@ -106,6 +106,81 @@ test('an unanswered timed question expires and stops blocking the pause', async 
   assert.equal(state.lastExpiredQuestion.expiredAt, '2026-09-21T02:00:00.000Z');
 });
 
+test('a 3-strike runner error resumes by itself once the login is renewed', async (t) => {
+  const f = fixture(t);
+  const creds = path.join(f.opts.home, '.claude', '.credentials.json');
+  fs.mkdirSync(path.dirname(creds), { recursive: true });
+  fs.writeFileSync(creds, JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '' } }));
+  fs.utimesSync(creds, new Date('2026-09-21T00:00:00Z'), new Date('2026-09-21T00:00:00Z'));
+  await f.call('start', { objective: 'test' });
+  for (let i = 0; i < 3; i += 1) await f.call('pause', { reason: 'runner_error', detail: 'OAuth session expired' });
+  const paused = (await f.call('status')).state;
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.consecutiveRunnerErrors, 3);
+  assert.equal(paused.lastRunnerErrorAt, NOW.toISOString());
+  // Same credentials that failed: stay paused instead of relaunching the child every tick.
+  assert.equal((await f.call('pre')).verdict, 'pause');
+  // The owner logs in again: the file is rewritten, so the pause lifts with no command.
+  fs.utimesSync(creds, new Date('2026-09-21T05:00:00Z'), new Date('2026-09-21T05:00:00Z'));
+  assert.equal((await f.call('pre', {}, { now: new Date('2026-09-21T05:05:00Z') })).verdict, 'run');
+  const after = (await f.call('status', {}, { now: new Date('2026-09-21T05:05:00Z') })).state;
+  assert.equal(after.status, 'running');
+  assert.equal(after.consecutiveRunnerErrors, 0);
+});
+
+test('a renewed login does not wipe an unanswered question', async (t) => {
+  const f = fixture(t);
+  const creds = path.join(f.opts.home, '.claude', '.credentials.json');
+  fs.mkdirSync(path.dirname(creds), { recursive: true });
+  fs.writeFileSync(creds, '{}');
+  fs.utimesSync(creds, new Date('2026-09-21T00:00:00Z'), new Date('2026-09-21T00:00:00Z'));
+  await f.call('start', { objective: 'test' });
+  for (let i = 0; i < 3; i += 1) await f.call('pause', { reason: 'runner_error', detail: 'OAuth session expired' });
+  await f.call('pause', { reason: 'runner_error', question: 'このまま進めますか？' });
+  fs.utimesSync(creds, new Date('2026-09-21T05:00:00Z'), new Date('2026-09-21T05:00:00Z'));
+  const pre = await f.call('pre', {}, { now: new Date('2026-09-21T05:05:00Z') });
+  assert.equal(pre.verdict, 'pause');
+  assert.equal(pre.pendingQuestion, 'このまま進めますか？');
+});
+
+test('a dead login still resumes when the deepseek key can carry the child', async (t) => {
+  const f = fixture(t);
+  const creds = path.join(f.opts.home, '.claude', '.credentials.json');
+  fs.mkdirSync(path.dirname(creds), { recursive: true });
+  fs.writeFileSync(creds, JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '' } }));
+  fs.utimesSync(creds, new Date('2026-09-21T00:00:00Z'), new Date('2026-09-21T00:00:00Z'));
+  fs.writeFileSync(path.join(f.opts.home, '.claude', 'deepseek.env'), 'DEEPSEEK_API_KEY="sk-test"\n');
+  await f.call('start', { objective: 'test' });
+  for (let i = 0; i < 3; i += 1) await f.call('pause', { reason: 'runner_error', detail: 'OAuth session expired' });
+  // Right after the pause nothing relaunches: a broken key must not spawn the child every tick.
+  assert.equal((await f.call('pre', {}, { now: new Date(NOW.getTime() + 5 * 60_000) })).verdict, 'pause');
+  const later = { now: new Date(NOW.getTime() + 31 * 60_000) };
+  assert.equal((await f.call('pre', {}, later)).verdict, 'run');
+  const state = (await f.call('status', {}, later)).state;
+  assert.equal(state.status, 'running');
+  assert.equal(state.consecutiveRunnerErrors, 0);
+});
+
+test('without a deepseek key a dead login keeps the 3-strike pause', async (t) => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.opts.home, '.claude'), { recursive: true });
+  await f.call('start', { objective: 'test' });
+  for (let i = 0; i < 3; i += 1) await f.call('pause', { reason: 'runner_error', detail: 'OAuth session expired' });
+  assert.equal((await f.call('pre', {}, { now: new Date(NOW.getTime() + 60 * 60_000) })).verdict, 'pause');
+});
+
+test('the deepseek fallback does not wipe an unanswered question', async (t) => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.opts.home, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(f.opts.home, '.claude', 'deepseek.env'), 'DEEPSEEK_API_KEY=sk-test\n');
+  await f.call('start', { objective: 'test' });
+  for (let i = 0; i < 3; i += 1) await f.call('pause', { reason: 'runner_error', detail: 'OAuth session expired' });
+  await f.call('pause', { reason: 'runner_error', question: 'このまま進めますか？' });
+  const pre = await f.call('pre', {}, { now: new Date(NOW.getTime() + 60 * 60_000) });
+  assert.equal(pre.verdict, 'pause');
+  assert.equal(pre.pendingQuestion, 'このまま進めますか？');
+});
+
 test('an invalid question deadline is ignored', async (t) => {
   const f = fixture(t);
   await f.call('start', { objective: 'test' });

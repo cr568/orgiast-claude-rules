@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseHandoff } from './auto-session.mjs';
-import { applyAutoHeal, collectFindings, emptyOutputReason, isCooldownSkippedRow, isQuotaLimitedRow, lowYieldBackends, parseRateLimitsFromText, readCodexUsedPercent, upsertFixTasks, windowResetsAfterLimit } from './delegation-health-check.mjs';
+import { applyAutoHeal, authRestoredAfter, collectFindings, emptyOutputReason, isCooldownSkippedRow, isQuotaLimitedRow, lowYieldBackends, parseRateLimitsFromText, readCodexUsedPercent, upsertFixTasks, windowResetsAfterLimit } from './delegation-health-check.mjs';
 
 const NOW = new Date('2026-09-09T12:00:00.000Z');
 const homes = [];
@@ -258,6 +258,62 @@ test('codex_auth_failed は high で next-session.md へ起票する', () => {
   const findings = collectFindings({ home: dir, now: NOW, codexUsedPercent: null });
   assert.equal(upsertFixTasks({ home: dir, findings, now: NOW, todayStr: '2026-09-22' }), true);
   assert.match(fs.readFileSync(path.join(dir, '.claude', 'next-session.md'), 'utf8'), /codex_auth_failed/);
+});
+
+test('Windows 側 auth.json が最後の auth 失敗より後に更新されていれば codex_auth_failed を出さない', () => {
+  const dir = home();
+  write(dir, 'executor-usage.jsonl', row({ t: '2026-09-09T10:00:00Z', provider: 'codex', out: 0, status: 1, stderrTail: '401 Unauthorized: Missing bearer or basic authentication in header' }));
+  fs.mkdirSync(path.join(dir, '.codex'));
+  const authFile = path.join(dir, '.codex', 'auth.json');
+  fs.writeFileSync(authFile, '{"tokens":{"id_token":"x"}}');
+  fs.utimesSync(authFile, new Date('2026-09-09T11:00:00Z'), new Date('2026-09-09T11:00:00Z'));
+  assert.equal(collectFindings({ home: dir, now: NOW }).some((item) => item.id === 'codex_auth_failed'), false);
+});
+
+test('失敗より古い / トークン無し / 壊れた JSON / ファイル無し は従来どおり high で出る', () => {
+  const failure = { t: '2026-09-09T10:00:00Z', provider: 'codex', out: 0, status: 1, stderrTail: '401 Unauthorized: Missing bearer or basic authentication in header' };
+  for (const [name, contents, mtime] of [
+    ['古い', '{"tokens":{"id_token":"x"}}', '2026-09-09T09:00:00Z'],
+    ['トークン無し', '{"tokens":{}}', '2026-09-09T11:00:00Z'],
+    ['壊れた JSON', '{', '2026-09-09T11:00:00Z'],
+    ['ファイル無し', null, null],
+  ]) {
+    const dir = home();
+    write(dir, 'executor-usage.jsonl', row(failure));
+    if (contents !== null) {
+      fs.mkdirSync(path.join(dir, '.codex'));
+      const authFile = path.join(dir, '.codex', 'auth.json');
+      fs.writeFileSync(authFile, contents);
+      fs.utimesSync(authFile, new Date(mtime), new Date(mtime));
+    }
+    const finding = collectFindings({ home: dir, now: NOW }).find((item) => item.id === 'codex_auth_failed');
+    assert.equal(finding?.severity, 'high', name);
+  }
+});
+
+test('BOM 付き・access_token のみでも復旧扱い', () => {
+  const dir = home();
+  write(dir, 'executor-usage.jsonl', row({ t: '2026-09-09T10:00:00Z', provider: 'codex', out: 0, status: 1, stderrTail: '401 Unauthorized: Missing bearer or basic authentication in header' }));
+  fs.mkdirSync(path.join(dir, '.codex'));
+  const authFile = path.join(dir, '.codex', 'auth.json');
+  fs.writeFileSync(authFile, '\uFEFF{"tokens":{"access_token":"x"}}');
+  fs.utimesSync(authFile, new Date('2026-09-09T11:00:00Z'), new Date('2026-09-09T11:00:00Z'));
+  assert.equal(collectFindings({ home: dir, now: NOW }).some((item) => item.id === 'codex_auth_failed'), false);
+});
+
+test('authRestoredAfter は有効な t が無ければ false、statImpl 注入で mtime を制御できる', () => {
+  assert.equal(authRestoredAfter('unused', [{ t: 'invalid' }], {
+    statImpl: () => ({ mtimeMs: Infinity }),
+    readFile: () => '{"tokens":{"id_token":"x"}}',
+  }), false);
+  assert.equal(authRestoredAfter('unused', [{ t: '2026-09-09T10:00:00Z' }], {
+    statImpl: () => ({ mtimeMs: Date.parse('2026-09-09T11:00:00Z') }),
+    readFile: () => '{"tokens":{"id_token":"x"}}',
+  }), true);
+  assert.equal(authRestoredAfter('unused', [{ t: '2026-09-09T10:00:00Z' }], {
+    statImpl: () => ({ mtimeMs: Date.parse('2026-09-09T09:00:00Z') }),
+    readFile: () => '{"tokens":{"id_token":"x"}}',
+  }), false);
 });
 
 test('認証失敗と本物の出力ゼロが混在しても codex_empty_output は本物だけを数える', () => {
@@ -831,4 +887,25 @@ test('低成果の chain 行だけでは fallback_low_yield を起票しない',
   ].map(row).join(''));
   const findings = collectFindings({ home: dir, now: NOW });
   assert.equal(findings.filter((f) => f.id === 'fallback_low_yield').length, 0);
+});
+
+test('#773 以降の timeout が上限を超えたら夜間に high で検出する', () => {
+  const dir = home();
+  write(dir, 'executor-usage.jsonl', row({
+    t: '2026-10-18T10:08:59Z', provider: 'fallback', status: 'timeout', secs: 1800,
+    chain: [{ backend: 'gemini-cli', outcome: 'timeout', secs: 1500 }, { backend: 'cheap-code:deepseek', outcome: 'ok', secs: 300 }],
+  }));
+  const findings = collectFindings({ home: dir, now: new Date('2026-10-19T12:00:00Z'), codexUsedPercent: null });
+  const finding = findings.find((f) => f.id === 'timeout_waste_exceeds_cap');
+  assert.equal(finding?.severity, 'high');
+  assert.deepEqual(finding.evidence, ['1件', '最大試行 1500秒', '上限 900秒']);
+});
+
+test('#773 以降の timeout が上限内なら timeout_waste_exceeds_cap を出さない', () => {
+  const dir = home();
+  write(dir, 'executor-usage.jsonl', row({
+    t: '2026-10-19T17:34:53Z', provider: 'codex', status: 'timeout', secs: 600.502, exitCode: 124,
+  }));
+  const findings = collectFindings({ home: dir, now: new Date('2026-10-19T20:00:00Z'), codexUsedPercent: null });
+  assert.equal(findings.find((f) => f.id === 'timeout_waste_exceeds_cap'), undefined);
 });
