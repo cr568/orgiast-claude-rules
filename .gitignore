@@ -56,3 +56,15 @@ scratch/
 tools/.feedback-zero-local.json
 FEEDBACK_KIT_REPORT.md
 .feedback-kit-backup/
+
+# 2026-10-21〜22 実測: origin の rescue 枝に機械ローカルの作業/証跡ディレクトリが
+# そのまま push され続けていた（.landing/ 14 ファイル・.gate-rollout-check/ 18・
+# .expense-leak-evidence/ 156・.scratch-lahaina/ 6・.scratch/ 4・.qwen/ 4）。
+# いずれも main に追跡ファイルが無く、どのツールからも参照されない使い捨て成果物なので
+# リポジトリには入れない。dirty-worktree-guard の status は ignore 済みパスを見ないため、
+# ここに登録すると救済ブランチ自体が作られなくなる。
+/.landing/
+/.gate-rollout-check/
+/.expense-leak-evidence/
+/.scratch*/
+/.qwen/
