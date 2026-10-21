@@ -24,7 +24,7 @@ function fixture(t) {
   const body = path.join(home, 'body.txt'); fs.writeFileSync(body, 'nonempty test body');
   const calls = [], output = [], errors = [], spawns = [];
   const deps = { home, pcMap, spawnImpl: (...args) => { spawns.push(args); return { on() {}, unref() {} }; }, identity: { hostname: pcMap[receiver].hostname }, now: () => now, stdout: s => output.push(s), stderr: s => errors.push(s),
-    fetchBeacons: async () => ({ ok: false, beacons: [] }), dailySelfHeal: () => {}, dailyLaneHealth: () => {}, autoRunFixNow: () => {},
+    fetchBeacons: async () => ({ ok: false, beacons: [] }), dailySelfHeal: () => {}, dailyLaneHealth: () => {}, autoRunFixNow: () => {}, dailyRuleCompliance: () => {},
     request: async (kind, payload) => { calls.push({ kind, payload: structuredClone(payload) }); return kind === 'mail-poll' ? { ok: true, messages: [] } : kind === 'mail-ack' && payload.ids ? { ok: true, results: payload.ids.map(id => ({ id, ok: true, mail: { id } })) } : { ok: true, mail: payload }; } };
   const save = m => fs.writeFileSync(path.join(inbox, `${m.id}.json`), JSON.stringify(m));
   const read = id => JSON.parse(fs.readFileSync(path.join(inbox, `${id}.json`), 'utf8'));
@@ -85,6 +85,35 @@ test('processed migration marks only existing inbox ids done and removes the leg
   await pollOnce(f.deps);
   assert.equal(fs.existsSync(file), false); assert.equal(f.read('mail-original').status, 'done'); assert.equal(f.read('mail-failed').status, 'failed');
   assert.equal(f.read('mail-unprocessed').status, 'delivered'); assert.equal(fs.existsSync(path.join(f.inbox, 'mail-missing.json')), false);
+});
+
+function growiFixture(t, { hub = true, body = JSON.stringify({ growiAppend: [{ path: '/手順', anchor: '目印', lines: '追記' }] }) } = {}) {
+  const f = fixture(t);
+  fs.appendFileSync(path.join(f.dir, 'fleet-sheet.env'), `FLEET_HUB=${hub ? receiver : sender}\n`);
+  fs.writeFileSync(path.join(f.dir, 'growi.env'), '存在確認専用');
+  f.save(mail({ why: '[growi-append] 手順更新', body }));
+  f.deps.growiAppend = async item => ({ ok: true, path: item.pagePath, insertedLines: 1 });
+  return f;
+}
+
+test('Growi 中継はハブかつ growi.env ありなら処理して返信する', async t => {
+  const f = growiFixture(t); await pollOnce(f.deps);
+  const sent = f.calls.find(call => call.kind === 'mail-send');
+  assert.equal(sent.payload.replyTo, 'mail-original'); assert.match(sent.payload.body, /"ok":true/);
+  assert.match(sent.payload.id, /^mail-reply-growi-[0-9a-f]{24}$/); // サーバーの mail-send は id 必須
+  assert.ok(f.read('mail-original').growiAppendDoneAt);
+});
+test('Growi 中継はハブでなければ処理しない', async t => {
+  const f = growiFixture(t, { hub: false }); await pollOnce(f.deps);
+  assert.equal(f.calls.some(call => call.kind === 'mail-send'), false); assert.equal(f.read('mail-original').growiAppendDoneAt, undefined);
+});
+test('Growi 中継は処理済みメールを二重処理しない', async t => {
+  const f = growiFixture(t); await pollOnce(f.deps); await pollOnce(f.deps);
+  assert.equal(f.calls.filter(call => call.kind === 'mail-send').length, 1);
+});
+test('Growi 中継は不正 JSON でも失敗理由を返信する', async t => {
+  const f = growiFixture(t, { body: '{不正' }); await pollOnce(f.deps);
+  const sent = f.calls.find(call => call.kind === 'mail-send'); assert.match(sent.payload.body, /"ok":false/); assert.ok(f.read('mail-original').growiAppendDoneAt);
 });
 test('interactive done/failed/expired prompts and already-started prompts are never re-executed', async t => {
   const f = fixture(t);
@@ -1156,7 +1185,7 @@ test('802 failed mail accepts interactive reply as idempotent note and closes lo
   assert.equal(f.read(mail().id).status, 'done');
 });
 
-import { refreshSentStatus, stripClaudeWarnings } from './fleet-mail.mjs';
+import { SENT_STATUS_MAX_LOOKUP_FAILURES, refreshSentStatus, stripClaudeWarnings } from './fleet-mail.mjs';
 test('802 sender poll caches failure reason for the offline hook', async t => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.dir, 'fleet-mail-sent.jsonl'), JSON.stringify({ action: 'sent', id: 'mail-outbound' }) + '\n');
@@ -1166,6 +1195,32 @@ test('802 sender poll caches failure reason for the offline hook', async t => {
   } });
   const cached = JSON.parse(fs.readFileSync(path.join(f.dir, 'fleet-mail-sent-status.json')));
   assert.equal(cached['mail-outbound'].failReason, 'timeout');
+});
+test('821 sent status stops auto-polling an id the server never returns', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.dir, 'fleet-mail-sent.jsonl'), JSON.stringify({ action: 'send-attempt', id: 'mail-never-sent' }) + '\n');
+  let calls = 0; const messages = [];
+  const request = async () => { calls++; throw new Error('timeout'); };
+  for (let i = 0; i < SENT_STATUS_MAX_LOOKUP_FAILURES; i++) await refreshSentStatus({ home: f.home, request, stderr: m => messages.push(m) });
+  assert.equal(calls, SENT_STATUS_MAX_LOOKUP_FAILURES);
+  assert.equal(messages.filter(m => /再試行待ち/.test(m)).length, SENT_STATUS_MAX_LOOKUP_FAILURES - 1);
+  assert.equal(messages.filter(m => /自動取得を打ち切り/.test(m)).length, 1);
+  await refreshSentStatus({ home: f.home, request, stderr: m => messages.push(m) });
+  assert.equal(calls, SENT_STATUS_MAX_LOOKUP_FAILURES, '打ち切り後は mail-get を呼ばない');
+});
+test('821 sent status counts an empty mail response as a lookup failure and resets after success', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.dir, 'fleet-mail-sent.jsonl'), JSON.stringify({ action: 'send-attempt', id: 'mail-late' }) + '\n');
+  let mail = null;
+  const request = async (kind, payload) => ({ ok: true, mail });
+  await refreshSentStatus({ home: f.home, request, stderr: () => {} });
+  let cached = JSON.parse(fs.readFileSync(path.join(f.dir, 'fleet-mail-sent-status.json')));
+  assert.equal(cached['mail-late'].lookupFailures, 1);
+  mail = { id: 'mail-late', status: 'delivered' };
+  await refreshSentStatus({ home: f.home, request, stderr: () => {} });
+  cached = JSON.parse(fs.readFileSync(path.join(f.dir, 'fleet-mail-sent-status.json')));
+  assert.equal(cached['mail-late'].status, 'delivered');
+  assert.equal(cached['mail-late'].lookupFailures, undefined);
 });
 test('802 warning stripping keeps real answers and removes known configuration lines', () => {
   assert.equal(stripClaudeWarnings('Permission allow rule (settings.json): warning\r\nWarning: Invalid configuration entry\nanswer\nUnknown permission rule'), 'answer');

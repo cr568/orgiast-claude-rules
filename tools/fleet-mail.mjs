@@ -14,7 +14,9 @@ import { backgroundSpawnOptions } from './lib/background-spawn.mjs';
 import { relayQuestions, readQuestion, clearResume, reconcileResumes, collectQuestions, validSessionId, RESUME_LIMIT_MS } from './fleet-question-relay.mjs';
 import { resolveFleetLabel } from './lib/fleet-label.mjs';
 import { LANE_HEALTH_KIM_PC, parseLaneDoctorOutput, deadLanes, repairAdvice, laneHealthSignature, buildLaneHealthMail } from './lib/lane-health.mjs';
-export { resolveFleetLabel };
+import { dailyRuleCompliance } from './fleet-rule-compliance-daily.mjs';
+import { appendAfterFromEnv } from './growi-manual.mjs';
+export { resolveFleetLabel, dailyRuleCompliance };
 
 const ownRepo = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -308,6 +310,7 @@ export const COMMAND_LOCK_RETRIES = 5;
 export const COMMAND_LOCK_DELAY_MS = 200;
 export const LOCK_BUSY_EXIT = 6;
 export const ACK_BATCH_LIMIT = 100;
+export const SENT_STATUS_MAX_LOOKUP_FAILURES = 5;
 export const CAPABILITY_BACKOFF_MS = 3600000;
 export const SERVER_MAX_ATTEMPTS = 5;
 export const INTERRUPTED_PROMPT_MS = 35 * 60000;
@@ -552,11 +555,25 @@ export async function refreshSentStatus({ home, request, stderr = console.error 
   const cache = readJson(file, {});
   const ids = [...new Set(lines.flatMap(line => { try { const r = JSON.parse(line); return ['sent', 'send-attempt'].includes(r.action) && r.id ? [r.id] : []; } catch { return []; } }))];
   const deadline = Date.now() + 10000;
-  for (const id of ids.reverse().filter(id => !['done', 'expired'].includes(cache[id]?.status)).sort((a, b) => (cache[a]?.checkedAt || 0) - (cache[b]?.checkedAt || 0)).slice(0, 5)) {
+  // 送信前に失敗した send-attempt のように、サーバーに一度も現れない id は
+  // 毎回 mail-get が失敗して「再試行待ち」が永久に出続ける。連続失敗が上限に達したら
+  // 自動取得を打ち切る（--sent-status <id> の明示照会は今までどおり動く）。
+  const abandoned = id => (cache[id]?.lookupFailures || 0) >= SENT_STATUS_MAX_LOOKUP_FAILURES;
+  for (const id of ids.reverse().filter(id => !['done', 'expired'].includes(cache[id]?.status) && !abandoned(id)).sort((a, b) => (cache[a]?.checkedAt || 0) - (cache[b]?.checkedAt || 0)).slice(0, 5)) {
     if (Date.now() >= deadline) break;
-    cache[id] = { ...cache[id], checkedAt: Date.now() };
-    try { const response = checked(await request('mail-get', { id }, Math.min(3000, deadline - Date.now()))); if (response.mail) cache[id] = { ...response.mail, checkedAt: Date.now() }; }
-    catch { stderr('fleet-mail: 送信状態取得再試行待ち=1'); }
+    const previous = cache[id] || {};
+    cache[id] = { ...previous, checkedAt: Date.now() };
+    const failed = () => {
+      const lookupFailures = (previous.lookupFailures || 0) + 1;
+      cache[id] = { ...cache[id], lookupFailures };
+      if (lookupFailures >= SENT_STATUS_MAX_LOOKUP_FAILURES) stderr(`fleet-mail: 送信状態を取得できないため自動取得を打ち切り=1 (${id})`);
+      else stderr('fleet-mail: 送信状態取得再試行待ち=1');
+    };
+    try {
+      const response = checked(await request('mail-get', { id }, Math.min(3000, deadline - Date.now())));
+      if (response.mail) cache[id] = { ...response.mail, checkedAt: Date.now() };
+      else failed();
+    } catch { failed(); }
   }
   writeJson(file, cache);
 }
@@ -903,6 +920,8 @@ export async function pollOnce(deps = {}) {
     const lastPollFile = path.join(dir, '.fleet-mail-last-poll.json');
     writeJson(lastPollFile, { ...readJson(lastPollFile, {}), at: new Date(now()).toISOString() });
     let promptHandled = false;
+    let growiAppendHandled = false;
+    const fleetMembers = deps.pcMap ?? readJson(new URL('../fleet-pc-map.json', import.meta.url), {});
     for (const pending of readInbox(home, { unreadOnly: false })) {
       let mail = pending;
       try {
@@ -933,6 +952,32 @@ export async function pollOnce(deps = {}) {
               log('sent', { action: 'decision-ack', id: mail.id, decisionId: latest.decisionId });
             } catch (error) { log('decision-ack-failed', { id: mail.id, error: redactSecrets(error.message) }); }
           }
+          continue;
+        }
+        const growiRequest = Object.hasOwn(fleetMembers, mail.from) && label === config.FLEET_HUB && fs.existsSync(path.join(dir, 'growi.env'))
+          && mail.kind === 'note' && /^\[growi-append\]/.test(String(mail.why ?? '')) && !mail.growiAppendDoneAt;
+        if (growiRequest && !growiAppendHandled) {
+          growiAppendHandled = true;
+          const results = [];
+          try {
+            const parsed = JSON.parse(mail.body);
+            if (!Array.isArray(parsed?.growiAppend) || parsed.growiAppend.length < 1 || parsed.growiAppend.length > 5) throw new Error('growiAppend は1〜5件の配列にしてください');
+            for (const item of parsed.growiAppend) {
+              if (!item || typeof item.path !== 'string' || !item.path.startsWith('/') || typeof item.anchor !== 'string' || !item.anchor || typeof item.lines !== 'string') throw new Error('各 growiAppend には path・anchor・lines が必要です');
+              try {
+                results.push(await (deps.growiAppend ?? appendAfterFromEnv)({ pagePath: item.path, anchor: item.anchor, lines: item.lines,
+                  envFile: path.join(dir, 'growi.env'), timeoutMs: 120000 }));
+              } catch (error) { results.push({ ok: false, path: item.path, error: redactSecrets(error.message) }); }
+            }
+          } catch (error) { results.push({ ok: false, error: redactSecrets(error.message) }); }
+          try {
+            checked(await request('mail-send', { id: `mail-reply-growi-${createHash('sha256').update(`${mail.id}\n${label}`).digest('hex').slice(0, 24)}`,
+              from: label, to: mail.from, replyTo: mail.id, messageKind: 'note', auto: true,
+              hop: nextHop(mail), priority: 'normal', why: '[回答・返信不要] growi-append 結果', body: JSON.stringify(results),
+              expiresAt: new Date(now() + 72 * 3600000).toISOString() }));
+            updateInbox(mail.id, current => current && ({ ...current, growiAppendDoneAt: new Date(now()).toISOString() }), { home });
+            handled.push(mail.id);
+          } catch { err('fleet-mail: growi-append 返信再送待ち=1'); }
           continue;
         }
         if (mail.kind !== 'prompt') { if (fresh.has(mail.id)) handled.push(mail.id); continue; }
@@ -1011,6 +1056,10 @@ export async function pollOnce(deps = {}) {
     try { (deps.dailySelfHeal ?? dailySelfHeal)({ dir, now }); } catch (error) { err(`fleet-mail: 自己修復失敗: ${redactSecrets(error.message)}`); }
     try { (deps.autoRunFixNow ?? autoRunFixNow)({ dir }); } catch (error) { err(`fleet-mail: 自動修復失敗: ${redactSecrets(error.message)}`); }
     try { await (deps.dailyLaneHealth ?? dailyLaneHealth)({ dir, label, request, now }); } catch (error) { err(`fleet-mail: レーン健全性報告失敗: ${redactSecrets(error.message)}`); }
+    try {
+      await (deps.dailyRuleCompliance ?? dailyRuleCompliance)({ dir, home, label, request, now,
+        repo: deps.repo ?? ownRepo, background: true, stderr: err });
+    } catch { err('fleet-mail: ルール遵守報告失敗（pollは継続）'); }
     // Transport latency must never prevent durable receipt or per-mail processing.
     await notifyPendingArrivals({ ...deps, home, label, now, stderr: err });
     out(deps.json ? JSON.stringify({ received, processed: handled }) : `受信=${received.length} / 処理=${handled.length} / 隔離=${rejected}`);

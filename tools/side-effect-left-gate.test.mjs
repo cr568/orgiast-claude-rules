@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { judgeSideEffectLeft } from './side-effect-left-gate.mjs';
 
 const blocked = [
+  '上書きして消してしまいました。', '上書きしてしまいました。', '上書きしちゃって元に戻せません。', '復元できません。',
   '営業アプリは GitHub 通知を取り込まなくなる。',
   '通知が取り込まれなくなります。', '画面が見えなくなります。', 'ログインできなくなる。',
   '既存PCに影響があります。', '既存PCに影響は出ます。', '既存PCに影響します。',
@@ -28,6 +29,7 @@ for (const text of blocked) test(`block: ${JSON.stringify(text)}`, () => {
 });
 
 const passed = [
+  '上書きして消してしまいました。\n修正済み、フォーム回答と読み戻しが一致。',
   '', undefined, '実装と検証が完了しました。', '影響範囲を調べます。', 'リスクを調べます。',
   '副作用について説明します。',
   '漏れを直しました。', '漏れは修正済みです。', 'リスクは対処済みです。',

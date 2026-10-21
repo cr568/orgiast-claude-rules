@@ -32,36 +32,37 @@ test('複数gateの理由を1つのblockへ合流する', () => {
   assert.ok(record.blockedBy.includes('handoff-info-guard'));
 });
 
-test('同一本文の3回目以降はretry-capでpassし回数を保存する', t => {
+test('同一ターンは既存上限の3回目からpass_after_capを台帳に残す', t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-runner-cap-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   assert.equal(JSON.parse(invoke(home, 'cap', request).stdout).decision, 'block');
   assert.equal(JSON.parse(invoke(home, 'cap', request).stdout).decision, 'block');
-  assert.equal(invoke(home, 'cap', request).stdout, '');
-  assert.equal(invoke(home, 'cap', request).stdout, '');
+  assert.match(JSON.parse(invoke(home, 'cap', request).stdout).systemMessage, /次の応答で必ず訂正.*残存コード/);
   const records = fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8').trim().split(/\r?\n/).map(JSON.parse);
-  assert.deepEqual(records.map(({ verdict }) => verdict), ['block', 'block', 'retry-cap', 'retry-cap']);
-  assert.deepEqual(records.map(({ sameTextRetries }) => sameTextRetries), [1, 2, 3, 4]);
+  assert.deepEqual(records.map(({ verdict }) => verdict), ['block', 'block', 'pass_after_cap']);
+  assert.deepEqual(records.map(({ sameTextRetries }) => sameTextRetries), [1, 2, 3]);
   const state = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-state.json'), 'utf8'));
-  assert.equal(state.cap.blocks, 4);
+  assert.equal(state.cap.blocks, 3);
   assert.equal(state.cap.lastHash, crypto.createHash('sha256').update(request).digest('hex').slice(0, 16));
 });
 
 for (const [name, texts, counts] of [
-  ['本文A・B・Cはすべてblock', [request, `${request} B`, `${request} C`], [1, 1, 1]],
-  ['本文変更で2回ずつblockできる', [request, request, `${request} B`, `${request} B`], [1, 2, 1, 2]],
+  ['本文A・Bは同一ターンのblockとして累積', [request, `${request} B`], [1, 2]],
+  ['本文変更を含め3回目は上限通過', [request, request, `${request} B`], [1, 2, 3]],
 ]) {
   test(name, t => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-runner-reset-'));
     t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-    for (const text of texts) {
+    for (const [index, text] of texts.entries()) {
       const result = invoke(home, 'reset', text);
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(JSON.parse(result.stdout).decision, 'block');
+      const output = JSON.parse(result.stdout);
+      if (counts.at(-1) === 3 && index === texts.length - 1) assert.match(output.systemMessage, /次の応答で必ず訂正/);
+      else assert.equal(output.decision, 'block');
     }
     const records = fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     assert.deepEqual(records.map(record => record.sameTextRetries), counts);
-    assert.ok(records.every(record => record.retryCap === false));
+    assert.equal(records.filter(record => record.retryCap).length, counts.at(-1) === 3 ? 1 : 0);
   });
 }
 
@@ -106,12 +107,12 @@ test('書き込み時に7日超・不正日時を削除し、旧形式の累計�
   assert.ok(Date.parse(state.legacy.lastTs) >= now);
 });
 
-test('stop_hook_activeは評価せずskippedでpassする', () => {
+test('stop_hook_activeでも書き直しを再評価する', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-runner-active-'));
-  assert.equal(invoke(home, 'active', request, { stop_hook_active: true }).stdout, '');
+  assert.equal(JSON.parse(invoke(home, 'active', request, { stop_hook_active: true }).stdout).decision, 'block');
   const record = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8'));
-  assert.equal(record.verdict, 'skipped');
-  assert.deepEqual(record.reasonCodes, ['stop_hook_active']);
+  assert.equal(record.verdict, 'block');
+  assert.ok(record.reasonCodes.length > 0);
 });
 
 test('次の行があればピギーバック・ヒントを重ねない', () => {
@@ -383,12 +384,47 @@ test('完了報告の引用に反応した形式gateは台帳だけに降格す�
   assert.equal(record.handoffKind, 'none'); assert.ok(record.demoted.includes('manual-request-fullsteps-gate')); assert.ok(record.demoted.includes('user-burden-gate'));
   assert.ok(!record.blockedBy.includes('manual-request-fullsteps-gate')); assert.doesNotMatch(result.stdout, /FULL-STEPS/);
 });
+
+test('Sheets書き込み後に第三者へ再送を頼むとhandoff-action-gateでblockする', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-runner-restore-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const transcript = path.join(home, 'transcript.jsonl');
+  fs.writeFileSync(transcript, [
+    { type: 'user', message: { role: 'user', content: 'フォーム回答を確認してください' } },
+    { type: 'assistant', message: { role: 'assistant', content: [
+      { type: 'tool_use', name: 'mcp__booth___debug_writeAndRead', input: { ssId: 'sheet', a1Cell: 'A1', formula: '="test"' } },
+    ] } },
+  ].map(entry => JSON.stringify(entry)).join('\n'));
+  const text = '上書きして消してしまいました。私の側からは元に戻せません。\n> お心当たりがあれば、もう一度フォームから送っていただけますか。';
+  const result = invoke(home, 'restore-gate-test', text, { transcript_path: transcript });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).decision, 'block');
+  const record = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8').trim().split('\n').at(-1));
+  assert.ok(record.blockedBy.includes('handoff-action-gate'));
+});
 test('返信1回の依頼ではFULL-STEPSとUSER-BURDENを出さない', t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-reply-')); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const result = invoke(home, 'reply', '一言返信してください。\n次に kim がすること: 返信してください');
   const record = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8'));
   assert.equal(record.handoffKind, 'reply-only'); assert.ok(record.demoted.includes('manual-request-fullsteps-gate')); assert.ok(record.demoted.includes('user-burden-gate'));
   assert.doesNotMatch(result.stdout, /FULL-STEPS|USER-BURDEN/);
+});
+
+test('恒久策必須は返信のみでも形式gateと一緒に降格しない', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-permanent-fix-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const text = '一言返信してください。\n次に kim がすること: 返信してください\nこの後の自動進行: なし（完了）\nこのセッション: /session-close は不要なので、このセッションを閉じてよい';
+  const result = invoke(home, 'permanent-fix', text);
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.decision, 'block');
+  assert.match(output.reason, /### next-action-gate[\s\S]*恒久策:/);
+  const record = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8'));
+  assert.equal(record.handoffKind, 'reply-only');
+  assert.ok(record.demoted.includes('user-burden-gate'));
+  assert.ok(!record.demoted.includes('next-action-gate'));
+  assert.ok(record.blockedBy.includes('next-action-gate'));
+  assert.ok(record.reasonCodes.includes('PERMANENT-FIX-REQUIRED'));
 });
 test('MacroDroidの検索不足を先に示し形式は1セクションにまとめる', t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-past-log-')); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -412,6 +448,23 @@ test('副作用の告知だけならStopで差し戻し、直後に対処を書�
   assert.equal(output.decision, 'block');
   assert.match(output.reason, /side-effect-left-gate[\s\S]*\[SIDE-EFFECT\]/);
   const repaired = invoke(home, 'side-effect', `${text}\n取り込み条件を修正済み、回帰テスト成功。`);
+  assert.equal(repaired.status, 0, repaired.stderr);
+  assert.equal(repaired.stdout, '');
+});
+
+test('完了待ちと将来作業をStopで差し戻し、完了報告なら通す', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-runner-deferral-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const result = invoke(home, 'deferral', '営業アプリは GitHub 通知を取り込まなくなる。\nCodex の実装完了を待っています（終わると通知が来ます）。');
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.decision, 'block');
+  assert.match(output.reason, /### deferral-wait-gate/);
+  const record = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'stop-gate-runner-ledger.jsonl'), 'utf8'));
+  assert.ok(record.reasonCodes.includes('DEFERRAL-WAIT'));
+  assert.ok(record.blockedBy.includes('side-effect-left-gate'));
+  assert.equal(record.blockedBy.indexOf('deferral-wait-gate'), record.blockedBy.indexOf('side-effect-left-gate') + 1);
+  const repaired = invoke(home, 'deferral', '作業はすべて完了しました。テストは全件 PASS、本番反映済みです。');
   assert.equal(repaired.status, 0, repaired.stderr);
   assert.equal(repaired.stdout, '');
 });

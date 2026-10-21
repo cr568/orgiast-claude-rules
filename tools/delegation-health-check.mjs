@@ -7,6 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { normalizeExecutorStatus } from './executor-status.mjs';
 import { isEntry } from './is-entry.mjs';
+import { judgeTimeoutRows } from './timeout-waste-judge.mjs';
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
@@ -32,6 +33,25 @@ function readJson(file, fallback = {}) {
 
 function readJsonl(file) {
   try { return fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } }); } catch { return []; }
+}
+
+export function authRestoredAfter(home, failures, options = {}) {
+  const failureTimes = (Array.isArray(failures) ? failures : [])
+    .map((row) => Date.parse(row?.t))
+    .filter((time) => Number.isFinite(time));
+  if (!failureTimes.length) return false;
+  const lastFailureTime = Math.max(...failureTimes);
+  const statImpl = options.statImpl || fs.statSync;
+  const readFile = options.readFile || fs.readFileSync;
+  try {
+    const authFile = path.join(home, '.codex', 'auth.json');
+    if (!(statImpl(authFile).mtimeMs > lastFailureTime)) return false;
+    const auth = JSON.parse(String(readFile(authFile, 'utf8')).replace(/^\uFEFF/, ''));
+    return [auth?.tokens?.id_token, auth?.tokens?.access_token]
+      .some((token) => typeof token === 'string' && token.length > 0);
+  } catch {
+    return false;
+  }
 }
 
 function measured(value) {
@@ -130,6 +150,17 @@ export function isCooldownSkippedRow(row = {}) {
   return String(row?.status ?? '').toLowerCase() === 'cooldown';
 }
 
+// fallback バックエンド自体は走って応答を返した(chain の outcome が ok)のに、作業ツリーを
+// 1行も変えなかった行。codex-do が reason:'empty_diff' を付ける。
+// これはレーン(バックエンド)の全滅ではなく、昇格元(codex sol→astra)が空diffだった作業を
+// 代替が実装しなかった＝成果の失敗。全滅の分母に入れると、代替が正常に動いているのに
+// 毎晩 high の「未修理」が積まれる(2026-10-19 実測: fallback の3件が全てこれ)。
+export function isEmptyDiffEscalationRow(row = {}) {
+  if (row?.provider !== 'fallback' || String(row?.reason || '') !== 'empty_diff') return false;
+  const chain = Array.isArray(row?.chain) ? row.chain : [];
+  return chain.some((item) => item?.outcome === 'ok');
+}
+
 // フォールバック先の子プロセスが OS エラーで起動できなかった行(例: spawn ENAMETOOLONG / ENOENT)。
 // 1件で発火させる: 低成果(2件閾値)では単発の故障が翌朝 healthy と判定されてしまった (2026-09-21)。
 const SPAWN_FAILED = /syscall: 'spawn'|\bspawn E[A-Z]+\b|code: 'E[A-Z]{4,}'/;
@@ -203,6 +234,28 @@ export function collectFindings({ home, now = new Date(), codexUsedPercent = nul
   // 上限後に別の窓へ進んでいたら、その低い使用率は反証にならない（windowResetsAfterLimit の説明を参照）。
   const supersededWindow = windowResetsAfterLimit(limitRows, metric);
   const findings = [];
+  // #773(600→900秒＋連鎖予算)以降の timeout が上限を超えて秒数を捨てたかは、
+  // Claude セッションを待たず夜間で判定する。判定器は台帳全体（配備前を含む）を見る必要が
+  // あるため、24時間窓の usageRows ではなく executor-usage.jsonl を全件読む。
+  // (2026-10-20: 判定器が CLI 専用で、台帳が伸びても人手で実行するまで判定が止まっていた)
+  // 予算は試行ごとに判定する: フォールバック試行は与えた budgetSecs（無い旧行は 900 秒）、
+  // 主経路は与えた --timeout の timeoutSecs（無い旧行は 1800 秒）。900 秒固定で主経路を見ると
+  // 既定 1800 秒を使い切っただけの行を回帰と誤検出する（2026-10-20 実測 / 2026-10-22 修正）。
+  const timeoutWaste = judgeTimeoutRows(readJsonl(path.join(claudeDir, 'executor-usage.jsonl')));
+  if (timeoutWaste.verdict === 'waste-exceeds-cap') {
+    const overCap = (timeoutWaste.overCapAttempts || []).map((a) => {
+      const label = a.path === 'primary' ? '主経路' : 'フォールバック';
+      const name = a.model ? `${a.backend ?? '不明'}(${a.model})` : (a.backend ?? '不明');
+      return `超過: ${name} ${label} ${Math.round(a.secs)}秒/予算${Math.round(a.budgetSecs)}秒`;
+    });
+    findings.push({
+      id: 'timeout_waste_exceeds_cap',
+      severity: 'high',
+      title: 'タイムアウトで捨てた秒数が上限超過（#773 の回帰）',
+      evidence: [`${timeoutWaste.overCapRows}件`, `最大試行 ${timeoutWaste.maxAttemptSecs}秒`, `上限 ${timeoutWaste.capSecs}秒`, ...overCap],
+      fixTask: 'killProcessTree と fallbackBackendTimeoutSecs(#773)が効いていない。timeout 行の chain[].secs を実測し、上限を超えた試行のバックエンドと起動経路を特定して修正・テスト追加',
+    });
+  }
   if (limitRows.length && metric && !supersededWindow && metric.usedPercent < 90) findings.push({
     id: 'codex_false_usage_limit', severity: 'high', title: 'Codex 上限検出の偽陽性',
     evidence: [`usage_limit記録 ${limitRows.length}件`, `実測 used_percent ${metric.usedPercent}`, `window ${metric.windowMinutes ?? '不明'}分`, `resets_at ${metric.resetsAt ?? '不明'}`],
@@ -275,7 +328,9 @@ export function collectFindings({ home, now = new Date(), codexUsedPercent = nul
   if (spawnFailedRows.length && !repairedAfter(spawnFailedRows)) findings.push({ id: 'codex_spawn_failed', severity: 'high', title: 'Codex の子プロセスが spawn に失敗（起動できていない）', evidence: [`${spawnFailedRows.length}件`, ...reasonTop(spawnFailedRows)], fixTask: 'where codex／WSL 内 command -v codex で実体を確認し、無ければ npm i -g @openai/codex で入れ直す' });
   // 直せる欠陥なので fixTask を付ける（medium）。
   if (modelAuthMismatch.length) findings.push({ id: 'codex_model_auth_mismatch', severity: 'medium', title: 'Codex が ChatGPT アカウントで sol/astra を選んで失敗', evidence: [`${modelAuthMismatch.length}件`, ...reasonTop(modelAuthMismatch)], fixTask: 'codex-do のレーン選択が ChatGPT アカウント認証を検出できず sol/astra を選んでいる。detectChatGptAuth と decideCodexLane の判定を照合し、再現テストを追加して修正' });
-  if (authFailed.length && !repairedAfter(authFailed)) findings.push({ id: 'codex_auth_failed', severity: 'high', title: 'Codex CLI が未認証（WSL 側の再ログインが必要）', evidence: [`${authFailed.length}件`, 'WSL の ~/.codex/auth.json を確認し codex login を実行'], fixTask: 'Windows の %USERPROFILE%\\.codex\\auth.json を WSL の ~/.codex/ にコピーし codex login status。Windows 側も未ログインのときだけ人の codex login が要る' });
+  // 2026-10-19 実測: Windows はログイン済みなのに、WSL 側 401 の履歴だけで毎晩 high 起票されていた。
+  // codex-do は起動時に Windows の auth.json を WSL へ同期するため、失敗後の再ログインも修復として扱う。
+  if (authFailed.length && !repairedAfter(authFailed) && !authRestoredAfter(home, authFailed)) findings.push({ id: 'codex_auth_failed', severity: 'high', title: 'Codex CLI が未認証（WSL 側の再ログインが必要）', evidence: [`${authFailed.length}件`, 'WSL の ~/.codex/auth.json を確認し codex login を実行'], fixTask: 'Windows の %USERPROFILE%\\.codex\\auth.json を WSL の ~/.codex/ にコピーし codex login status。Windows 側も未ログインのときだけ人の codex login が要る' });
   if (realEmpty.length) findings.push({ id: 'codex_empty_output', severity: 'medium', title: 'Codex の出力ゼロ', evidence: [`${realEmpty.length}件`, ...reasonTop(realEmpty), ...(empty.length > realEmpty.length ? [`インフラ/起動失敗で除外 ${empty.length - realEmpty.length}件`] : [])], fixTask: 'codex が出力ゼロで終了した原因（認証切れ/上限/起動失敗）を codex-do のログから特定' });
   for (const [provider, state] of Object.entries(cooldown)) if (state?.reason === 'http_402' && Number(state.until) > nowMs) findings.push({ id: 'provider_balance_exhausted', severity: 'low', title: `${provider} の残高切れ`, evidence: [`provider ${provider}`, CLAUDE_FALLBACK_RULE] });
   const providers = new Map();
@@ -291,12 +346,20 @@ export function collectFindings({ home, now = new Date(), codexUsedPercent = nul
     // 全滅の分母は「実際に投げた回(attempts)」。cooldown 行は上限中で投げなかった記録なので
     // 分母から外す。外さないと上限到達の実体が「N件すべて失敗」の high 未修理全滅に見える
     // (2026-10-13 診断: glm の11件 = cooldown 5件 + http_429 6件)。
-    const attempts = rows.filter((row) => !isCooldownSkippedRow(row));
+    const emptyDiffRows = rows.filter(isEmptyDiffEscalationRow);
+    const attempts = rows.filter((row) => !isCooldownSkippedRow(row) && !isEmptyDiffEscalationRow(row));
     // 24h 窓が cooldown だけで埋まる＝上限中で一度も試行していない。レーンは止まっているが
     // 原因は上限側で、コードの欠陥ではない。low の可視化だけ残す(high にすると上限が明けるまで
     // 毎晩同じ偽の修理タスクが積まれる。黙って消すと止まっている事実自体が見えなくなる)。
     if (!attempts.length) {
-      if (rows.length >= 3) {
+      // 窓が「代替は応答したが1行も変えなかった」行だけで埋まった場合も、レーン障害ではない。
+      // 止まっている事実は low で可視化し、修理タスク(high)にはしない。
+      if (emptyDiffRows.length === rows.length && rows.length >= 3) {
+        const times = rows.map(row => row.t).sort((a, b) => Date.parse(a) - Date.parse(b));
+        findings.push({ id: 'fallback_empty_diff_escalation', provider, severity: 'low', title: `${provider} の昇格先は応答したが作業ツリーを変更できていない（レーン障害ではない）`,
+          evidence: [`${rows.length}件すべて空diff`, `最初 ${times[0]}`, `最後 ${times.at(-1)}`,
+            'chain の outcome は ok（バックエンドは起動・応答している）'] });
+      } else if (rows.length >= 3) {
         const state = cooldown[provider], until = Number(state?.until);
         const skipped = rows.map(row => row.t).sort((a, b) => Date.parse(a) - Date.parse(b));
         findings.push({ id: 'provider_cooldown_skipped', provider, severity: 'low', title: `${provider} は cooldown 中で試行されていない（欠陥ではない）`,
@@ -380,9 +443,26 @@ export function upsertFixTasks({ home, findings, now = new Date(), todayStr }) {
   return true;
 }
 
+// 判定結果は「上限超過のときだけ」finding になるため、上限内だった事実は report に残らない。
+// 台帳の配備後 timeout を毎晩そのまま記録し、再発した夜に「捨てた秒数が600秒級に収まったか」を
+// 判定器を叩き直さずに読めるようにする
+// (2026-10-21: #765/#773 の効果判定が再発待ちのまま、判定した証跡がどこにも残らなかった)。
+export function timeoutWasteSummary(rows = []) {
+  const report = judgeTimeoutRows(rows);
+  const lastPostDeploy = report.events.filter((event) => event.postDeploy).map((event) => event.t).sort().at(-1) || null;
+  return {
+    verdict: report.verdict,
+    postDeployTimeoutRows: report.postDeployTimeoutRows,
+    overCapRows: report.overCapRows,
+    maxAttemptSecs: report.maxAttemptSecs,
+    lastPostDeployTimeoutAt: lastPostDeploy,
+  };
+}
+
 export function renderSummary(report) {
   const lines = ['## 🩺 委譲ヘルス（直近24h）'];
   for (const item of report.findings) lines.push(`- ${item.severity} / ${item.title} / 自動修復:${item.autoHealed ? 'あり' : 'なし'} / 起票先:${item.fixTask && ['high', 'medium'].includes(item.severity) ? '~/.claude/next-session.md' : 'なし'}`);
+  if (report.timeoutWaste) lines.push(`- timeout判定: ${report.timeoutWaste.verdict} / 配備後 ${report.timeoutWaste.postDeployTimeoutRows}件 / 上限超過 ${report.timeoutWaste.overCapRows}件 / 最大試行 ${report.timeoutWaste.maxAttemptSecs}秒${report.timeoutWaste.lastPostDeployTimeoutAt ? ` / 最終 ${report.timeoutWaste.lastPostDeployTimeoutAt}` : ''}`);
   if (lines.length < 5) lines.push(`- Codex実測: ${report.codexExhausted ? '上限到達（primary なし）' : report.codexUsedPercent === null ? '計測不能' : `${report.codexUsedPercent}%`}`, `- 生成日時: ${report.generatedAt}`, '- high があっても夜間処理は継続');
   return `${lines.slice(0, 15).join('\n')}\n`;
 }
@@ -393,7 +473,7 @@ export function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv), metric = readCodexUsedPercent({});
   const findings = collectFindings({ home: args.home, now: args.now, codexUsedPercent: metric });
   if (!args.dryRun) { fs.mkdirSync(path.join(args.home, '.claude'), { recursive: true }); applyAutoHeal({ home: args.home, findings, now: args.now }); upsertFixTasks({ home: args.home, findings, now: args.now }); }
-  const report = { generatedAt: args.now.toISOString(), codexUsedPercent: measured(metric)?.usedPercent ?? null, codexExhausted: metric?.exhausted === true, findings };
+  const report = { generatedAt: args.now.toISOString(), timeoutWaste: timeoutWasteSummary(readJsonl(path.join(args.home, '.claude', 'executor-usage.jsonl'))), codexUsedPercent: measured(metric)?.usedPercent ?? null, codexExhausted: metric?.exhausted === true, findings };
   const summary = renderSummary(report);
   if (!args.dryRun) { fs.writeFileSync(path.join(args.home, '.claude', 'delegation-health.json'), `${JSON.stringify(report, null, 2)}\n`); fs.writeFileSync(path.join(args.home, '.claude', 'delegation-health.md'), summary); }
   process.stdout.write(summary);

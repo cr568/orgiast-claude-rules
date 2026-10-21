@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { extractFileId, defaultRole, shareFile, recordShares, shareAndRecord } from './drive-share.mjs';
+import { extractFileId, defaultRole, shareRecipients, shareFile, recordShares, shareAndRecord } from './drive-share.mjs';
 
 for (const value of [
   'abc_123-XYZ',
@@ -25,6 +25,15 @@ test('default roles use exact case-insensitive domain', () => {
   assert.equal(defaultRole('a@external.jp'), 'commenter');
   assert.equal(defaultRole('a@notorgiast.jp'), 'commenter');
 });
+test('employee recipients add the all-employee group with the same role and no duplicates', () => {
+  assert.deepEqual(shareRecipients('person@orgiast.jp', 'reader'), [
+    { email: 'person@orgiast.jp', role: 'reader', type: 'user' },
+    { email: 'syain@orgiast.jp', role: 'reader', type: 'group' },
+  ]);
+  assert.deepEqual(shareRecipients('syain@orgiast.jp,SYAIN@ORGIAST.JP'), [
+    { email: 'syain@orgiast.jp', role: 'writer', type: 'group' },
+  ]);
+});
 test('shareFile paginates, skips higher permissions, adds and reports individual errors', async t => {
   const calls = [];
   t.mock.method(globalThis, 'fetch', async (url, options) => {
@@ -36,12 +45,13 @@ test('shareFile paginates, skips higher permissions, adds and reports individual
       : { permissions: [], nextPageToken: 'second' });
     assert.equal(u.searchParams.get('sendNotificationEmail'), 'false');
     const body = JSON.parse(options.body);
+    if (body.emailAddress === 'syain@orgiast.jp') assert.equal(body.type, 'group');
     return body.emailAddress === 'bad@external.jp' ? new Response('denied', { status: 403 }) : Response.json({ id: 'new' });
   });
   const result = await shareFile({ fileId: 'file123', emails: ['exists@orgiast.jp', 'new@external.jp', 'bad@external.jp'], auth: 'token' });
-  assert.deepEqual(result.map(r => [r.role, r.status]), [['writer', 'exists'], ['commenter', 'added'], ['commenter', 'error']]);
+  assert.deepEqual(result.map(r => [r.role, r.status]), [['writer', 'exists'], ['commenter', 'added'], ['commenter', 'error'], ['writer', 'added']]);
   assert.match(result[2].error, /403/);
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 5);
 });
 test('lower or expired permission is not skipped; explicit role wins', async t => {
   t.mock.method(globalThis, 'fetch', async (url, options) => options.method === 'POST'
@@ -50,12 +60,12 @@ test('lower or expired permission is not skipped; explicit role wins', async t =
       { type: 'user', emailAddress: 'b@orgiast.jp', role: 'owner', expirationTime: '2000-01-01' },
     ] }));
   const results = await shareFile({ fileId: 'id', emails: 'a@orgiast.jp,b@orgiast.jp', role: 'writer', auth: 'token' });
-  assert.deepEqual(results.map(r => r.status), ['added', 'added']);
+  assert.deepEqual(results.map(r => r.status), ['added', 'added', 'added']);
 });
 test('list failure returns errors for every recipient', async t => {
   t.mock.method(globalThis, 'fetch', async () => new Response('no access', { status: 403 }));
   const results = await shareFile({ fileId: 'id', emails: 'a@orgiast.jp,b@example.com', auth: 'token' });
-  assert.deepEqual(results.map(r => r.status), ['error', 'error']);
+  assert.deepEqual(results.map(r => r.status), ['error', 'error', 'error']);
 });
 test('ledger records only successful recipients with actual per-recipient roles', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'share-ledger-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -72,7 +82,8 @@ test('partial failure is reported and still records successful shares', async t 
   await assert.rejects(shareAndRecord({ fileId: 'id', name: '文書', emails: 'ok@orgiast.jp,bad@example.com', auth: 'token' }, { ledgerPath, stdout: s => out.push(s), stderr: s => err.push(s) }));
   assert.equal(out[0], '共有済み: ok@orgiast.jp (writer) 文書');
   assert.equal(err.length, 1);
-  assert.deepEqual(JSON.parse(fs.readFileSync(ledgerPath, 'utf8')).emails, ['ok@orgiast.jp']);
+  const rows = fs.readFileSync(ledgerPath, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(rows.map(row => row.emails), [['ok@orgiast.jp'], ['syain@orgiast.jp']]);
 });
 test('existing creation CLIs accept share and share-role', async () => {
   for (const [file, args] of [
@@ -91,5 +102,5 @@ test('share CLI dry run does not authenticate, write permissions, or create a le
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('dry run must not fetch'); });
   const lines = []; t.mock.method(console, 'log', value => lines.push(value));
   assert.equal(await main(['--id', 'id', '--to', 'a@orgiast.jp,b@example.com', '--dry']), 0);
-  assert.deepEqual(lines, ['dry: id → a@orgiast.jp (writer)', 'dry: id → b@example.com (commenter)']);
+  assert.deepEqual(lines, ['dry: id → a@orgiast.jp (writer)', 'dry: id → b@example.com (commenter)', 'dry: id → syain@orgiast.jp (writer)']);
 });

@@ -56,19 +56,137 @@ test('cap boundaries: iter/hours/noop/total and lifetime stop precedence', () =>
   assert.equal(capReason({ ...state, totalIterations: 200, iterationsToday: 20 }, objective, { hours: 6 }), 'total_cap');
 });
 
-test('JST rollover clears daily count but requires explicit resume from pause', async (t) => {
+test('JST rollover clears a daily cap and resumes it automatically', async (t) => {
   const f = fixture(t);
   await f.call('start', { objective: 'test', 'max-iter-per-day': 1 });
   assert.equal((await f.call('post', { summary: 'work', progress: 10 })).watchdog.reason, 'daily_iter_cap');
-  assert.equal((await f.call('resume')).status, 'paused');
+  assert.equal((await f.call('resume')).status, 'paused'); // the same-day cap cannot be bypassed
   const tomorrow = { now: new Date('2026-09-21T15:00:00Z') };
   const pre = await f.call('pre', {}, tomorrow);
-  assert.equal(pre.verdict, 'pause');
+  assert.equal(pre.verdict, 'run');
   assert.equal(pre.budget.iterationsLeftToday, 1);
-  assert.equal((await f.call('resume', {}, tomorrow)).status, 'running');
+  assert.equal((await f.call('status', {}, tomorrow)).state.status, 'running');
   assert.equal((await f.call('status', {}, tomorrow)).state.totalIterations, 1);
   assert.equal(dateKey('2026-09-21T14:59:59Z'), '2026-09-21');
   assert.equal(dateKey('2026-09-21T15:00:00Z'), '2026-09-22');
+});
+
+test('a pending question keeps a daily-cap pause until the human answers', async (t) => {
+  const f = fixture(t);
+  await f.call('start', { objective: 'test', 'max-iter-per-day': 1 });
+  assert.equal((await f.call('post', { summary: 'work', progress: 10 })).watchdog.reason, 'daily_iter_cap');
+  await f.call('pause', { question: 'このまま進めてよいですか？' });
+  const tomorrow = { now: new Date('2026-09-21T15:00:00Z') };
+  const pre = await f.call('pre', {}, tomorrow);
+  assert.equal(pre.verdict, 'pause');
+  assert.equal(pre.pendingQuestion, 'このまま進めてよいですか？');
+  assert.equal((await f.call('status', {}, tomorrow)).state.pausedReason, 'daily_iter_cap');
+  assert.equal((await f.call('resume', {}, tomorrow)).status, 'running');
+  assert.equal((await f.call('status', {}, tomorrow)).state.pendingQuestion, null);
+});
+
+test('an unanswered timed question expires and stops blocking the pause', async (t) => {
+  const f = fixture(t);
+  await f.call('start', { objective: 'test', 'max-iter-per-day': 1 });
+  assert.equal((await f.call('post', { summary: 'work', progress: 10 })).watchdog.reason, 'daily_iter_cap');
+  await f.call('pause', { question: 'このまま進めてよいですか？', 'question-deadline': '2026-09-21T02:00:00Z' });
+  // Before the deadline (same day, so the cap still applies): the question survives.
+  const early = await f.call('pre', {}, { now: new Date('2026-09-21T01:30:00Z') });
+  assert.equal(early.verdict, 'pause');
+  assert.equal(early.pendingQuestion, 'このまま進めてよいですか？');
+  // After the deadline the question clears itself (nothing is executed) and the cap reset resumes.
+  const later = { now: new Date('2026-09-22T01:00:00Z') };
+  const pre = await f.call('pre', {}, later);
+  assert.equal(pre.verdict, 'run');
+  assert.equal(pre.pendingQuestion, null);
+  const state = (await f.call('status', {}, later)).state;
+  assert.equal(state.status, 'running');
+  assert.equal(state.pendingQuestionExpiresAt, null);
+  assert.equal(state.lastExpiredQuestion.question, 'このまま進めてよいですか？');
+  assert.equal(state.lastExpiredQuestion.expiredAt, '2026-09-21T02:00:00.000Z');
+});
+
+test('a 3-strike runner error resumes by itself once the login is renewed', async (t) => {
+  const f = fixture(t);
+  const creds = path.join(f.opts.home, '.claude', '.credentials.json');
+  fs.mkdirSync(path.dirname(creds), { recursive: true });
+  fs.writeFileSync(creds, JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '' } }));
+  fs.utimesSync(creds, new Date('2026-09-21T00:00:00Z'), new Date('2026-09-21T00:00:00Z'));
+  await f.call('start', { objective: 'test' });
+  for (let i = 0; i < 3; i += 1) await f.call('pause', { reason: 'runner_error', detail: 'OAuth session expired' });
+  const paused = (await f.call('status')).state;
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.consecutiveRunnerErrors, 3);
+  assert.equal(paused.lastRunnerErrorAt, NOW.toISOString());
+  // Same credentials that failed: stay paused instead of relaunching the child every tick.
+  assert.equal((await f.call('pre')).verdict, 'pause');
+  // The owner logs in again: the file is rewritten, so the pause lifts with no command.
+  fs.utimesSync(creds, new Date('2026-09-21T05:00:00Z'), new Date('2026-09-21T05:00:00Z'));
+  assert.equal((await f.call('pre', {}, { now: new Date('2026-09-21T05:05:00Z') })).verdict, 'run');
+  const after = (await f.call('status', {}, { now: new Date('2026-09-21T05:05:00Z') })).state;
+  assert.equal(after.status, 'running');
+  assert.equal(after.consecutiveRunnerErrors, 0);
+});
+
+test('a renewed login does not wipe an unanswered question', async (t) => {
+  const f = fixture(t);
+  const creds = path.join(f.opts.home, '.claude', '.credentials.json');
+  fs.mkdirSync(path.dirname(creds), { recursive: true });
+  fs.writeFileSync(creds, '{}');
+  fs.utimesSync(creds, new Date('2026-09-21T00:00:00Z'), new Date('2026-09-21T00:00:00Z'));
+  await f.call('start', { objective: 'test' });
+  for (let i = 0; i < 3; i += 1) await f.call('pause', { reason: 'runner_error', detail: 'OAuth session expired' });
+  await f.call('pause', { reason: 'runner_error', question: 'このまま進めますか？' });
+  fs.utimesSync(creds, new Date('2026-09-21T05:00:00Z'), new Date('2026-09-21T05:00:00Z'));
+  const pre = await f.call('pre', {}, { now: new Date('2026-09-21T05:05:00Z') });
+  assert.equal(pre.verdict, 'pause');
+  assert.equal(pre.pendingQuestion, 'このまま進めますか？');
+});
+
+test('a dead login still resumes when the deepseek key can carry the child', async (t) => {
+  const f = fixture(t);
+  const creds = path.join(f.opts.home, '.claude', '.credentials.json');
+  fs.mkdirSync(path.dirname(creds), { recursive: true });
+  fs.writeFileSync(creds, JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '' } }));
+  fs.utimesSync(creds, new Date('2026-09-21T00:00:00Z'), new Date('2026-09-21T00:00:00Z'));
+  fs.writeFileSync(path.join(f.opts.home, '.claude', 'deepseek.env'), 'DEEPSEEK_API_KEY="sk-test"\n');
+  await f.call('start', { objective: 'test' });
+  for (let i = 0; i < 3; i += 1) await f.call('pause', { reason: 'runner_error', detail: 'OAuth session expired' });
+  // Right after the pause nothing relaunches: a broken key must not spawn the child every tick.
+  assert.equal((await f.call('pre', {}, { now: new Date(NOW.getTime() + 5 * 60_000) })).verdict, 'pause');
+  const later = { now: new Date(NOW.getTime() + 31 * 60_000) };
+  assert.equal((await f.call('pre', {}, later)).verdict, 'run');
+  const state = (await f.call('status', {}, later)).state;
+  assert.equal(state.status, 'running');
+  assert.equal(state.consecutiveRunnerErrors, 0);
+});
+
+test('without a deepseek key a dead login keeps the 3-strike pause', async (t) => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.opts.home, '.claude'), { recursive: true });
+  await f.call('start', { objective: 'test' });
+  for (let i = 0; i < 3; i += 1) await f.call('pause', { reason: 'runner_error', detail: 'OAuth session expired' });
+  assert.equal((await f.call('pre', {}, { now: new Date(NOW.getTime() + 60 * 60_000) })).verdict, 'pause');
+});
+
+test('the deepseek fallback does not wipe an unanswered question', async (t) => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.opts.home, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(f.opts.home, '.claude', 'deepseek.env'), 'DEEPSEEK_API_KEY=sk-test\n');
+  await f.call('start', { objective: 'test' });
+  for (let i = 0; i < 3; i += 1) await f.call('pause', { reason: 'runner_error', detail: 'OAuth session expired' });
+  await f.call('pause', { reason: 'runner_error', question: 'このまま進めますか？' });
+  const pre = await f.call('pre', {}, { now: new Date(NOW.getTime() + 60 * 60_000) });
+  assert.equal(pre.verdict, 'pause');
+  assert.equal(pre.pendingQuestion, 'このまま進めますか？');
+});
+
+test('an invalid question deadline is ignored', async (t) => {
+  const f = fixture(t);
+  await f.call('start', { objective: 'test' });
+  await f.call('pause', { question: '進めますか？', 'question-deadline': 'not-a-date' });
+  assert.equal((await f.call('status')).state.pendingQuestionExpiresAt, null);
+  assert.equal((await f.call('pre')).pendingQuestion, '進めますか？');
 });
 
 test('hours cap uses the range of today log timestamps and fires immediately on post', async (t) => {
@@ -174,6 +292,24 @@ test('running pre/post and day rollover never send progress DMs; logs retain wor
   await f.call('pre', {}, { now: new Date('2026-09-22T01:00:00Z') });
   assert.equal(f.sent.length, 0);
   assert.match(fs.readFileSync(f.paths.log, 'utf8'), /work1[\s\S]*work4/);
+});
+
+test('digest records the real delivery result and never re-sends the same slot', async (t) => {
+  const f = discord(t);
+  await f.call('start', { objective: 'digest goal' });
+  const noon = { now: new Date('2026-09-21T03:00:00Z') };
+  const sent = await f.call('digest', {}, noon);
+  assert.equal(sent.ok, true);
+  assert.equal(sent.slot, '2026-09-21-12');
+  assert.equal(sent.delivered, 'dm');
+  assert.equal((await f.call('status', {}, noon)).state.lastDigestDelivered, 'dm');
+  assert.equal((await f.call('digest', {}, noon)).skipped, 'not_due_or_already_sent');
+  f.unavailable.add('dm');
+  const evening = { now: new Date('2026-09-21T12:00:00Z') };
+  const failed = await f.call('digest', {}, evening);
+  assert.equal(failed.delivered, 'none');
+  assert.equal((await f.call('status', {}, evening)).state.lastDigestDelivered, 'none');
+  assert.equal(f.sent.length, 1); // 未達の分は送れた扱いにしない
 });
 
 test('done is durable, notifies once, and handoff contains the seven session-close headings', async (t) => {
