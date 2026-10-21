@@ -391,6 +391,14 @@ export function fallbackBackendTimeoutSecs(timeoutSeconds, env = process.env) {
   return Math.max(60, Math.min(timeoutSeconds, wanted));
 }
 
+// gemini-cli だけ既定 600 秒。実測: 成功 37 件の max 559 秒 / timeout 13 件の min 638 秒。
+// 900 秒まで待っても成功した例は無く、待つほど捨てる秒数だけ増える。
+export function backendSpecificTimeoutSecs(backendName, env = process.env) {
+  if (backendName !== 'gemini-cli') return null;
+  const raw = Number(env.CODEX_DO_GEMINI_TIMEOUT_SECS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 600;
+}
+
 // タイムアウト時にプロセス木ごと殺す。Windows で shell:true のとき直接の子は cmd.exe なので、
 // child.kill() は cmd.exe だけを終わらせ、孫(gemini 等)が残る。孫が stdout パイプを握ったままだと
 // 'close' が発火せず、タイムアウトが実効しない
@@ -607,7 +615,31 @@ export function isBackendCliMissing(output, stderr) {
   return false;
 }
 
-export function shouldAdvanceToNextBackend({ timedOut, status, exhausted, cliMissing } = {}) {
+export const POLICY_STALL_MIN_ELAPSED_SECS = 300;
+export const POLICY_STALL_MIN_OUTPUT_CHARS = 400;
+export const POLICY_STALL_MIN_DENIALS = 3;
+export const POLICY_DENIAL_PATTERN = /tool execution denied by policy/gi;
+
+export function countPolicyDenials(text) {
+  return typeof text === 'string' ? (text.match(POLICY_DENIAL_PATTERN) || []).length : 0;
+}
+
+export function shouldAbortPolicyStall({
+  elapsedSecs,
+  outputChars,
+  stderr,
+  minElapsedSecs = POLICY_STALL_MIN_ELAPSED_SECS,
+  minOutputChars = POLICY_STALL_MIN_OUTPUT_CHARS,
+  minDenials = POLICY_STALL_MIN_DENIALS
+} = {}) {
+  if (![elapsedSecs, outputChars, minElapsedSecs, minOutputChars, minDenials].every(Number.isFinite)) return false;
+  return elapsedSecs >= minElapsedSecs
+    && outputChars < minOutputChars
+    && countPolicyDenials(stderr) >= minDenials;
+}
+
+export function shouldAdvanceToNextBackend({ timedOut, status, exhausted, cliMissing, aborted } = {}) {
+  if (aborted) return { advance: true, outcome: 'blocked' };
   if (timedOut) return { advance: true, outcome: 'timeout' };
   if (cliMissing) return { advance: true, outcome: 'cli_missing' };
   if (exhausted) return { advance: true, outcome: 'exhausted' };
@@ -892,6 +924,7 @@ function execute(command, commandArgs, options = {}) {
           stderr: mock.stderr || '',
           outputChars: (mock.output || '').length,
           timedOut: mock.timedOut || false,
+          aborted: null,
           error: mock.error || null
         });
       }
@@ -900,12 +933,14 @@ function execute(command, commandArgs, options = {}) {
     }
   }
   return new Promise((resolve) => {
-    let outputChars = 0, output = '', stderr = '', timedOut = false;
+    let outputChars = 0, output = '', stderr = '', timedOut = false, abortedPolicyStall = false;
+    const callStarted = Date.now();
     const callTimeoutSeconds = Number.isFinite(options.timeoutSecs) && options.timeoutSecs > 0
       ? options.timeoutSecs
       : timeoutSeconds;
     const spawnOptions = { ...options };
     delete spawnOptions.timeoutSecs;
+    delete spawnOptions.abortPolicyStall;
     // stdio を全て pipe にして TTY を渡さない。TTY 付きで起動すると codex が端末入力を
     // 待ったまま眠り続ける(2026-08-26 に 1日00:57 hang した実害)。
     const child = spawn(command, commandArgs, { ...spawnOptions, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
@@ -916,9 +951,20 @@ function execute(command, commandArgs, options = {}) {
     }, callTimeoutSeconds * 1000);
     timer.unref?.();
     child.stdout.on('data', (chunk) => { outputChars += chunk.length; output += chunk.toString(); process.stdout.write(chunk); });
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); process.stderr.write(chunk); });
-    child.on('error', (error) => { clearTimeout(timer); resolve({ status: null, error, outputChars, output, stderr }); });
-    child.on('close', (status) => { clearTimeout(timer); resolve({ status: timedOut ? 124 : status, outputChars, output, stderr, timedOut }); });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+      process.stderr.write(chunk);
+      if (!abortedPolicyStall
+        && options.abortPolicyStall === true
+        && process.env.CODEX_DO_POLICY_STALL_ABORT !== '0'
+        && shouldAbortPolicyStall({ elapsedSecs: (Date.now() - callStarted) / 1000, outputChars, stderr })) {
+        abortedPolicyStall = true;
+        console.error(`\n[codex-do] ${command} はポリシー拒否が続き、出力 ${outputChars} 文字のまま停滞したため停止します`);
+        killProcessTree(child);
+      }
+    });
+    child.on('error', (error) => { clearTimeout(timer); resolve({ status: null, error, outputChars, output, stderr, timedOut, aborted: abortedPolicyStall ? 'policy_stall' : null }); });
+    child.on('close', (status) => { clearTimeout(timer); resolve({ status: timedOut ? 124 : status, outputChars, output, stderr, timedOut, aborted: abortedPolicyStall ? 'policy_stall' : null }); });
     // 指示は stdin で渡し、必ず閉じる。閉じないと codex が
     // "Reading additional input from stdin..." のまま永久に待つ。
     child.stdin.end(prompt);
@@ -1202,7 +1248,10 @@ if (quotaCheck.matched || escalationFailed || launchUnavailable || authFailed) {
       const chainStarted = Date.now();
       fallbackChain = [];
       for (const backend of backends) {
-        const backendTimeout = chainBackendBudgetSecs(timeoutSeconds, (Date.now() - chainStarted) / 1000);
+        const backendTimeout = Math.min(
+          chainBackendBudgetSecs(timeoutSeconds, (Date.now() - chainStarted) / 1000),
+          backendSpecificTimeoutSecs(backend.name) ?? Infinity
+        );
         if (backendTimeout <= 0) {
           console.error(`[codex-do] フォールバック全体の時間枠(${timeoutSeconds}秒)を使い切ったため、残りのバックエンドは実行しません`);
           break;
@@ -1215,7 +1264,8 @@ if (quotaCheck.matched || escalationFailed || launchUnavailable || authFailed) {
               cwd,
               env: buildGeminiEnv(process.env, backend.apiKey),
               shell: process.platform === 'win32',
-              timeoutSecs: backendTimeout
+              timeoutSecs: backendTimeout,
+              abortPolicyStall: true
             })
           : backend.kind === 'cheap-code'
             ? await executeCheapCode(backend, backendTimeout)
@@ -1233,7 +1283,7 @@ if (quotaCheck.matched || escalationFailed || launchUnavailable || authFailed) {
         const spawnFailed = originalStatus === null;
         const cliMissing = isBackendCliMissing(result.output, `${result.stderr || ''}\n${result.error?.message || ''}`);
         const exhausted = isBackendExhausted(result.output, result.stderr);
-        const decision = shouldAdvanceToNextBackend({ timedOut: result.timedOut === true, status: result.status, exhausted, cliMissing });
+        const decision = shouldAdvanceToNextBackend({ timedOut: result.timedOut === true, status: result.status, exhausted, cliMissing, aborted: result.aborted === 'policy_stall' });
         const outcome = decision.outcome;
 
         fallbackChain.push({
@@ -1251,8 +1301,10 @@ if (quotaCheck.matched || escalationFailed || launchUnavailable || authFailed) {
           outcome
         });
 
-        if (outcome === 'timeout' || outcome === 'cli_missing') recordFallbackBackendOutcome(home, { backend: backend.name, outcome });
-        if (outcome === 'timeout') {
+        if (outcome === 'timeout' || outcome === 'cli_missing' || outcome === 'blocked') recordFallbackBackendOutcome(home, { backend: backend.name, outcome });
+        if (outcome === 'blocked') {
+          console.error(`[codex-do] backend=${backend.name} がポリシー拒否で停滞しているため ${fallbackChain.at(-1).secs} 秒で打ち切って次へ`);
+        } else if (outcome === 'timeout') {
           console.error(`[codex-do] backend=${backend.name} が ${backendTimeout} 秒でタイムアウトしたため次のバックエンドへ移ります`);
         } else if (outcome === 'cli_missing') {
           console.error(`[codex-do] backend=${backend.name} の CLI が見つからないため次のバックエンドへ移ります`);
