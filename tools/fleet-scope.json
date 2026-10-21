@@ -92,6 +92,18 @@
       "reason": "fleet-mail 通知・提示 hook の実行時 import 依存（再帰検査対象）"
     },
     {
+      "path": "tools/rescue-todo-sweep.mjs",
+      "scope": "fleet",
+      "step": "task:fleet-mail",
+      "reason": "auto-session.mjs が import する実行時依存（rescue TODO の自動掃除）。D8 再帰検査の対象"
+    },
+    {
+      "path": "tools/rescue-review-scan.mjs",
+      "scope": "fleet",
+      "step": "task:fleet-mail",
+      "reason": "rescue-todo-sweep.mjs が import する実行時依存（rescue 枝の分類）。D8 再帰検査の対象"
+    },
+    {
       "path": "tools/backup-claude-to-drive.ps1",
       "scope": "kim-only",
       "step": null,
