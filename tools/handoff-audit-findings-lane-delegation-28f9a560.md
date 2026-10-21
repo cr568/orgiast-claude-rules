@@ -86,3 +86,36 @@ node tools/handoff-audit-lane-delegation-scan.mjs --since 2026-10-15
   未完了**なら inTurn=true になる（分類の人手確認は残る）。ただし turn を閉じていない点で
   「実行中で handoff」とは別の型であり、本 handoff の再発判定には使える。
 - 近接 80 文字・turn 内のみという検出限界は従来どおり。turn をまたぐ言及は取りこぼす（過小評価側）。
+
+## 6. 追検証（2026-10-22）: 起票後 0 件は **再現しなかった**（1 セッション 4 hit）
+
+PR #908（本節 §4 の `inTurn` 分離）は **2026-10-19T18:14:28Z にマージ済み**、CI 4 チェックすべて pass。
+配布コピー2系統（`~/.claude/nightly-repo` / `~/orgiast-claude-rules`）の
+`tools/handoff-audit-lane-delegation-scan.mjs` は **バイト一致**で `inTurn` 実装を含む。
+
+```
+node tools/handoff-audit-lane-delegation-scan.mjs --selftest   → 13/13 pass
+node tools/handoff-audit-lane-delegation-scan.mjs --since 2026-10-18T18:01:30Z
+→ ledger 1453 行 / 窓内 582、transcript 275 ファイル / 窓内 30 / assistant turn 4,818
+→ hits 7 / recurrences 4 / inTurnHits 3
+```
+
+| ts | session | 一致 | inTurn | 人数え |
+|---|---|---|---|---|
+| 2026-10-19T05:31:26Z | `1f03b132` | CI 完了待ちマージを Codex に任せます | true | 0（§2 で確認済み） |
+| 2026-10-19T05:44:33Z | `1f03b132` | 同上（2 回目） | true | 0 |
+| 2026-10-20T23:21:50Z | `cf63f5f2` | `Codex 実行中に、セッション側の変更を準備します` | true | 0 |
+| **2026-10-21T07:04:08 / 07:04:21Z** | **`7e568bc0`** | `v3 の組み立ては実装レーン（Codex）で実行中で、終わると通知が来ます` | **false** | **1** |
+
+`7e568bc0` の 4 hit は同一 turn（台帳 2 行＋transcript 2 行）の二重計上で、**セッションとしては 1 件**。
+本文は C0051 提案書 v3 の組み立て中に「Codex で実行中、終わると通知が来ます」と報告して turn を閉じたもの
+（07:04:12Z に Stop hook が発火しているので turn 終端）。ただし**同一セッションが 08:18:09Z まで続き、
+v3 PDF を佐藤様へ Discord DM で送って完結**している（成果物は実在）。＝
+「委譲したまま実測せず終える」事故型ではなく、**turn を『実行中』で閉じる型の再発**ではある。
+
+- 判定: 起票後の **真の再発 1 セッション**。前回記録（§2 の recurrences 0）は **10-20 時点**の値で、
+  10-21 の 1 件で更新される。**「recurrences 0」は 2026-10-22 時点では成立しない。**
+- 未解決の検出器の穴: `inTurn` は前景実行の有無しか見ないため、**委譲先（外部 Codex 通知）で進む
+  turn を mid-session の進捗報告と区別できない**。次に直すなら
+  (a) `recurrences` をセッション単位に束ねる（台帳＋transcript の二重計上を除く）、
+  (b) hit した turn の後に同一セッションで成果物が着地したかを `inTurn` と同様に判定する、の 2 点。
