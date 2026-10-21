@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, detectCodexAuthFailure, isCodexAuthFailure, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, findExecutable, isBackendCliMissing, shouldAdvanceToNextBackend, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS, wantsEdit, buildUsageRow } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, detectCodexAuthFailure, isCodexAuthFailure, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, backendSpecificTimeoutSecs, countPolicyDenials, shouldAbortPolicyStall, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, findExecutable, isBackendCliMissing, shouldAdvanceToNextBackend, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS, wantsEdit, buildUsageRow } = await import('./codex-do.mjs');
 
 const runDirs = [];
 function workDir() {
@@ -151,6 +151,31 @@ test('chainBackendBudgetSecs は連鎖の残り予算を超えない（全体枠
   // 環境変数の上限は残り予算にも反映される
   assert.equal(chainBackendBudgetSecs(1800, 0, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 900);
   assert.equal(chainBackendBudgetSecs(1800, 1500, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 300);
+});
+
+test('backendSpecificTimeoutSecs は gemini-cli だけに既定600秒と正の上書きを適用する', () => {
+  assert.equal(backendSpecificTimeoutSecs('gemini-cli', {}), 600);
+  assert.equal(backendSpecificTimeoutSecs('gemini-cli', { CODEX_DO_GEMINI_TIMEOUT_SECS: '450' }), 450);
+  assert.equal(backendSpecificTimeoutSecs('gemini-cli', { CODEX_DO_GEMINI_TIMEOUT_SECS: 'garbage' }), 600);
+  assert.equal(backendSpecificTimeoutSecs('gemini-cli', { CODEX_DO_GEMINI_TIMEOUT_SECS: '0' }), 600);
+  assert.equal(backendSpecificTimeoutSecs('cheap-code:deepseek', {}), null);
+});
+
+test('countPolicyDenials は大文字小文字を区別せず拒否回数を数える', () => {
+  assert.equal(countPolicyDenials('通常のエラー'), 0);
+  assert.equal(countPolicyDenials('Tool execution denied by policy.\ntool execution denied by policy'), 2);
+  assert.equal(countPolicyDenials('TOOL EXECUTION DENIED BY POLICY'), 1);
+});
+
+test('shouldAbortPolicyStall は長時間・低出力・拒否3回が揃ったときだけ中断する', () => {
+  const denied3 = 'tool execution denied by policy\n'.repeat(3);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 900, outputChars: 164, stderr: denied3 }), true);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 452, outputChars: 4048, stderr: denied3 }), false);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 299, outputChars: 164, stderr: denied3 }), false);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 900, outputChars: 400, stderr: denied3 }), false);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 900, outputChars: 164, stderr: denied3.replace(/[^\n]+\n$/, '') }), false);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: '900', outputChars: 164, stderr: denied3 }), false);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 900, outputChars: NaN, stderr: denied3 }), false);
 });
 
 // 実測（2026-10-12〜10-14 の executor-usage.jsonl）: fallback 行が毎回 secs≈600.05 で
@@ -927,6 +952,7 @@ test('isBackendCliMissing は CLI 欠落だけを検出する', () => {
 });
 
 test('shouldAdvanceToNextBackend は次のバックエンドへ進む結果を分類する', () => {
+  assert.deepEqual(shouldAdvanceToNextBackend({ aborted: true, timedOut: true }), { advance: true, outcome: 'blocked' });
   assert.deepEqual(shouldAdvanceToNextBackend({ cliMissing: true, status: 1 }), { advance: true, outcome: 'cli_missing' });
   assert.deepEqual(shouldAdvanceToNextBackend({ exhausted: true, status: 1 }), { advance: true, outcome: 'exhausted' });
   assert.deepEqual(shouldAdvanceToNextBackend({ timedOut: true }), { advance: true, outcome: 'timeout' });
