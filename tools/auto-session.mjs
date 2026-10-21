@@ -9,6 +9,7 @@ import { DEFAULT_REPO_MAP, parseRepoMap } from './feedback-to-issues.mjs';
 import { ledgerRows, runTaskLedger } from './task-ledger.mjs';
 import { alternateCheapProvider, autoSessionExecutor, buildClaudeHeadlessArgs, buildCheapCodeArgs, claudeFallbackEnabled, recordFallbackToClaude, recordSkippedNoExecutor } from './auto-session-executor.mjs';
 import { findClaudeInVersionedDir, sanitizeClaudeSupervisorEnv } from './claude-exe.mjs';
+import { sweepFile as sweepRescueTodoFile } from './rescue-todo-sweep.mjs';
 
 export { autoSessionExecutor } from './auto-session-executor.mjs';
 
@@ -1049,6 +1050,10 @@ export async function main(argv = process.argv.slice(2), io = {}) {
 
   const nextFile = path.join(claudeDir, 'next-session.md');
   if (!readOnly && fs.existsSync(nextFile) && fs.statSync(nextFile).size > MAX_BYTES) rotate(nextFile);
+  if (fs.existsSync(nextFile)) {
+    try { sweepRescueTodoFile(nextFile, { dryRun: readOnly }); }
+    catch (error) { console.error(`[rescue-todo-sweep] ${error?.message ?? error}`); }
+  }
   // フォーム報告は next-session.md と独立した入力源なので、片方が無くてももう片方を止めない。
   const parsed = fs.existsSync(nextFile) ? parseHandoff(fs.readFileSync(nextFile, 'utf8')) : { block: '', todos: [], todoBlocks: [], sections: {} };
   const feedbackIssues = await listIssues();
