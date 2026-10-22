@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, detectCodexAuthFailure, isCodexAuthFailure, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, backendSpecificTimeoutSecs, countPolicyDenials, shouldAbortPolicyStall, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, findExecutable, isBackendCliMissing, shouldAdvanceToNextBackend, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS, wantsEdit, buildUsageRow } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, detectCodexAuthFailure, isCodexAuthFailure, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, backendSpecificTimeoutSecs, countPolicyDenials, shouldAbortPolicyStall, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, findExecutable, isBackendCliMissing, shouldAdvanceToNextBackend, isBackendExhausted, validateCwd, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS, wantsEdit, buildUsageRow } = await import('./codex-do.mjs');
 
 const runDirs = [];
 function workDir() {
@@ -54,6 +54,31 @@ function writePrompt(body) {
   fs.writeFileSync(file, body, 'utf8');
   return file;
 }
+
+test('validateCwd は存在・不存在・壊れた Windows パス・省略を判定する', () => {
+  const existing = validateCwd('/work', { resolveImpl: (value) => value, existsImpl: () => true, statImpl: () => ({ isDirectory: () => true }), platform: 'linux' });
+  assert.deepEqual(existing, { cwd: '/work', ok: true });
+
+  const missing = validateCwd('/missing', { resolveImpl: (value) => value, existsImpl: () => false, platform: 'linux' });
+  assert.deepEqual(missing, { cwd: '/missing', ok: false, reason: 'cwd_not_found' });
+
+  const mangled = validateCwd(String.raw`C:Userskimko.claudeauto-session-repo`, { resolveImpl: (value) => `resolved/${value}`, existsImpl: () => false, platform: 'win32' });
+  assert.deepEqual(mangled, { cwd: 'resolved/C:Userskimko.claudeauto-session-repo', ok: false, reason: 'cwd_mangled' });
+
+  const omitted = validateCwd(undefined, { processCwd: '/current', resolveImpl: (value) => value, existsImpl: () => true, statImpl: () => ({ isDirectory: () => true }) });
+  assert.deepEqual(omitted, { cwd: '/current', ok: true });
+});
+
+test('存在しない --cwd は起動せず status 2 で具体的な案内を出す', () => {
+  const home = workDir();
+  const missing = path.join(home, 'missing');
+  const result = run(['--dry-run', '--cwd', missing, '実装する'], { home });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /cwd_not_found/);
+  assert.match(result.stderr, /--cwd のディレクトリが存在しません/);
+  assert.doesNotMatch(result.stdout, /executor=codex/);
+  assert.equal(fs.existsSync(path.join(home, '.claude', 'executor-usage.jsonl')), false);
+});
 
 test('即時の出力ゼロ失敗を1回だけ再試行し、成功と試行回数を台帳に記録する', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-fastfail-'));

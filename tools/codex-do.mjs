@@ -27,6 +27,22 @@ export function normalizeCodexModel(model) {
   return model === 'astra' ? ASTRA : model === 'sol' ? SOL : model;
 }
 
+export function validateCwd(rawArg, {
+  processCwd = process.cwd(),
+  resolveImpl = path.resolve,
+  existsImpl = fs.existsSync,
+  statImpl = fs.statSync,
+  platform = process.platform,
+} = {}) {
+  const rawCwd = rawArg || processCwd;
+  const cwd = resolveImpl(rawCwd);
+  try {
+    if (existsImpl(cwd) && statImpl(cwd).isDirectory()) return { cwd, ok: true };
+  } catch {}
+  const mangled = platform === 'win32' && /^[A-Za-z]:(?![\\/])/.test(rawCwd);
+  return { cwd, ok: false, reason: mangled ? 'cwd_mangled' : 'cwd_not_found' };
+}
+
 // gpt-5.6-sol / gpt-6-astra は API キー認証の環境向けの独自モデル名で、ChatGPT アカウント
 // 認証では invalid_request_error(400) で必ず拒否される(2026-09-21 実測: genbateam.toho@gmail.com
 // のChatGPTプランで両方とも "not supported when using Codex with a ChatGPT account"。既定の
@@ -742,7 +758,17 @@ const lane = laneIndex >= 0 ? args[laneIndex + 1] : 'auto';
 const cwdIndex = args.indexOf('--cwd');
 const promptFileIndex = args.indexOf('--prompt-file');
 const timeoutIndex = args.indexOf('--timeout');
-const cwd = path.resolve(cwdIndex >= 0 && args[cwdIndex + 1] ? args[cwdIndex + 1] : process.cwd());
+const cwdValidation = validateCwd(cwdIndex >= 0 ? args[cwdIndex + 1] : undefined);
+const cwd = cwdValidation.cwd;
+if (!cwdValidation.ok) {
+  console.error(`[codex-do] --cwd 検証失敗: ${cwd} (reason=${cwdValidation.reason})`);
+  if (cwdValidation.reason === 'cwd_mangled') {
+    console.error('バックスラッシュが消えています。ダブルクォートで囲んでください: --cwd "C:\\Users\\..."');
+  } else {
+    console.error('--cwd のディレクトリが存在しません');
+  }
+  process.exit(2);
+}
 // cwdIndex が -1 のとき cwdIndex+1 が 0 になり、指示文(第1引数)を捨ててしまうので条件付きで除外する。
 const omitted = new Set();
 if (dryRun) omitted.add(args.indexOf('--dry-run'));
