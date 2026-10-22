@@ -218,6 +218,12 @@
       "reason": "ドキュメントで実行体なし（~/.claude 設定名の記載による誤検出を許容）"
     },
     {
+      "path": "tools/handoff-audit-findings-lane-delegation-28f9a560.md",
+      "scope": "kim-only",
+      "step": null,
+      "reason": "ドキュメントで実行体なし（~/.claude 設定名の記載による誤検出を許容）"
+    },
+    {
       "path": "tools/handoff-audit-findings-oauth-first-consent-recheck.md",
       "scope": "kim-only",
       "step": null,
