@@ -186,6 +186,37 @@ test('emptyOutputReason は U+2019 と U+0027 の両方の usage limit 行を us
   assert.equal(emptyOutputReason({ secs: 0 }), 'no_output');
 });
 
+// 2026-10-21T00:32Z 実測: stderrTail は末尾200字の切り詰め(codex-do.mjs の slice(-200))なので、
+// "You've hit" の先頭が欠けて "t your usage limit." から始まる行が2件出た。旧パターンは
+// 先頭を要求していたため一致せず、no_output(2件) として codex_empty_output が起票された。
+const TRUNCATED_USAGE_LIMIT_STDERR = 't your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at 1:22 PM.';
+
+test('先頭が切り詰められた usage limit 行も usage_limit に分類する', () => {
+  assert.equal(emptyOutputReason({
+    status: 'error', exitCode: 1, launched: true, timedOut: false, secs: 39, stderrTail: TRUNCATED_USAGE_LIMIT_STDERR,
+  }), 'usage_limit');
+  // 対照群: 上限メッセージを含まない status:'error' + exitCode:1 は従来どおり no_output。
+  assert.equal(emptyOutputReason({ status: 'error', exitCode: 1, launched: true, timedOut: false, secs: 39, stderrTail: 't something else went wrong' }), 'no_output');
+});
+
+test('先頭切り詰めの usage limit 2件で codex_empty_output を出さない', () => {
+  const dir = home();
+  const realRow = (t, model, lane, secs) => ({
+    t, provider: 'codex', model, lane, escalated: false, in: 5781, out: 0,
+    launched: true, timedOut: false, status: 'error', origin: 'interactive', kind: 'implement',
+    exitCode: 1, fastFail: true, attempts: 2, secs, stderrTail: TRUNCATED_USAGE_LIMIT_STDERR,
+  });
+  write(dir, 'executor-usage.jsonl',
+    row(realRow('2026-10-21T00:32:59.024Z', 'codex-cli/gpt-6-astra', 'complex_task', 38.998))
+    + row(realRow('2026-10-21T00:33:04.003Z', 'codex-cli/gpt-5.6-sol', 'astra_usage_limit', 4.972)));
+  const findings = collectFindings({ home: dir, now: new Date('2026-10-21T01:00:00.000Z'), codexUsedPercent: null });
+  const ids = findings.map((item) => item.id);
+  assert.ok(!ids.includes('codex_empty_output'), JSON.stringify(ids));
+  const limit = findings.find((item) => item.id === 'codex_usage_limit');
+  assert.equal(limit.severity, 'low');
+  assert.deepEqual(limit.evidence, ['2件', 'usage_limit(2件)']);
+});
+
 test('実台帳行の Codex 上限到達行で collectFindings が codex_empty_output を出さず codex_usage_limit を出す', () => {
   const dir = home();
   const realUsageRow = {
