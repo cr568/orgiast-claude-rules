@@ -155,7 +155,10 @@ function reasonTop(rows) {
 // 2026-09-11 実測: 404秒/487秒で打ち切られた実行は rollout ログ上は tsc 実行など実作業の途中だった。
 // codex は WSL の名前解決失敗などで、セッションを作る前に exit 1 / 出力ゼロで死ぬことがある。
 // これは codex 本体の故障ではなく一過性のインフラ障害で、codex-do 側の再試行で回復する。
-const INFRA_TRANSIENT = /failed to lookup address information|failed to connect to websocket|stream error|connection reset|i\/o timeout|dns/i;
+// "workspace routing discovery timed out" / "Reconnecting... 5/5" も同じ一過性のネットワーク断
+// （2026-10-20 実測: 出力ゼロ4件すべてがこの文言で、11分後の実行は成功。認証でも上限でも起動失敗でもない）。
+// 401 の "workspace routing discovery unauthorized (401)" は auth_failed 判定（この関数の上）が先に拾う。
+const INFRA_TRANSIENT = /failed to lookup address information|failed to connect to websocket|stream error|connection reset|i\/o timeout|dns|workspace routing discovery timed out|Reconnecting\.\.\. 5\/5/i;
 
 // WSL のディストリが1つも無い PC では codex レーンを環境修復する必要がある。
 // 「そもそも走っていない」の中でも、コードで直せる起動失敗(codex_launch_failed)と分けて扱う

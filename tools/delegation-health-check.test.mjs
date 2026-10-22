@@ -251,6 +251,31 @@ test('token_revoked 401 の失敗後に成功1件があれば何も起票しな�
   assert.deepEqual(collectFindings({ home: dir, now: NOW, codexUsedPercent: null }).map((item) => item.id), ['healthy']);
 });
 
+// 2026-10-20 実測: 出力ゼロ4件（19:14/19:17/19:32/19:36）の stderr は全て
+// "ERROR: Reconnecting... 5/5 ERROR: workspace routing discovery timed out" で、
+// 11分後の実行は成功している＝一過性のネットワーク断。認証(401)とは別物。
+const ROUTING_TIMEOUT_STDERR = 'onnecting... 3/5 ERROR: Reconnecting... 4/5 ERROR: Reconnecting... 5/5 ERROR: workspace routing discovery timed out ERROR: workspace routing discovery timed out';
+
+test('制御プレーン不達(workspace routing discovery timed out)の出力ゼロは infra_transient に分類する', () => {
+  assert.equal(emptyOutputReason({ status: 'error', exitCode: 1, launched: true, timedOut: false, secs: 236.3, stderrTail: ROUTING_TIMEOUT_STDERR }), 'infra_transient');
+  // 401 は同じ "Reconnecting... 5/5" の接頭辞を共有するが、auth_failed を先に判定する。
+  assert.equal(emptyOutputReason({ status: 'error', exitCode: 1, launched: true, timedOut: false, secs: 38.4, stderrTail: TOKEN_REVOKED_STDERR }), 'auth_failed');
+});
+
+test('制御プレーン不達の出力ゼロ4件では codex_empty_output を起票しない', () => {
+  const dir = home();
+  write(dir, 'executor-usage.jsonl', [
+    { t: '2026-09-09T10:14:01Z', provider: 'codex', out: 0, status: 'error', exitCode: 1, launched: true, timedOut: false, secs: 236.3, stderrTail: ROUTING_TIMEOUT_STDERR },
+    { t: '2026-09-09T10:17:59Z', provider: 'codex', out: 0, status: 'error', exitCode: 1, launched: true, timedOut: false, secs: 238.0, stderrTail: ROUTING_TIMEOUT_STDERR },
+    { t: '2026-09-09T10:32:52Z', provider: 'codex', out: 0, status: 'error', exitCode: 1, launched: true, timedOut: false, secs: 236.0, stderrTail: ROUTING_TIMEOUT_STDERR },
+    { t: '2026-09-09T10:36:50Z', provider: 'codex', out: 0, status: 'error', exitCode: 1, launched: true, timedOut: false, secs: 238.5, stderrTail: ROUTING_TIMEOUT_STDERR },
+    { t: '2026-09-09T10:47:52Z', provider: 'codex', status: '0', out: 136 },
+  ].map(row).join(''));
+  const ids = collectFindings({ home: dir, now: NOW, codexUsedPercent: null }).map((item) => item.id);
+  assert.ok(!ids.includes('codex_empty_output'), JSON.stringify(ids));
+  assert.deepEqual(ids, ['healthy']);
+});
+
 test('codex_auth_failed は high で next-session.md へ起票する', () => {
   const dir = home();
   write(dir, 'next-session.md', handoff());
