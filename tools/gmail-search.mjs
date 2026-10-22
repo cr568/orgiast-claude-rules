@@ -17,11 +17,13 @@ export function headerValue(payload, name) {
 export function compactMessage(message) {
   return {
     id: String(message?.id || ''),
+    internalDate: message?.internalDate || null,
     threadId: String(message?.threadId || ''),
     date: headerValue(message?.payload, 'date'),
     from: headerValue(message?.payload, 'from'),
     to: headerValue(message?.payload, 'to'),
     subject: headerValue(message?.payload, 'subject'),
+    listUnsubscribe: headerValue(message?.payload, 'list-unsubscribe'),
     snippet: String(message?.snippet || '').replace(/\s+/g, ' ').trim(),
     labels: Array.isArray(message?.labelIds) ? message.labelIds : [],
   };
@@ -58,14 +60,14 @@ async function gmail(token, path, fetchImpl) {
   return response.json();
 }
 
-export async function searchGmail({ user, query, max = 10, withBody = false, bodyLimit = 4000, fetchImpl = globalThis.fetch, getToken = getDriveToken }) {
+export async function searchGmail({ user, query, max = 10, withBody = false, bodyLimit = 4000, pageToken, fetchImpl = globalThis.fetch, getToken = getDriveToken }) {
   const token = await getToken({ scope: SCOPE, impersonate: user });
-  const list = await gmail(token, `/messages?q=${encodeURIComponent(query)}&maxResults=${Math.min(100, max)}`, fetchImpl);
+  const list = await gmail(token, `/messages?q=${encodeURIComponent(query)}&maxResults=${Math.min(100, max)}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`, fetchImpl);
   const results = [];
   let skipped = 0;
   for (const stub of (list.messages || []).slice(0, max)) {
     const format = withBody ? 'full' : 'metadata';
-    const suffix = withBody ? '' : '&metadataHeaders=Date&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject';
+    const suffix = withBody ? '' : '&metadataHeaders=Date&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=List-Unsubscribe';
     let message;
     try {
       message = await gmail(token, `/messages/${stub.id}?format=${format}${suffix}`, fetchImpl);
@@ -79,7 +81,7 @@ export async function searchGmail({ user, query, max = 10, withBody = false, bod
     results.push(compact);
   }
   if (skipped > 0) console.error(`gmail-search: ${skipped}件のメッセージが取得前に削除または移動されたためスキップしました`);
-  return { estimate: Number(list.resultSizeEstimate) || results.length, messages: results, skipped };
+  return { estimate: Number(list.resultSizeEstimate) || results.length, messages: results, skipped, nextPageToken: list.nextPageToken || null };
 }
 
 async function main() {
