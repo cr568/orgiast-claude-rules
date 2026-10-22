@@ -210,7 +210,13 @@ const CODEX_MODEL_AUTH_MISMATCH = /is not supported when using codex with a chat
 
 // Codex の利用上限到達。コードの欠陥ではなく上限到達による停止。
 // アポストロフィは U+2019(’) と U+0027(') の両方に一致させる。
-const CODEX_USAGE_LIMIT = /You[’']ve hit your usage limit/i;
+// 台帳の stderrTail は末尾200文字だけ(codex-do.mjs の slice(-200))なので、上限メッセージが
+// 長いと先頭の "You've hit your usage limit" が切り落とされ、末尾の
+// "… to purchase more credits or try again at 1:22 PM." だけが残る。2026-10-21 実測:
+// 01:52 の2件がまさにこの形で、usage_limit を取り逃して no_output に落ち、
+// codex_empty_output が毎晩起票されていた（1:22 PM まで待てば回復する上限到達）。
+// 末尾に必ず残る "purchase more credits or try again at" でも一致させる。
+const CODEX_USAGE_LIMIT = /You[’']ve hit your usage limit|purchase more credits or try again at/i;
 
 export function emptyOutputReason(row) {
   if (row?.timedOut === true) return 'timeout';
