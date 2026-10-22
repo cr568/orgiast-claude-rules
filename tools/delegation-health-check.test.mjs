@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseHandoff } from './auto-session.mjs';
-import { applyAutoHeal, authRestoredAfter, collectFindings, dedupeLimitEvents, emptyOutputReason, isCooldownSkippedRow, isEmptyDiffEscalationRow, isQuotaLimitedRow, lowYieldBackends, metricFromLaterWindow, parseRateLimitsFromText, quotaSweepProgressRow, readCodexUsedPercent, timeoutWasteSummary, upsertFixTasks, windowResetsAfterLimit } from './delegation-health-check.mjs';
+import { applyAutoHeal, authRestoredAfter, collectFindings, dedupeLimitEvents, emptyOutputReason, isCooldownSkippedRow, isEmptyDiffEscalationRow, isQuotaLimitedRow, lowYieldBackends, metricFromLaterWindow, parseRateLimitsFromText, policyStallAttempts, quotaSweepProgressRow, readCodexUsedPercent, timeoutWasteSummary, upsertFixTasks, windowResetsAfterLimit } from './delegation-health-check.mjs';
 
 const NOW = new Date('2026-09-09T12:00:00.000Z');
 const homes = [];
@@ -1028,4 +1028,38 @@ test('timeoutWasteSummary は上限内でも配備後の timeout を report に�
   assert.equal(summary.overCapRows, 0);
   assert.equal(summary.maxAttemptSecs, 900);
   assert.equal(summary.lastPostDeployTimeoutAt, '2026-10-19T17:34:53.000Z');
+});
+
+test('policyStallAttempts は chain 試行ごとに拒否痕跡を抽出し outcome を引き継ぐ', () => {
+  const rows = [
+    { t: '2026-10-22T00:00:00Z', provider: 'fallback', chain: [
+      { backend: 'gemini-cli', model: 'gemini-3.7-flash', secs: 305.2, out: 120, budgetSecs: 600, stderrTail: 'Tool execution denied by policy. Tool execution denied by policy.', outcome: 'blocked' },
+      { backend: 'cheap-code:deepseek', secs: 40, out: 900, stderrTail: 'ok', outcome: 'ok' },
+    ] },
+    { t: '2026-10-22T01:00:00Z', provider: 'gemini', secs: 12, out: 50, stderrTail: 'no denial here' },
+  ];
+  const attempts = policyStallAttempts(rows);
+  assert.equal(attempts.length, 1);
+  assert.equal(attempts[0].backend, 'gemini-cli');
+  assert.equal(attempts[0].outcome, 'blocked');
+  assert.equal(attempts[0].denials, 2);
+  assert.equal(attempts[0].budgetSecs, 600);
+});
+
+test('#964 以降で打ち切られずに300秒以上消費した policy 停滞を起票し、打ち切り済み・配備前は起票しない', () => {
+  const stall = (t, outcome, secs) => row({ t, provider: 'fallback', chain: [{ backend: 'gemini-cli', secs, out: 200, budgetSecs: 600, stderrTail: 'Tool execution denied by policy. Tool execution denied by policy. Tool execution denied by policy.', outcome }] });
+  const unaborted = home();
+  write(unaborted, 'executor-usage.jsonl', stall('2026-10-22T03:00:00Z', 'ok', 880));
+  const found = collectFindings({ home: unaborted, now: new Date('2026-10-22T12:00:00Z'), codexUsedPercent: null });
+  const finding = found.find((item) => item.id === 'policy_stall_not_aborted');
+  assert.ok(finding, `起票されるべき: ${JSON.stringify(found.map((f) => f.id))}`);
+  assert.match(finding.evidence.join(' '), /1件.*最大 880秒/);
+
+  const aborted = home();
+  write(aborted, 'executor-usage.jsonl', stall('2026-10-22T03:00:00Z', 'blocked', 301));
+  assert.equal(collectFindings({ home: aborted, now: new Date('2026-10-22T12:00:00Z'), codexUsedPercent: null }).some((item) => item.id === 'policy_stall_not_aborted'), false);
+
+  const preDeploy = home();
+  write(preDeploy, 'executor-usage.jsonl', stall('2026-10-21T02:27:07Z', 'timeout', 900));
+  assert.equal(collectFindings({ home: preDeploy, now: new Date('2026-10-22T12:00:00Z'), codexUsedPercent: null }).some((item) => item.id === 'policy_stall_not_aborted'), false);
 });
