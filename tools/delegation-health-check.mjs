@@ -179,6 +179,16 @@ export function isCooldownSkippedRow(row = {}) {
   return String(row?.status ?? '').toLowerCase() === 'cooldown';
 }
 
+// quota-sweep は終了状態をそのまま status に書く(final/exhausted/ceiling/deadline/no-goal/failed)。
+// exhausted は「累積上限まで走り切った」＝レーンは動いている。トークンを消費した行を成功証拠に
+// 数えないと、8 tick 走った翌晩も 24h 窓の過去失敗だけで「全滅」の high 起票が続く
+// (2026-10-22T02:55Z 実測: exhausted / in=1,126,575 / out=10,422 の翌日に再起票)。
+export function quotaSweepProgressRow(row = {}) {
+  if (!String(row?.provider ?? '').startsWith('quota-sweep:')) return false;
+  if (String(row?.status ?? '').toLowerCase() === 'failed') return false;
+  return Number(row.in) > 0 || Number(row.out) > 0;
+}
+
 // fallback バックエンド自体は走って応答を返した(chain の outcome が ok)のに、作業ツリーを
 // 1行も変えなかった行。codex-do が reason:'empty_diff' を付ける。
 // これはレーン(バックエンド)の全滅ではなく、昇格元(codex sol→astra)が空diffだった作業を
@@ -376,7 +386,7 @@ export function collectFindings({ home, now = new Date(), codexUsedPercent = nul
   }
   for (const [provider, rows] of providers) {
     // llm-ask は status:'ok'、cheap-code は ok、codex-do は終了状態と出力を記録する。
-    const succeeded = rows.some(row => normalizeExecutorStatus(row) === 'ok' && Number(row.out) > 0);
+    const succeeded = rows.some(row => (normalizeExecutorStatus(row) === 'ok' && Number(row.out) > 0) || quotaSweepProgressRow(row));
     if (succeeded) continue;
     // 全滅の分母は「実際に投げた回(attempts)」。cooldown 行は上限中で投げなかった記録なので
     // 分母から外す。外さないと上限到達の実体が「N件すべて失敗」の high 未修理全滅に見える

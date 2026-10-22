@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseHandoff } from './auto-session.mjs';
-import { applyAutoHeal, authRestoredAfter, collectFindings, dedupeLimitEvents, emptyOutputReason, isCooldownSkippedRow, isEmptyDiffEscalationRow, isQuotaLimitedRow, lowYieldBackends, metricFromLaterWindow, parseRateLimitsFromText, readCodexUsedPercent, timeoutWasteSummary, upsertFixTasks, windowResetsAfterLimit } from './delegation-health-check.mjs';
+import { applyAutoHeal, authRestoredAfter, collectFindings, dedupeLimitEvents, emptyOutputReason, isCooldownSkippedRow, isEmptyDiffEscalationRow, isQuotaLimitedRow, lowYieldBackends, metricFromLaterWindow, parseRateLimitsFromText, quotaSweepProgressRow, readCodexUsedPercent, timeoutWasteSummary, upsertFixTasks, windowResetsAfterLimit } from './delegation-health-check.mjs';
 
 const NOW = new Date('2026-09-09T12:00:00.000Z');
 const homes = [];
@@ -718,6 +718,20 @@ test('文字列 status の WSL 不在3件は high の環境故障と未修理全
   const outage = findings.find(f => f.id === 'lane_outage_unrepaired');
   assert.equal(outage.provider, 'codex'); assert.equal(outage.severity, 'high');
   assert.deepEqual(outage.evidence, ['3件すべて失敗', '最初 2026-09-09T10:00:00Z', '最後 2026-09-09T10:02:00Z', 'WSL ディストリが見つかりませんでした(3件)']);
+});
+test('quota-sweep:codex は失敗の後に exhausted(トークン消費)が1件あれば全滅にしない', () => {
+  const dir = home();
+  const failed = ['2026-09-09T08:48:58.750Z', '2026-09-09T09:04:00.145Z', '2026-09-09T10:33:57.577Z', '2026-09-09T10:48:57.518Z']
+    .map(t => ({ t, provider: 'quota-sweep:codex', model: 'codex', in: 0, out: 0, tokens: 0, status: 'failed' }));
+  const progressed = { t: '2026-09-09T11:55:43.783Z', provider: 'quota-sweep:codex', model: 'codex', in: 1126575, out: 10422, tokens: 1136997, status: 'exhausted' };
+  write(dir, 'executor-usage.jsonl', [...failed, progressed].map(row).join(''));
+  assert.equal(quotaSweepProgressRow(progressed), true);
+  assert.equal(quotaSweepProgressRow(failed[0]), false);
+  assert.deepEqual(collectFindings({ home: dir, now: NOW }).filter(f => f.id === 'lane_outage_unrepaired'), []);
+  // 対照群: 走った行が無ければ同じ4件で全滅を出す（キーが増えても検出は鈍らない）。
+  write(dir, 'executor-usage.jsonl', failed.map(row).join(''));
+  const outage = collectFindings({ home: dir, now: NOW }).find(f => f.id === 'lane_outage_unrepaired');
+  assert.equal(outage.provider, 'quota-sweep:codex'); assert.equal(outage.severity, 'high');
 });
 test('全レーンの未修理全滅は provider ごとに集計し集計窓外を除く', () => {
   const dir = home();
