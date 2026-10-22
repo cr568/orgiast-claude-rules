@@ -118,24 +118,61 @@ function commandRunner(spawnImpl = spawnSync) {
     return String(r.stdout || '').trim();
   };
 }
-function prepareTree({ home, provider, run, previous }) {
+const pointerFile = tree => path.join(tree, '.git');
+const accessDenied = error => error && (error.code === 'EPERM' || error.code === 'EACCES');
+
+// 2026-10-21 実測: worktree の `.git` がウイルス対策/索引サービスに掴まれると fs の open が
+// EPERM になり、prepareTree が毎回ここで落ちて quota-sweep:codex が12時間ぶん6連続 failed
+// (ticks=0) になった。EPERM は読み取り属性や一時ロックで起きるので、chmod で解除して再試行する。
+export function readWorktreePointer(file, { readFile = fs.readFileSync, chmod = fs.chmodSync, attempts = 3 } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try { return String(readFile(file)).match(/^gitdir: (.+)\s*$/)?.[1] ?? null; }
+    catch (error) {
+      if (!accessDenied(error) || attempt >= attempts) throw error;
+      try { chmod(file, 0o666); } catch { /* best effort */ }
+    }
+  }
+}
+
+export function writeWorktreePointer(file, value, { writeFile = fs.writeFileSync, chmod = fs.chmodSync, attempts = 3 } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try { writeFile(file, value); return; }
+    catch (error) {
+      if (!accessDenied(error) || attempt >= attempts) throw error;
+      try { chmod(file, 0o666); } catch { /* best effort */ }
+    }
+  }
+}
+
+export function prepareTree({ home, provider, run, previous, needRelativePointer = false, io = {}, log = () => {} }) {
   const shared = path.join(home, '.claude', 'nightly-repo'), tree = path.join(home, '.claude', 'quota-sweep-repo');
   run('git', ['fetch', 'origin', 'main', '--quiet'], shared);
   if (!fs.existsSync(tree)) run('git', ['worktree', 'add', '--detach', tree, 'origin/main'], shared);
   // Relative worktree pointer is usable by both Windows git and WSL git.
-  const pointer = read(path.join(tree, '.git')).match(/^gitdir: (.+)\s*$/);
+  const pointer = readWorktreePointer(pointerFile(tree), io);
   if (!pointer) throw new Error('Dedicated worktree has no gitdir pointer');
-  if (path.isAbsolute(pointer[1])) fs.writeFileSync(path.join(tree, '.git'), `gitdir: ${path.relative(tree, pointer[1]).replaceAll('\\', '/')}\n`);
+  let pointerWarning = null;
+  if (path.isAbsolute(pointer)) {
+    const relative = `gitdir: ${path.relative(tree, pointer).replaceAll('\\', '/')}\n`;
+    try { writeWorktreePointer(pointerFile(tree), relative, io); }
+    catch (error) {
+      // 相対化は WSL の git が読むときだけ必須。Windows ネイティブの git は絶対パスでも解決できるので、
+      // EPERM で書けない場合はレーンを落とさず続行する（2026-10-21 の全滅はこの書き込みだった）。
+      if (!accessDenied(error) || needRelativePointer) throw error;
+      pointerWarning = `worktree pointer stays absolute (${error.code}); native git resolves it`;
+      log(`quota-sweep: ${pointerWarning}`);
+    }
+  }
   if (previous?.branch && previous.outcome !== 'final') {
     if (run('git', ['branch', '--show-current'], tree) !== previous.branch) throw new Error('Interrupted branch changed; preserve worktree for recovery');
-    return { tree, branch: previous.branch, base: previous.base };
+    return { tree, branch: previous.branch, base: previous.base, ...(pointerWarning ? { pointerWarning } : {}) };
   }
   const dirty = run('git', ['status', '--porcelain', '--', '.', ':!.loop'], tree);
   if (dirty) throw new Error('Uncommitted prior work preserved in quota-sweep-repo; reconcile before starting a new branch');
   run('git', ['checkout', '--detach', 'origin/main'], tree);
   const branch = `quota-sweep/${new Date().toISOString().replace(/[-:]/g, '').slice(0, 13).replace('T', '-')}-${provider}-${Date.now().toString(36)}`;
   run('git', ['switch', '-c', branch], tree);
-  return { tree, branch, base: run('git', ['rev-parse', 'HEAD'], tree) };
+  return { tree, branch, base: run('git', ['rev-parse', 'HEAD'], tree), ...(pointerWarning ? { pointerWarning } : {}) };
 }
 
 export async function runSweep(decision, context) {
@@ -171,7 +208,7 @@ export async function runSweep(decision, context) {
       if (!eligible) stop = 'exhausted'; else usedBefore = eligible.usedPercent;
     }
     if (stop) { outcome = stop; return; }
-    const prepared = (context.prepareTree ?? prepareTree)({ home, provider, run, previous });
+    const prepared = (context.prepareTree ?? prepareTree)({ home, provider, run, previous, needRelativePointer: Boolean(context.wsl), log, io: context.treeIo });
     ({ tree, branch } = prepared); Object.assign(record, prepared); save();
     const model = env.ORGIAST_QUOTA_SWEEP_MODEL || 'sonnet';
     if (/opus|fable/i.test(model)) throw new Error('Supervisor model is not permitted for quota sweep');

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { DEFAULT_GOAL, MAX_TICKS, selectGoal, tickPrompt, contractPrompt, canRunWindow, interactiveClaude, main, makeLedger, runSweep, parseOutput, acquireLock } from './quota-sweep.mjs';
+import { DEFAULT_GOAL, MAX_TICKS, selectGoal, tickPrompt, contractPrompt, canRunWindow, interactiveClaude, main, makeLedger, runSweep, parseOutput, acquireLock, prepareTree, readWorktreePointer, writeWorktreePointer } from './quota-sweep.mjs';
 import { runBounded, killTree } from './lib/quota-sweep-process.mjs';
 import { interactiveCodex, wslPath } from './lib/quota-sweep-host.mjs';
 import { decideSweep, resetKey, sameReset } from './lib/quota-windows.mjs';
@@ -78,6 +78,46 @@ test('lock respects live/unknown owner and reclaims dead PID', t => {
   const file = path.join(temp(t), 'lock'); fs.writeFileSync(file, JSON.stringify({ pid: 999, startedAt: 'old' }));
   assert.equal(acquireLock(file, { alive: () => true }), null);
   const release = acquireLock(file, { alive: () => false }); assert.equal(typeof release, 'function'); release(); assert.equal(fs.existsSync(file), false);
+});
+// 2026-10-21 実測: worktree の .git が EPERM で開けず prepareTree が ticks=0 で6連続 failed。
+// chmod して再試行し、Windows ネイティブ git なら絶対パスのまま続行することを固定する。
+function worktreeFixture(t) {
+  const home = temp(t), tree = path.join(home, '.claude', 'quota-sweep-repo');
+  const sharedPointer = path.join(home, '.claude', 'nightly-repo', '.git', 'worktrees', 'quota-sweep-repo');
+  fs.mkdirSync(tree, { recursive: true });
+  fs.writeFileSync(path.join(tree, '.git'), `gitdir: ${sharedPointer}\n`);
+  const eperm = () => Object.assign(new Error('EPERM: operation not permitted, open'), { code: 'EPERM' });
+  const run = (_exe, args) => args[0] === 'rev-parse' ? 'base' : '';
+  return { home, tree, sharedPointer, eperm, run };
+}
+test('readWorktreePointer/writeWorktreePointer は EPERM のあと chmod して再試行する', t => {
+  const file = path.join(temp(t), '.git');
+  let reads = 0, writes = 0, chmods = 0;
+  const read = readWorktreePointer(file, { readFile: () => { if (++reads === 1) throw Object.assign(new Error('x'), { code: 'EPERM' }); return 'gitdir: ../repo/.git/worktrees/x\n'; }, chmod: () => { chmods++; } });
+  assert.equal(read, '../repo/.git/worktrees/x');
+  assert.equal(chmods, 1); assert.equal(reads, 2);
+  const seen = [];
+  writeWorktreePointer(file, 'gitdir: rel\n', { writeFile: (_f, value) => { seen.push(value); if (++writes === 1) throw Object.assign(new Error('x'), { code: 'EPERM' }); }, chmod: () => { chmods++; } });
+  assert.equal(writes, 2); assert.deepEqual(seen, ['gitdir: rel\n', 'gitdir: rel\n']); assert.equal(chmods, 2);
+});
+test('prepareTree は一時的な EPERM でも相対ポインタを書いて続行する', t => {
+  const { home, tree, sharedPointer, eperm, run } = worktreeFixture(t);
+  let writes = 0, chmods = 0;
+  const io = { writeFile: (file, value) => { if (++writes === 1) throw eperm(); fs.writeFileSync(file, value); }, chmod: () => { chmods++; } };
+  const prepared = prepareTree({ home, provider: 'codex', run, previous: null, io });
+  assert.equal(prepared.tree, tree); assert.equal(prepared.base, 'base'); assert.equal(prepared.pointerWarning, undefined);
+  assert.equal(writes, 2); assert.equal(chmods, 1);
+  assert.equal(fs.readFileSync(path.join(tree, '.git'), 'utf8'), `gitdir: ${path.relative(tree, sharedPointer).replaceAll('\\', '/')}\n`);
+});
+test('prepareTree は書き込み不能でも native git なら落とさず、WSL 用の相対化が要るときだけ落とす', t => {
+  const { home, tree, sharedPointer, eperm, run } = worktreeFixture(t);
+  const io = { writeFile: () => { throw eperm(); }, chmod: () => {} };
+  const prepared = prepareTree({ home, provider: 'codex', run, previous: null, io });
+  assert.equal(prepared.tree, tree); assert.match(prepared.pointerWarning, /EPERM/);
+  assert.equal(fs.readFileSync(path.join(tree, '.git'), 'utf8'), `gitdir: ${sharedPointer}\n`);
+  assert.throws(() => prepareTree({ home, provider: 'codex', run, previous: null, io, needRelativePointer: true }), /EPERM/);
+  // 読み取りが EPERM のままなら、native でも worktree は使えないので落とす。
+  assert.throws(() => prepareTree({ home, provider: 'codex', run, previous: null, io: { readFile: () => { throw eperm(); }, chmod: () => {} } }), /EPERM/);
 });
 function context(t, child) {
   const home = temp(t), tree = path.join(home, 'tree'); fs.mkdirSync(path.join(home, '.claude')); fs.mkdirSync(tree);
