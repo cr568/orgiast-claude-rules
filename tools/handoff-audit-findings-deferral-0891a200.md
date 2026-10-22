@@ -67,6 +67,21 @@ P3 の一致語は `修正`（`HANDOFF_LINE` の直後）。対象は `aujust-ga
 → 本件の手渡し文が**別セッションで再発した事実は無い**。修正案を承認待ちで止めたのは当該 1 セッションのみで、
 そのセッション自身が同日中に実装・push まで到達している。
 
+### 追補（2026-10-23 auto-session #4）: 兄弟監査ID `b0b68f419a6e567d` の単独再検証
+
+`b0b68f419a6e567d` は `297b6517` の **1ターン目 12:30:36.063Z** に対応する（ID は本文ハッシュ由来で
+台帳に文字列としては現れないため、時刻と原文の逐語一致で同定した）。独立に再実測した結果:
+
+- `node tools/permanent-fix-deferral-scan.mjs --since 2026-10-21T12:30:36Z` → P3 は stop-gate-runner の
+  3件（すべて `297b6517`・12:30:36/43/49）と nightly の再録 1件（18:01:31Z・同一原文）のみ。
+  handoff-audit 台帳は 0 / 1392。
+- `--since 2026-10-22T00:00:00Z` → 3 台帳すべて **P1〜W = 0**（10-22 / 10-23 の再発なし）。
+- `D:/repos/aujust-gakkai-automation` で `git merge-base --is-ancestor f2c8150 origin/main` = **YES**
+  （origin/main = `7ba1879`）。`origin/main:src/lib/moshikomi-followup.ts` の L50/L52 に
+  「担当(DS)未設定なら追跡しない」「趣意書が URL 未入手なら追跡しない」が現存＝revert なし。
+
+→ 本 ID も**再発 0・先送りは同一セッション内（12:44:27Z）で回収済み**。重複 PR は作らず本 PR で記録する。
+
 ## 4. 本番への反映状況（参考）
 
 - Vercel `aujust-gakkai-automation` の Production デプロイは **2026-10-22 01:16:29 JST に Ready**
