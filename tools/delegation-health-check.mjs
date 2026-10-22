@@ -207,7 +207,12 @@ const CODEX_MODEL_AUTH_MISMATCH = /is not supported when using codex with a chat
 
 // Codex の利用上限到達。コードの欠陥ではなく上限到達による停止。
 // アポストロフィは U+2019(’) と U+0027(') の両方に一致させる。
-const CODEX_USAGE_LIMIT = /You[’']ve hit your usage limit/i;
+// 台帳の stderrTail は codex-do.mjs が末尾200字へ切り詰める(slice(-200))ため、上限メッセージの
+// 先頭が欠けて "t your usage limit. Upgrade to Pro ..." だけが残ることがある。
+// 実測 2026-10-21T00:32Z の2件(astra→sol 退避)が旧パターンに一致せず no_output に落ち、
+// codex_empty_output が毎晩起票された。先頭欠落を許容する語("your usage limit" + "Upgrade to Pro"、
+// 最後の砦として ChatGPT の購入URL)も一致させる。
+const CODEX_USAGE_LIMIT = /You(?:[’']ve| have) hit your usage limit|your usage limit[.!]?\s*Upgrade to Pro|Upgrade to Pro \(https:\/\/chatgpt\.com\/explore\/pro\)|Usage limit (?:reached|exceeded)/i;
 
 export function emptyOutputReason(row) {
   if (row?.timedOut === true) return 'timeout';
