@@ -94,7 +94,7 @@ test('watch: 猶予1時間未満は判定しない', async () => {
   assert.equal(GRACE_MS, H);
 });
 
-test('watch: APIエラー未返答を1回だけ起票してDMし、dry-runは何もしない', async () => {
+test('watch: APIエラー未返答を1回だけ起票してDMし、dry-runは数えるだけで書かない', async () => {
   const home = tmp(), transcript = path.join(home, 'session-api.jsonl');
   const errorAt = '2026-10-22T23:30:00.000Z';
   const found = { sessionId: 'session-api', cwd: home, transcriptPath: transcript, requestText: '秘密 token=abc を含む依頼', errorAt,
@@ -112,7 +112,7 @@ test('watch: APIエラー未返答を1回だけ起票してDMし、dry-runは何
 
   const dryHome = tmp();
   const dry = await watch({ home: dryHome, now, dryRun: true, io });
-  assert.equal(dry.discovered, 0); assert.equal(dm, 1); assert.equal(fs.existsSync(ledgerFile(dryHome)), false);
+  assert.equal(dry.discovered, 1); assert.equal(dm, 1); assert.equal(fs.existsSync(ledgerFile(dryHome)), false);
 });
 
 test('resumeSession: APIエラー未返答だけ別モデルを指定する', async () => {

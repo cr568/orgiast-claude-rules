@@ -206,7 +206,8 @@ async function registerUnanswered(home, now, rows, dryRun, summary, ownerOf, io)
     const duplicate = rows.some(row =>
       (row.sessionId === found.sessionId && OPEN_STATUSES.has(row.status)) ||
       (row.source === 'api-error-unanswered' && row.ts === found.errorAt));
-    if (duplicate || dryRun) continue;
+    if (duplicate) continue;
+    if (dryRun) { summary.discovered += 1; continue; } // dry-run は件数だけ数え、台帳も DM も触らない。
     const requestText = redactSecrets(found.requestText).slice(0, 200);
     const kind = redactSecrets(errorKind(found));
     const row = {
