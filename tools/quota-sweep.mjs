@@ -343,7 +343,13 @@ export async function runSweep(decision, context) {
     catch (error) { log(`修復タスク起票失敗: ${error.message}`); row.remediationError = error.message; }
     Object.assign(record, row); save();
     fs.appendFileSync(path.join(home, '.claude', 'quota-sweep.jsonl'), JSON.stringify(row) + '\n');
-    fs.appendFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), JSON.stringify({ t: row.ts, provider: `quota-sweep:${provider}`, model: provider === 'claude' ? env.ORGIAST_QUOTA_SWEEP_MODEL || 'sonnet' : 'codex', in: inputTokens, out: outputTokens, tokens: inputTokens + outputTokens, secs: row.durationSec, status: outcome, attempt: record.attempts, failover: false }) + '\n');
+    // 停止理由と failureKey は executor-usage 側にも残す。quota-sweep.jsonl だけに置いていたため、
+    // executor-usage しか読まない delegation-health では全滅行が no_output と表示され、原因
+    // （EPERM・窓情報不足・対話検出）が見えなかった（2026-10-21 の codex 6連続 failed が該当）。
+    const usageRow = { t: row.ts, provider: `quota-sweep:${provider}`, model: provider === 'claude' ? env.ORGIAST_QUOTA_SWEEP_MODEL || 'sonnet' : 'codex', in: inputTokens, out: outputTokens, tokens: inputTokens + outputTokens, secs: row.durationSec, status: outcome, attempt: record.attempts, failover: false };
+    if (reason) usageRow.reason = reason;
+    if (failureKey) usageRow.failureKey = failureKey;
+    fs.appendFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), JSON.stringify(usageRow) + '\n');
     log(`${provider}: ${outcome}, ticks=${record.ticks}, reason=${reason || '完了'}`);
     const oneLine = value => String(value).replace(/[\r\n]+/g, ' ').slice(0, 250);
     try { if (outcome !== 'no-goal') await notify([`${provider}/${decision.window}`, `${usedBefore}% → ${usedAfter ?? '?'}%`, `tick: ${record.ticks}`, oneLine(selection.goal), prUrl || '変更なし', outcome === 'partial' ? '成果あり・未完了' : outcome, reason ? `理由: ${oneLine(reason)}` : '検証完了'].join('\n'), { home }); }
