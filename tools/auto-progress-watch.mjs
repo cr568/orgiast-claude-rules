@@ -16,6 +16,8 @@ import { notifyOwner, resolveOwner } from './notify-owner.mjs';
 import { kimAction } from './auto-progress-digest.mjs';
 import { checkPromise } from './auto-progress-check.mjs';
 import { appendInbox } from './auto-progress-inbox-hook.mjs';
+import { redactSecrets } from './redact-secrets.mjs';
+import { errorKind, findUnansweredRequest } from './lib/unanswered-request.mjs';
 
 export const GRACE_MS = 1 * 3600 * 1000;
 export const RESUME_INTERVAL_MS = 2 * 3600 * 1000;
@@ -141,8 +143,14 @@ export async function resumeSession(row, { timeoutMs = 20 * 60000, home = os.hom
   const { runChild, resolveClaudeExe } = await import('./auto-session.mjs');
   const resultFile = path.join(home, '.claude', `auto-progress-resume-${String(row.sessionId).slice(0, 8)}.json`);
   fs.rmSync(resultFile, { force: true }); // Never reuse a report from an earlier attempt.
-  const prompt = `以前このセッションで宣言した「この後の自動進行」が止まっています。宣言: 「${row.promise}」。\n元の会話は ${row.transcriptPath} にあります。宣言の最終成果まで進めてください。user の判断・承認が必要な地点では、判断材料を揃えて止まり needs_user を返してください。推測で目的を広げず、他セッションの変更を上書きせず、権限や確認待ちを迂回しないでください。期限は${timeoutMs / 60000}分です。\n結果を ${resultFile} に JSON で保存: {"state":"progressed|done|needs_user|blocked","evidence":"成果物パスと検証結果、または進めない理由","artifact":"成果物パス（任意）","nextKim":"本人だけができる具体的な判断・操作。返信待ちや自動調査なら空文字"}`;
-  const result = await (io.runChild ?? runChild)(io.executable ?? resolveClaudeExe(), prompt, row.cwd, row.cwd, timeoutMs, { resumeSessionId: row.sessionId });
+  const apiErrorResume = row.source === 'api-error-unanswered';
+  const promptLead = apiErrorResume
+    ? `API エラーで返答できなかった user の依頼に、最初から通常どおり応えてください。依頼: ${row.requestText || row.promise.replace(/^API エラー（.*?）で返答できなかった依頼:\s*/, '')}`
+    : `以前このセッションで宣言した「この後の自動進行」が止まっています。宣言: 「${row.promise}」。`;
+  const prompt = `${promptLead}\n元の会話は ${row.transcriptPath} にあります。${apiErrorResume ? '依頼を完了まで進めてください。' : '宣言の最終成果まで進めてください。'}user の判断・承認が必要な地点では、判断材料を揃えて止まり needs_user を返してください。推測で目的を広げず、他セッションの変更を上書きせず、権限や確認待ちを迂回しないでください。期限は${timeoutMs / 60000}分です。\n結果を ${resultFile} に JSON で保存: {"state":"progressed|done|needs_user|blocked","evidence":"成果物パスと検証結果、または進めない理由","artifact":"成果物パス（任意）","nextKim":"本人だけができる具体的な判断・操作。返信待ちや自動調査なら空文字"}`;
+  const rateLimited = apiErrorResume && /rate.?limit|usage.?credits?|429/i.test([row.error, row.apiError, row.apiErrorStatus].join(' '));
+  const runOptions = { resumeSessionId: row.sessionId, ...(rateLimited ? { model: process.env.AUTO_PROGRESS_RESUME_MODEL || 'opus' } : {}) };
+  const result = await (io.runChild ?? runChild)(io.executable ?? resolveClaudeExe(), prompt, row.cwd, row.cwd, timeoutMs, runOptions);
   if (result.status !== 'success') return { outcome: 'error', reason: String(result.status) };
   let report = null; try { report = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch { /* 成果記録なし */ }
   const state = ['progressed', 'done', 'needs_user', 'blocked'].includes(report?.state) ? report.state : 'blocked';
@@ -172,6 +180,55 @@ export function sheetRow(row, verdict, evidence, now = Date.now()) {
   };
 }
 
+function recentTranscripts(home, now, io = {}) {
+  if (io.transcriptFiles) return io.transcriptFiles;
+  const root = path.join(home, '.claude', 'projects');
+  const found = [];
+  const visit = dir => {
+    let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!['subagents', 'memory'].includes(entry.name)) visit(file);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        try { if (now - fs.statSync(file).mtimeMs <= EXPIRE_MS) found.push(file); } catch {}
+      }
+    }
+  };
+  visit(root);
+  return found;
+}
+
+async function registerUnanswered(home, now, rows, dryRun, summary, ownerOf, io) {
+  for (const transcriptPath of recentTranscripts(home, now, io)) {
+    const found = (io.findUnansweredRequest ?? findUnansweredRequest)(transcriptPath);
+    if (!found) continue;
+    const duplicate = rows.some(row =>
+      (row.sessionId === found.sessionId && OPEN_STATUSES.has(row.status)) ||
+      (row.source === 'api-error-unanswered' && row.ts === found.errorAt));
+    if (duplicate) continue;
+    if (dryRun) { summary.discovered += 1; continue; } // dry-run は件数だけ数え、台帳も DM も触らない。
+    const requestText = redactSecrets(found.requestText).slice(0, 200);
+    const kind = redactSecrets(errorKind(found));
+    const row = {
+      ts: found.errorAt, pc: io.hostname ?? os.hostname(), user: io.user ?? (() => { try { return os.userInfo().username; } catch { return ''; } })(),
+      owner: '', sessionId: found.sessionId, cwd: found.cwd, transcriptPath: found.transcriptPath,
+      promise: `API エラー（${kind}）で返答できなかった依頼: ${requestText}`, requestText,
+      error: found.error, apiError: found.apiError, apiErrorStatus: found.apiErrorStatus,
+      nextKim: 'なし', status: 'open', source: 'api-error-unanswered',
+    };
+    row.owner = ownerOf(row);
+    rows.push(row);
+    writeLedger(ledgerFile(home), rows);
+    summary.discovered += 1;
+    try {
+      const message = `${originLine(row, { label: io.label ?? resolveFleetLabel(home), localOwner: row.owner, home })}\nエラーで止まっていた依頼を見つけ、自動で再開します。\n依頼: ${requestText}`;
+      const delivery = await (io.notifyOwner ?? notifyOwner)(row.owner, message, { home });
+      if (delivery?.delivered !== 'dm') throw new Error(delivery?.reason || 'DM not delivered');
+    } catch (error) { summary.errors.push(`api-error-notify: ${String(error?.message ?? error).slice(0, 120)}`); }
+  }
+}
+
 // ---- 本体 ----------------------------------------------------------------
 export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now = Date.now(), dryRun = false, io = {} } = {}) {
   const file = ledgerFile(home);
@@ -182,7 +239,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
     const rows = readLedger(file);
     writeLedger(file, rows.map((r) => rowKey(r) === key ? { ...r, ...changes, status: WATCHED.has(r.status) ? (changes.status ?? r.status) : r.status } : r));
   };
-  const summary = { checked: 0, done: 0, noop: 0, inProgress: 0, stalled: 0, resumed: 0, reported: 0, expired: 0, graced: 0, superseded: 0, errors: [] };
+  const summary = { checked: 0, done: 0, noop: 0, inProgress: 0, stalled: 0, resumed: 0, reported: 0, expired: 0, graced: 0, superseded: 0, discovered: 0, errors: [] };
   const config = (io.sheetConfig ?? sheetConfig)(home);
   // owner 未記録の行は自PCの持ち主へ。空のまま渡すと「宛先: 不明（DM 未解決）」だけになり出どころが分からない（2026-10-23 実測）。
   let localOwner;
@@ -190,6 +247,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
   const askKim = (row, reason) => (io.notifyOwner ?? notifyOwner)(ownerOf(row),
     `${originLine(row, { label: io.label ?? resolveFleetLabel(home), localOwner: ownerOf(row), home })}\n自動進行が判断待ちです: ${row.promise}\n${reason || ''}`, { home });
   const rows = readLedger(file);
+  await registerUnanswered(home, now, rows, dryRun, summary, ownerOf, io);
   const candidates = latestOpenPromises(rows);
   const selected = new Set(candidates);
   const pendingChecks = rows.filter(row => row.check && row.status === 'done' && row.checkResult === 'done' && row.checkNotifiedResult !== 'done');

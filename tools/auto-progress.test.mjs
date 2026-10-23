@@ -94,6 +94,43 @@ test('watch: 猶予1時間未満は判定しない', async () => {
   assert.equal(GRACE_MS, H);
 });
 
+test('watch: APIエラー未返答を1回だけ起票してDMし、dry-runは数えるだけで書かない', async () => {
+  const home = tmp(), transcript = path.join(home, 'session-api.jsonl');
+  const errorAt = '2026-10-22T23:30:00.000Z';
+  const found = { sessionId: 'session-api', cwd: home, transcriptPath: transcript, requestText: '秘密 token=abc を含む依頼', errorAt,
+    error: 'rate_limit', apiError: 'model_requires_usage_credits', apiErrorStatus: 429 };
+  let dm = 0;
+  const io = { transcriptFiles: [transcript], findUnansweredRequest: () => found, localOwner: 'kim', sheetConfig: () => null,
+    notifyOwner: async () => { dm++; return { delivered: 'dm' }; }, digest: async () => ({}) };
+  const now = Date.parse('2026-10-23T00:00:00.000Z');
+  const first = await watch({ home, now, io });
+  assert.equal(first.discovered, 1); assert.equal(dm, 1);
+  let rows = readLedger(ledgerFile(home));
+  assert.equal(rows.length, 1); assert.equal(rows[0].source, 'api-error-unanswered'); assert.equal(rows[0].status, 'open');
+  const second = await watch({ home, now, io });
+  assert.equal(second.discovered, 0); assert.equal(dm, 1); assert.equal(readLedger(ledgerFile(home)).length, 1);
+
+  const dryHome = tmp();
+  const dry = await watch({ home: dryHome, now, dryRun: true, io });
+  assert.equal(dry.discovered, 1); assert.equal(dm, 1); assert.equal(fs.existsSync(ledgerFile(dryHome)), false);
+});
+
+test('resumeSession: APIエラー未返答だけ別モデルを指定する', async () => {
+  const home = tmp(), calls = [];
+  const invoke = async row => resumeSession(row, { home, io: { executable: 'claude', runChild: async (...args) => {
+    calls.push(args);
+    const resultFile = path.join(home, '.claude', `auto-progress-resume-${row.sessionId.slice(0, 8)}.json`);
+    fs.mkdirSync(path.dirname(resultFile), { recursive: true });
+    fs.writeFileSync(resultFile, JSON.stringify({ state: 'done', evidence: '完了' }));
+    return { status: 'success' };
+  } } });
+  await invoke({ sessionId: 'api-error-session', cwd: home, transcriptPath: '/t', source: 'api-error-unanswered', requestText: '依頼', promise: '依頼', error: 'rate_limit', apiErrorStatus: 429 });
+  await invoke({ sessionId: 'normal-session', cwd: home, transcriptPath: '/t', promise: '通常の宣言' });
+  assert.equal(calls[0][5].model, process.env.AUTO_PROGRESS_RESUME_MODEL || 'opus');
+  assert.equal('model' in calls[1][5], false);
+  assert.match(calls[0][1], /最初から通常どおり応えてください/);
+});
+
 test('watch: done は閉じ、stalled は再開1回＋Sheet報告、同日2回目は再開しない', async () => {
   // 実時刻の23時台では now + H が翌日になり、再開が正しく許可される。
   // localDay と同じローカル時刻の正午に固定して、どのTZでも同日を検証する。
