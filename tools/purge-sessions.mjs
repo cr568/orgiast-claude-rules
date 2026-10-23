@@ -313,10 +313,10 @@ function launchRemotePurge() {
   child.on('error', () => {});
   child.unref();
 }
-// スマホ側の待機セッションは PC 側の帳簿と食い違うので、6 時間ごとにサーバー API で数えて補充する。
-// 判定は mobile-standby-status.mjs 側が持ち、ここは起動の間引きだけを担う。
+// スマホ側の待機セッションは PC 側の帳簿と食い違うので、1 時間ごとにサーバー API で数えて補充する。
+// 判定は mobile-standby-status.mjs 側が持ち、ここは起動の間引きだけを担う（DM 側で 6 時間に 1 回まで間引く）。
 function launchMobileStandbyStatus() {
-  if (Date.now() - (json(path.join(root(), 'mobile-standby-status-state.json')).at ?? 0) < 6 * 60 * MINUTE) return;
+  if (Date.now() - (json(path.join(root(), 'mobile-standby-status-state.json')).at ?? 0) < 60 * MINUTE) return;
   const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mobile-standby-status.mjs');
   if (!fs.existsSync(script)) return;
   const child = spawn(process.execPath, [script, '--replenish'], { detached: true, windowsHide: true, stdio: 'ignore' });
