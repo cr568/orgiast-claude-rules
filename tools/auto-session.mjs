@@ -711,7 +711,9 @@ export function runChild(executable, prompt, repoCwd, historyCwd, timeoutMs, run
   return new Promise((resolve) => {
     const startedAt = new Date();
     const configuredChoice = autoSessionExecutor();
-    const choice = runOptions.executor === 'cheap-code'
+    const choice = runOptions.model
+      ? { ...configuredChoice, executor: 'claude' }
+      : runOptions.executor === 'cheap-code'
       ? { ...configuredChoice, executor: 'cheap-code' }
       : configuredChoice;
     let cheapProvider = choice.provider;
@@ -723,7 +725,7 @@ export function runChild(executable, prompt, repoCwd, historyCwd, timeoutMs, run
       let child;
       try { child = spawn(cheap ? process.execPath : executable, cheap
         ? buildCheapCodeArgs({ repoRoot: REPO_ROOT, provider: cheapProvider, promptFile, cwd: historyCwd })
-        : buildClaudeHeadlessArgs({ repoCwd, historyCwd, resumeSessionId: runOptions.resumeSessionId }), { detached: process.platform !== 'win32', cwd: historyCwd,
+        : buildClaudeHeadlessArgs({ repoCwd, historyCwd, resumeSessionId: runOptions.resumeSessionId, ...(runOptions.model ? { model: runOptions.model } : {}) }), { detached: process.platform !== 'win32', cwd: historyCwd,
         // cheap-code 側でも浄化するが、claude フォールバック(監督セッション)はここで
         // デスクトップ由来の CLAUDECODE / CLAUDE_CODE_* / MCP_* を外しておく。
         env: { ...sanitizeClaudeSupervisorEnv(process.env), CLAUDE_HEADLESS: '1', ORGIAST_HEADLESS_JOB: cheap ? `auto-session:cheap-code:${cheapProvider}` : 'auto-session:fallback-claude' }, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }); }

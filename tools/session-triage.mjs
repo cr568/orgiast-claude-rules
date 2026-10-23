@@ -195,7 +195,8 @@ function analyze(file, headRaw, tailRaw, headEvents, tailEvents, tailBytes) {
       lastMessageText = textOf(content);
       lastMessageEvent = event;
       endedWithError = false;
-    } else if (event?.type === 'assistant' && event?.message?.role === 'assistant') {
+    } else if (event?.type === 'assistant' && event?.message?.role === 'assistant' &&
+      event?.isApiErrorMessage !== true && event?.message?.model !== '<synthetic>') {
       const assistantText = textOf(content);
       if (assistantText) lastAssistantText = assistantText;
       lastRole = 'assistant';
