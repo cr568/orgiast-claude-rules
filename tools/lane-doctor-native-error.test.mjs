@@ -8,7 +8,7 @@ test('native 失敗はエラー末尾を残し、認証・上限なら physical_
   assert.match(src, /result\.nativeRepair && health\.lanes\[p\]\.reason === 'probe_failed'/);
 });
 test('native probe は --kind implement で codex を確実に起動し、クールダウン保留を WSL 不在と誤診断しない', () => {
-  assert.match(src, /'--force-native', '--kind', 'implement'/);
+  assert.match(src, /'--kind', 'implement', '--force-native'/);
   assert.match(src, /const deferred = \/codex_cooldown\/\.test\(text\)/);
   assert.match(src, /\(limited \|\| deferred\) \? 'cooldown'/);
 });

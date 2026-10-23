@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runOnce, invokeClaude, buildPrompt } from './autopilot-run.mjs';
+import { runOnce, invokeClaude, buildPrompt, resolveSupervisorAuth } from './autopilot-run.mjs';
 import { runAutopilot, acquireLock } from './autopilot-tick.mjs';
 
 function fixture(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'autopilot-run-test-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  return { home, dir: path.join(home, 'state'), token: '', userId: '', now: new Date('2026-09-21T01:00:00Z'), fetchImpl: async () => { throw new Error('unexpected network'); } };
+  return { home, platform: 'linux', dir: path.join(home, 'state'), token: '', userId: '', now: new Date('2026-09-21T01:00:00Z'), fetchImpl: async () => { throw new Error('unexpected network'); } };
 }
 
 test('runner does not invoke Claude when unstarted, paused, stopped, or done', async (t) => {
@@ -42,7 +42,7 @@ test('models follow planIncluded; prompt comes from skill and headless uses one 
     const opts = fixture(t);
     await runAutopilot('start', { objective: 'test' }, opts);
     const result = await runOnce({ ...opts, policy, executable: 'fake-claude', invokeImpl: async (invocation) => {
-      assert.deepEqual(invocation.args, ['-p', '--model', model, '--output-format', 'text']);
+      assert.deepEqual(invocation.args, ['-p', '--model', model, '--output-format', 'stream-json', '--verbose']);
       assert.match(invocation.prompt, /codex-do\.mjs/);
       assert.match(invocation.prompt, /ScheduleWakeup と \/loop は使用しない/);
       assert.equal(invocation.timeoutMs, 25 * 60_000);
@@ -328,4 +328,47 @@ test('進捗報告: 12:00 枠・21:00 枠でそれぞれ 1 回だけ送る。同
   // 起床 6: 21:30 JST (21:00 枠の2回目の起床 -> 二重送信しない)
   await runOnce({ ...opts, now: new Date('2026-10-14T21:30:00+09:00'), invokeImpl: async () => ({ exitCode: 0 }) });
   assert.equal(sent.length, 2);
+});
+
+test('resolveSupervisorAuth: OAuth が死んでいる時だけ deepseek.env の鍵へ切り替える', () => {
+  const files = (map) => (file) => {
+    const name = path.basename(String(file));
+    if (!(name in map)) throw new Error('ENOENT');
+    return map[name];
+  };
+  const creds = (token) => JSON.stringify({ claudeAiOauth: { accessToken: token } });
+
+  const envLane = resolveSupervisorAuth({ home: 'H', env: { ANTHROPIC_AUTH_TOKEN: 'x' }, readFile: files({}) });
+  assert.equal(envLane.lane, 'env');
+  assert.equal(envLane.model, null);
+
+  const oauthEnv = { PATH: 'q' };
+  const oauthLane = resolveSupervisorAuth({ home: 'H', env: oauthEnv, readFile: files({ '.credentials.json': creds('tok') }) });
+  assert.equal(oauthLane.lane, 'oauth');
+  assert.equal(oauthLane.model, null);
+  assert.equal(oauthLane.env, oauthEnv);
+
+  const dead = files({ '.credentials.json': creds(''), 'deepseek.env': 'DEEPSEEK_API_KEY="sk-test"\n' });
+  const fallback = resolveSupervisorAuth({ home: 'H', env: { PATH: 'p' }, readFile: dead });
+  assert.equal(fallback.lane, 'deepseek');
+  assert.equal(fallback.model, 'deepseek-v4-flash');
+  assert.equal(fallback.env.ANTHROPIC_AUTH_TOKEN, 'sk-test');
+  assert.equal(fallback.env.ANTHROPIC_BASE_URL, 'https://api.deepseek.com/anthropic');
+  assert.equal(fallback.env.PATH, 'p');
+
+  const noKey = resolveSupervisorAuth({ home: 'H', env: {}, readFile: files({ '.credentials.json': creds('') }) });
+  assert.equal(noKey.lane, 'none');
+  assert.equal(noKey.model, null);
+  assert.equal(resolveSupervisorAuth({ home: 'H', env: {}, readFile: files({}) }).lane, 'none');
+});
+
+test('streaming records tool stage before timeout without persisting tool arguments', async t => {
+  const opts = fixture(t);
+  const events = [];
+  const program = `console.log(JSON.stringify({type:'assistant',message:{content:[{type:'tool_use',name:'Bash',input:{command:'SECRET'}}]}})); setInterval(()=>{},1000)`;
+  const result = await invokeClaude({ executable: process.execPath, args: ['-e', program, '--', 'stream-json'], prompt: '', cwd: opts.home, timeoutMs: 500, onProgress: e => events.push(e) });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.lastStage, 'tool:Bash');
+  assert.deepEqual(events, [{ stage: 'tool:Bash' }]);
+  assert.doesNotMatch(JSON.stringify(result), /SECRET/);
 });

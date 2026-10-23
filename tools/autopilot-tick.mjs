@@ -8,7 +8,10 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { isEntry } from './is-entry.mjs';
 import { toPlainJa } from './lib/plain-ja.mjs';
-import { notifyKim, clipDiscordContent } from './notify-kim.mjs';
+import { notifyKim, deliverKim, clipDiscordContent } from './notify-kim.mjs';
+
+import { localNotice, noticeRecipient } from './autopilot-local-notice.mjs';
+import { waitingDigest, acknowledgeWaiting } from './waiting-on-user.mjs';
 
 const API = 'https://discord.com/api/v10';
 const DEFAULTS = { maxIterPerDay: 20, maxHoursPerDay: 6, maxNoop: 3, maxTotalIter: 200 };
@@ -129,6 +132,34 @@ const REASON_TEXT = {
 };
 const reasonText = (reason) => REASON_TEXT[reason] || '止まりました。';
 const autoResumes = (reason) => reason === 'daily_iter_cap' || reason === 'daily_hours_cap';
+// A runner error is usually "the CLI could not authenticate" (an expired OAuth login).
+// The owner fixes that by logging in once, which rewrites ~/.claude/.credentials.json.
+// Nothing used to look at the file, so a run that paused after 3 errors stayed dead even
+// after the cause was gone: the resume task is one-shot and watchdog() skips paused runs.
+// The probe stays cheap and local — no child launch.
+function credentialsRefreshedSince(state, paths) {
+  const since = Date.parse(state.lastRunnerErrorAt || '');
+  if (!Number.isFinite(since)) return false;
+  try { return fs.statSync(path.join(paths.home, '.claude', '.credentials.json')).mtimeMs > since; } catch { return false; }
+}
+// A dead OAuth login no longer has to stop the run: autopilot-run.mjs passes the
+// ~/.claude/deepseek.env key to the child when the Claude credentials are empty.
+// Nothing lifted the 3-strike pause for that lane, so a PC whose login is never renewed
+// stayed paused forever although the child would now start (2026-10-20 実測: 全tickが
+// skipped:runner_error のまま、credentials は 2026-10-17T04:27Z で不変).
+// Keep a quiet gap so a broken fallback key retries at a human pace, not every tick.
+const FALLBACK_RESUME_COOLDOWN_MS = 30 * 60_000;
+function fallbackKeyAvailable(paths) {
+  try {
+    const env = fs.readFileSync(path.join(paths.home, '.claude', 'deepseek.env'), 'utf8');
+    return /^\s*DEEPSEEK_API_KEY\s*=\s*["']?[^\s"']+/m.test(env);
+  } catch { return false; }
+}
+function fallbackResumeReady(state, paths, now) {
+  if (!fallbackKeyAvailable(paths)) return false;
+  const since = Date.parse(state.lastRunnerErrorAt || '');
+  return !Number.isFinite(since) || now.getTime() - since >= FALLBACK_RESUME_COOLDOWN_MS;
+}
 export function digestSlot(date) {
   const d = new Date(date);
   const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Tokyo', hour: 'numeric', hourCycle: 'h23' }).format(d));
@@ -318,10 +349,16 @@ export async function sendNotice(text, ctx) {
     }
   } catch (error) { mirrorError = error.message; }
   // Normalize once so both destinations receive the exact same final DM body.
-  if (command) text = clipDiscordContent(process.env.NOTIFY_PLAIN_JA === '0' ? text : await toPlainJa(String(text)));
-  let result;
-  try { result = await ctx.notifyImpl(text, { home: ctx.home, token: ctx.token, userId: ctx.userId, fetchImpl: ctx.fetchImpl, webhookFallback: false, ...(command ? { plainJa: false } : {}) }); }
-  catch { result = { delivered: 'none' }; }
+  if (command && !ctx.periodicDigest) text = clipDiscordContent(process.env.NOTIFY_PLAIN_JA === '0' ? text : await toPlainJa(String(text)));
+  const channels = await localNotice(text, ctx);
+  let result, recipient;
+  try {
+    recipient = noticeRecipient(ctx.home, ctx.userId);
+    result = await ctx.notifyImpl(text, { home: ctx.home, token: ctx.token, userId: recipient.userId, fetchImpl: ctx.fetchImpl, webhookFallback: false, ...(command || ctx.periodicDigest ? { plainJa: false } : {}) });
+  } catch (error) { result = { delivered: 'none', reason: error.code || error.message }; }
+  result ||= { delivered: 'unknown' };
+  if (result.delivered === 'dm' && recipient?.notOwner) result = { ...result, delivered: 'dm-not-owner' };
+  result = { ...result, channels: { dm: { status: result.delivered, ...(result.reason ? { reason: result.reason } : {}) }, ...channels } };
   if (command) {
     try { await mirrorNotice(command, text, ctx); }
     catch (error) { mirrorError = error.message; }
@@ -495,6 +532,16 @@ async function execute(command, args, ctx) {
       && !capReason(state, objective, summarize(log, todayKey))) {
       resumeState(state);
     }
+    // The 3-strike runner-error pause is a dead end for the owner: re-login fixes the
+    // cause, but no timer lifts the pause. Lift it once the credentials were rewritten
+    // after the failure, or once the deepseek fallback lane can carry the child while the
+    // login stays dead. The counter resets, so a still-broken lane pauses again after
+    // 3 fresh errors instead of relaunching the child every tick.
+    if (state.status === 'paused' && state.pausedReason === 'runner_error'
+      && (state.consecutiveRunnerErrors || 0) >= 3 && !state.pendingQuestion
+      && (credentialsRefreshedSince(state, paths) || fallbackResumeReady(state, paths, now))) {
+      resumeState(state);
+    }
     // No candidate and no command: leave a completed run byte-for-byte intact.
     if (state.status !== 'done' || control) {
       state.controlCursors = { ...state.controlCursors, ...result.cursors };
@@ -592,11 +639,22 @@ async function execute(command, args, ctx) {
   if (command === 'digest') {
     if (!state) return { ok: false, reason: 'not_started' };
     const slot = digestSlot(now);
-    if (!slot || state.lastDigestSlot === slot) return { ok: false, skipped: 'not_due_or_already_sent' };
+    if (!args['dry-run'] && (!slot || state.lastDigestSlot === slot)) return { ok: false, skipped: 'not_due_or_already_sent' };
     const rowsSince = (state.lastDigestIteration !== undefined)
       ? log.filter((r) => r.iteration > state.lastDigestIteration)
       : log.filter((r) => !state.lastDigestAt || Date.parse(r.ts) > Date.parse(state.lastDigestAt));
-    const text = formatPeriodicDigest({ hostname: ctx.hostname, objective, state, rowsSince });
+    let waiting = { text: '', completedIds: [] };
+    try {
+      waiting = await waitingDigest({ home: ctx.home, now, checkImpl: ctx.checkImpl, persist: !args['dry-run'] });
+    } catch (error) {
+      // 台帳が壊れていても定時報告そのものは止めない。原因は run.log に残す。
+      try {
+        fs.mkdirSync(paths.dir, { recursive: true });
+        fs.appendFileSync(path.join(paths.dir, 'run.log'), `${JSON.stringify({ ts: now.toISOString(), waitingError: error.code || error.message })}\n`, 'utf8');
+      } catch { /* 記録失敗で報告を落とさない */ }
+    }
+    const text = formatPeriodicDigest({ hostname: ctx.hostname, objective, state, rowsSince }) + waiting.text;
+    if (args['dry-run']) return { ok: true, dryRun: true, text };
     state.lastDigestSlot = slot;
     state.lastDigestAt = now.toISOString();
     state.lastDigestIteration = state.totalIterations;
@@ -605,10 +663,20 @@ async function execute(command, args, ctx) {
     // sendNotice swallows delivery failures, so "no error in run.log" is not
     // evidence that the DM arrived (2026-10-17 実測)。呼び出し側が run.log に
     // delivered を残せるよう、結果を戻り値と state の両方に載せる。
-    const delivery = await sendNotice(text, ctx);
+    const delivery = await sendNotice(text, { ...ctx, periodicDigest: true });
+    if (delivery.delivered === 'dm' || delivery.channels.toast.status === 'submitted' || delivery.channels.file.status === 'written') {
+      // 送信済みの報告を、後片付けの失敗で「失敗した周」にしない。
+      try { await acknowledgeWaiting(waiting.completedIds, { home: ctx.home, now }); }
+      catch (error) {
+        try {
+          fs.appendFileSync(path.join(paths.dir, 'run.log'), `${JSON.stringify({ ts: now.toISOString(), waitingAckError: error.code || error.message })}\n`, 'utf8');
+        } catch { /* 記録失敗で報告を落とさない */ }
+      }
+    }
+    state.lastDigestChannels = delivery.channels;
     state.lastDigestDelivered = delivery?.delivered ?? 'unknown';
     save();
-    return { ok: true, slot, text, delivered: state.lastDigestDelivered };
+    return { ok: true, slot, text, delivered: state.lastDigestDelivered, channels: delivery.channels };
   }
   if (['stop', 'pause', 'resume'].includes(command)) {
     if (command === 'resume') {
@@ -631,6 +699,7 @@ async function execute(command, args, ctx) {
     }
     if (command === 'pause' && args.reason === 'runner_error') {
       state.consecutiveRunnerErrors = (state.consecutiveRunnerErrors || 0) + 1;
+      state.lastRunnerErrorAt = now.toISOString();
       const n = state.consecutiveRunnerErrors;
       if (n < 3) {
         const backoffMin = 30 * Math.pow(2, n - 1);
@@ -678,8 +747,8 @@ export async function runAutopilot(command, args = {}, options = {}) {
     if (!release) return { error: 'busy' };
     const home = paths.home;
     const token = options.token ?? (process.env.DISCORD_BOT_TOKEN?.trim() || readText(path.join(home, '.claude', 'orgiast-discord-bot-token.txt')));
-    const userId = options.userId ?? (process.env.ORGIAST_DISCORD_USER_ID?.trim() || readText(path.join(home, '.claude', 'orgiast-discord-user-id.txt')));
-    return await execute(command, args, { paths, home, token, userId, now: options.now || new Date(), hostname: options.hostname || os.hostname(), fetchImpl: options.fetchImpl || globalThis.fetch, askImpl: options.askImpl || askCandidate, notifyImpl: options.notifyImpl || notifyKim, spawnImpl: options.spawnImpl, mirrorTimeoutMs: options.mirrorTimeoutMs });
+    const userId = noticeRecipient(home, options.userId ?? (process.env.ORGIAST_DISCORD_USER_ID?.trim() || readText(path.join(home, '.claude', 'orgiast-discord-user-id.txt')))).userId;
+    return await execute(command, args, { paths, home, token, userId, now: options.now || new Date(), hostname: options.hostname || os.hostname(), fetchImpl: options.fetchImpl || globalThis.fetch, askImpl: options.askImpl || askCandidate, notifyImpl: options.notifyImpl || (command === 'digest' ? deliverKim : notifyKim), platform: options.platform, execFileImpl: options.execFileImpl, checkImpl: options.checkImpl, spawnImpl: options.spawnImpl, mirrorTimeoutMs: options.mirrorTimeoutMs });
   } catch (error) { return { error: error.code || error.message || 'autopilot_error' }; }
   finally { release?.(); }
 }
@@ -687,7 +756,7 @@ export async function runAutopilot(command, args = {}, options = {}) {
 export async function main(argv = process.argv.slice(2)) {
   try {
     const options = Object.fromEntries(['objective', 'done', 'max-iter-per-day', 'max-hours-per-day', 'max-noop', 'max-total-iter', 'summary', 'progress', 'tokens-out', 'next-delay', 'reason', 'question', 'question-deadline', 'evidence', 'unverified', 'id', 'result', 'note', 'detail'].map((key) => [key, { type: 'string' }]));
-    for (const key of ['noop', 'codex', 'pretty']) options[key] = { type: 'boolean' };
+    for (const key of ['noop', 'codex', 'pretty', 'dry-run']) options[key] = { type: 'boolean' };
     const { values, positionals } = parseArgs({ args: argv, options, allowPositionals: true });
     const result = await runAutopilot(positionals[0], values);
     if (values.pretty && result.state) result.text = `autopilot: ${result.state.status} / ${result.objective.objective}\n今日 ${result.today.iterations}周 / 合計 ${result.state.totalIterations}周 / 進捗 ${result.today.progressTo}% / ${result.state.pausedReason || '制限内'}`;

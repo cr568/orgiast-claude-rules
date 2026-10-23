@@ -5,6 +5,28 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
+test('setup converge timeout covers Node updates on new and existing PCs, idempotently', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'register-hooks-node-runtime-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const repo = path.resolve('.');
+  const settingsFile = path.join(home, '.claude', 'settings.json');
+  const run = () => execFileSync(process.execPath, [path.join(repo, 'tools/register-hooks.mjs'), '--hooks-only'], {
+    encoding: 'utf8', env: { ...process.env, ORGIAST_HOME: home, ORGIAST_REPO: repo },
+  });
+  run();
+  const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  const hooks = settings.hooks.SessionStart.flatMap((group) => group.hooks).filter((hook) => hook.command.includes('setup.mjs'));
+  assert.equal(hooks.length, 1);
+  assert.equal(hooks[0].timeout, 1200);
+  hooks[0].timeout = 60;
+  fs.writeFileSync(settingsFile, JSON.stringify(settings));
+  run();
+  const repaired = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  assert.equal(repaired.hooks.SessionStart.flatMap((group) => group.hooks).find((hook) => hook.command.includes('setup.mjs')).timeout, 1200);
+  run();
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), repaired);
+});
+
 test('既存PowerShell hookへExecutionPolicy Bypassを補いcost-loopをmjsへ移行する', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'register-hooks-'));
   const repo = path.resolve('.');
@@ -45,6 +67,9 @@ test('session-relaunch hook は同期で1本だけ登録され、再実行で重
   assert.match(hooks[0].command, /session-relaunch\.mjs" --hook$/);
   assert.equal(hooks[0].timeout, 10);
   assert.equal('async' in hooks[0], false);
+  const planHooks = settings.hooks.UserPromptSubmit.flatMap(group => group.hooks || []).filter(hook => hook.command.includes('plan-usage-report.mjs'));
+  assert.equal(planHooks.length, 1);
+  assert.match(planHooks[0].command, /plan-usage-report\.mjs" --hook$/);
   assert.match(second, /hook は既に登録済み\(変更なし\)/);
   fs.rmSync(home, { recursive: true, force: true });
 });
@@ -401,4 +426,41 @@ test('billing and implementation approval register synchronously, globally and i
     assert.equal(groups.length, 1); assert.equal(groups[0].matcher, undefined);
     const hook = groups[0].hooks.find(h => h.command.includes(name)); assert.equal(hook.timeout, 5); assert.ok(!hook.async);
   }
+});
+
+test('bihin K-column gate registers once with Sheets writes and both shells', async t => {
+  const { HOOK_MATCHER } = await import('./bihin-kcol-gate.mjs');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'register-bihin-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  // Reproduce the path/name collision even in CI checkouts named differently.
+  const repo = path.join(home, 'bihin-kcol-gate');
+  fs.symlinkSync(path.resolve('.'), repo, 'junction');
+  const env = { ...process.env, ORGIAST_HOME: home, ORGIAST_REPO: repo };
+  for (let n = 0; n < 2; n++) execFileSync(process.execPath, [path.join(repo, 'tools/register-hooks.mjs'), '--hooks-only'], { env, encoding: 'utf8' });
+  const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude/settings.json'), 'utf8'));
+  const groups = settings.hooks.PreToolUse.filter(g => g.hooks.some(h => h.command.includes('bihin-kcol-gate.mjs')));
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].matcher, HOOK_MATCHER);
+  assert.equal(groups[0].hooks[0].timeout, 15); // runner adds its five-second budget
+  assert.match(groups[0].hooks[0].command, /gate-hook-runner/);
+});
+
+test('全OSの旧e2e/verify ps1登録を同期Stop mjsへ収束し再実行で不変', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-migration-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const file = path.join(home, '.claude/settings.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const commands = ['C:\\Users\\uers\\.claude\\hooks\\', '/Users/test/.claude/hooks/', '/home/test/.claude/hooks/'].flatMap(root => ['check-e2e-before-stop', 'verify-before-done-detector'].map(name => `pwsh -File "${root}${name}.ps1"`));
+  fs.writeFileSync(file, JSON.stringify({ hooks: { Stop: [{ hooks: commands.map(command => ({ command, async: true })) }] } }));
+  const run = () => execFileSync(process.execPath, [path.resolve('tools/register-hooks.mjs'), '--hooks-only'], { env: { ...process.env, ORGIAST_HOME: home, ORGIAST_REPO: path.resolve('.') } });
+  run();
+  const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const hooks = settings.hooks.Stop.flatMap(g => g.hooks);
+  for (const name of ['check-e2e-before-stop', 'verify-before-done-detector']) {
+    assert.equal(hooks.filter(h => h.command.includes(name + '.ps1')).length, 0);
+    const current = hooks.filter(h => h.command.includes(name + '.mjs'));
+    assert.equal(current.length, 1);
+    assert.notEqual(current[0].async, true);
+  }
+  run(); assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), settings);
 });

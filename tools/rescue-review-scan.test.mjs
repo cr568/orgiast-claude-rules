@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { scanRescueBranches } from './rescue-review-scan.mjs';
+import { scanRescueBranches, isNoisePath, isNoiseBranch } from './rescue-review-scan.mjs';
 
 // import.meta.url からスクリプトのディレクトリを求める。
 // 手組みの file:// 剥がしは POSIX で先頭スラッシュまで削れて path.resolve が cwd 相対になり、
@@ -31,7 +31,7 @@ function realGit(dir, args) {
   return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-function fixture(t, { featureBranch = false, squashedMerge = false, cherryPickedFirst = false } = {}) {
+function fixture(t, { featureBranch = false, squashedMerge = false, cherryPickedFirst = false, ignoredArtifact = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rescue-review-scan-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const repo = path.join(root, 'repo');
@@ -43,6 +43,18 @@ function fixture(t, { featureBranch = false, squashedMerge = false, cherryPicked
   fs.writeFileSync(path.join(repo, 'a.txt'), 'base');
   git('add', '.');
   git('commit', '-m', 'base');
+
+  if (ignoredArtifact) {
+    fs.writeFileSync(path.join(repo, '.gitignore'), '.stall-sweeper/\n');
+    git('add', '.gitignore');
+    git('commit', '-m', 'ignore runtime artifacts');
+    git('checkout', '-b', 'rescue/ignored', 'main');
+    fs.mkdirSync(path.join(repo, '.stall-sweeper'));
+    fs.writeFileSync(path.join(repo, '.stall-sweeper', 'probe.evidence.md'), 'runtime evidence\n');
+    git('add', '-f', '.stall-sweeper/probe.evidence.md');
+    git('commit', '-m', 'rescue ignored artifact');
+    git('checkout', 'main');
+  }
 
   // rescue/u1: a.txt を x に変更
   git('checkout', '-b', 'rescue/u1', 'main');
@@ -211,7 +223,7 @@ test('CLI 既定出力はサマリ行を先頭に出す', t => {
   const script = path.join(dirOf(import.meta.url), 'rescue-review-scan.mjs');
   const out = execFileSync(process.execPath, [script, '--repo', f.repo, '--main', 'main'], { encoding: 'utf8' });
   const lines = out.trim().split('\n');
-  assert.equal(lines[0], 'unique: 2 / duplicate: 1 / covered: 1 / covered-by-branch: 0 / covered-in-main: 0 / error: 0');
+  assert.equal(lines[0], 'unique: 2 / duplicate: 1 / covered: 1 / covered-by-branch: 0 / covered-in-main: 0 / error: 0 / ignored-only: 0');
   assert.equal(lines.length, 5);
 });
 
@@ -231,6 +243,21 @@ test('compareRefs を空にすると照合せず unique に戻る', t => {
   const f = fixture(t, { featureBranch: true });
   const m = byBranch(scanRescueBranches({ repo: f.repo, main: 'main', compareRefs: [] }));
   assert.equal(m['rescue/u3'].status, 'unique');
+});
+
+// 実測: origin の sync-orgiast-main-* は origin/main との差分が約 90MB あり、
+// spawnSync の既定 maxBuffer(1MB)だと ENOBUFS で error に落ちていた。
+test('1MB を超える差分でも ENOBUFS で error にならず分類できる', t => {
+  const f = fixture(t);
+  f.git('checkout', '-b', 'rescue/large', 'main');
+  fs.writeFileSync(path.join(f.repo, 'large.txt'), 'x'.repeat(2 * 1024 * 1024));
+  f.git('add', '.');
+  f.git('commit', '-m', 'large change');
+  f.git('checkout', 'main');
+
+  const m = byBranch(scanRescueBranches({ repo: f.repo, main: 'main' }));
+  assert.equal(m['rescue/large'].status, 'unique');
+  assert.equal(m['rescue/large'].files, 1);
 });
 
 test('照合先の git 失敗は握りつぶし、rescue 側の分類を壊さない', t => {
@@ -256,7 +283,44 @@ test('CLI --no-compare-refs は照合を切り、サマリに covered-by-branch 
   assert.equal(withRefs.summary.coveredByBranch, 1);
   assert.equal(withRefs.summary.unique, 1);
   const without = execFileSync(process.execPath, [script, '--repo', f.repo, '--main', 'main', '--no-compare-refs'], { encoding: 'utf8' });
-  assert.equal(without.trim().split('\n')[0], 'unique: 2 / duplicate: 1 / covered: 1 / covered-by-branch: 0 / covered-in-main: 0 / error: 0');
+  assert.equal(without.trim().split('\n')[0], 'unique: 2 / duplicate: 1 / covered: 1 / covered-by-branch: 0 / covered-in-main: 0 / error: 0 / ignored-only: 0');
+});
+
+test('gitignore 済みの実行時成果物だけの枝は ignored-only になる', t => {
+  const f = fixture(t, { ignoredArtifact: true });
+  const b = byBranch(scanRescueBranches({ repo: f.repo, main: 'main' }))['rescue/ignored'];
+  assert.equal(b.status, 'ignored-only');
+  assert.deepEqual(b.ignoredFiles, ['.stall-sweeper/probe.evidence.md']);
+});
+
+test('ignoreCheck=false なら ignored-only 判定を切って unique に戻る', t => {
+  const f = fixture(t, { ignoredArtifact: true });
+  const b = byBranch(scanRescueBranches({ repo: f.repo, main: 'main', ignoreCheck: false }))['rescue/ignored'];
+  assert.equal(b.status, 'unique');
+});
+
+test('実行時成果物と通常ファイルが混在する枝は unique のまま', t => {
+  const f = fixture(t, { ignoredArtifact: true });
+  f.git('checkout', '-b', 'rescue/mixed', 'main');
+  fs.mkdirSync(path.join(f.repo, '.stall-sweeper'));
+  fs.writeFileSync(path.join(f.repo, '.stall-sweeper', 'x.md'), 'runtime\n');
+  fs.writeFileSync(path.join(f.repo, 'b.txt'), 'normal\n');
+  f.git('add', 'b.txt');
+  f.git('add', '-f', '.stall-sweeper/x.md');
+  f.git('commit', '-m', 'mixed rescue');
+  f.git('checkout', 'main');
+  const b = byBranch(scanRescueBranches({ repo: f.repo, main: 'main' }))['rescue/mixed'];
+  assert.equal(b.status, 'unique');
+});
+
+test('CLI は ignored-only を JSON と既定サマリに出す', t => {
+  const f = fixture(t, { ignoredArtifact: true });
+  const script = path.join(dirOf(import.meta.url), 'rescue-review-scan.mjs');
+  const args = [script, '--repo', f.repo, '--main', 'main'];
+  const json = JSON.parse(execFileSync(process.execPath, [...args, '--json'], { encoding: 'utf8' }));
+  assert.equal(json.summary.ignoredOnly, 1);
+  const out = execFileSync(process.execPath, args, { encoding: 'utf8' });
+  assert.match(out.trim().split('\n')[0], /ignored-only: 1/);
 });
 
 // 同じ共通祖先から rescue のドラフトと main の改訂版を別々に作る。
@@ -310,4 +374,126 @@ test('変更ファイルが main に存在しなければ unique に残す', t =
   const f = supersededFixture(t, { missingFile: true });
   const b = byBranch(scanRescueBranches({ repo: f.repo, main: 'main' }))['rescue/draft'];
   assert.equal(b.status, 'unique');
+});
+
+test('isNoisePath は fleet 指令・実行時成果物・.tmp- をノイズと判定する', () => {
+  for (const p of [
+    'fleet-directives.json',
+    'fleet-command.json',
+    'tools/handoff-audit-knowledge.json',
+    'logs/20261021.log',
+    'runs/x/out.txt',
+    '.work/notes.md',
+    '.stall-sweeper/probe.evidence.md',
+    '.codex-prompts/prompt-1.md',
+    'tools/.tmp-abc123/output.txt',
+    './logs/nested/deep.log',
+    '.work/win\\style.md',
+    '.tmp-not-a-dir/file.txt',
+  ]) {
+    assert.equal(isNoisePath(p), true, `expected noise: ${p}`);
+  }
+  for (const p of [
+    'tools/rescue-review-scan.mjs',
+    'tools/rescue-review-scan.test.mjs',
+    'fleet-directives.json.bak',
+    'tools/fleet-directives.json',
+    'fleet-command.json.example',
+    'logs.md',
+    'runs.txt',
+    'src/logs/handler.ts',
+    'tools/handoff-audit-knowledge.json.bak',
+    '',
+    null,
+  ]) {
+    assert.equal(isNoisePath(p), false, `expected non-noise: ${p}`);
+  }
+});
+
+test('isNoiseBranch は rescue/sync-* 系だけをノイズと判定する', () => {
+  for (const name of ['rescue/sync-orgiast-main-20261021', 'rescues/sync-x', 'origin/rescue/sync-orgiast-main-1']) {
+    assert.equal(isNoiseBranch(name), true, `expected noise branch: ${name}`);
+  }
+  for (const name of ['rescue/auto-session-20261021-101010', 'rescue/syncx', 'rescue/syncorg', 'rescue/u1', 'feature/sync-x', '']) {
+    assert.equal(isNoiseBranch(name), false, `expected non-noise branch: ${name}`);
+  }
+});
+
+// --todo 用: 同期枝と「全ファイルがノイズ」の枝を足したフィクスチャ。
+function todoFixture(t) {
+  const f = fixture(t);
+  // 枝名が同期枝 → ファイルは通常でも除外
+  f.git('checkout', '-b', 'rescue/sync-orgiast-main-20261021', 'main');
+  fs.writeFileSync(path.join(f.repo, 'sync.txt'), 'synced\n');
+  f.git('add', '.');
+  f.git('commit', '-m', 'sync branch change');
+  f.git('checkout', 'main');
+
+  // 全ファイルがノイズ → 除外
+  f.git('checkout', '-b', 'rescue/noisy', 'main');
+  fs.writeFileSync(path.join(f.repo, 'fleet-directives.json'), '{}\n');
+  fs.mkdirSync(path.join(f.repo, 'logs'), { recursive: true });
+  fs.writeFileSync(path.join(f.repo, 'logs', 'run.log'), 'noise\n');
+  f.git('add', '-f', '.');
+  f.git('commit', '-m', 'noise only rescue');
+  f.git('checkout', 'main');
+
+  // ノイズ + 通常ファイル混在 → 残す
+  f.git('checkout', '-b', 'rescue/mixednoise', 'main');
+  fs.writeFileSync(path.join(f.repo, 'fleet-command.json'), '{}\n');
+  fs.writeFileSync(path.join(f.repo, 'd.txt'), 'real\n');
+  f.git('add', '.');
+  f.git('commit', '-m', 'mixed noise rescue');
+  f.git('checkout', 'main');
+  return f;
+}
+
+test('CLI --todo は同期枝とノイズのみの枝を除外してレビュー TODO を出す', t => {
+  const f = todoFixture(t);
+  const script = path.join(dirOf(import.meta.url), 'rescue-review-scan.mjs');
+  const out = execFileSync(process.execPath, [script, '--repo', f.repo, '--main', 'main', '--todo'], { encoding: 'utf8' });
+  const lines = out.trim().split('\n');
+  // unique は u1/u3/sync/noisy/mixednoise の5本 → 実対象は u1/u3/mixednoise の3本
+  assert.equal(lines[0], '## rescue レビュー TODO (unique 5 → 実対象 3)');
+  assert.deepEqual(lines.slice(1).map(l => /^\- \[ \] (\S+) —/.exec(l)[1]), ['rescue/mixednoise', 'rescue/u1', 'rescue/u3']);
+  assert.ok(!out.includes('rescue/sync-orgiast-main-20261021'));
+  assert.ok(!out.includes('rescue/noisy'));
+  assert.match(out, /^- \[ \] rescue\/u1 — 1 files 1\+\/1- \(a\.txt\)$/m);
+  assert.match(out, /^- \[ \] rescue\/mixednoise — 2 files 2\+\/0- \(d\.txt, fleet-command\.json\)$/m);
+});
+
+test('CLI --todo は実対象が無ければ (なし) を出す', t => {
+  const f = fixture(t);
+  const script = path.join(dirOf(import.meta.url), 'rescue-review-scan.mjs');
+  // u1/u3 は unique のままなので、unique 0 にはならない → ノイズだけの枝を1本足して残りを除外できないことを確認
+  const out = execFileSync(process.execPath, [script, '--repo', f.repo, '--main', 'main', '--todo'], { encoding: 'utf8' });
+  assert.equal(out.trim().split('\n')[0], '## rescue レビュー TODO (unique 2 → 実対象 2)');
+
+  // 全 unique がノイズ相当になる枝だけのリポジトリ
+  const g = fs.mkdtempSync(path.join(os.tmpdir(), 'rescue-review-scan-todo-'));
+  t.after(() => fs.rmSync(g, { recursive: true, force: true }));
+  const git = (...args) => execFileSync('git', ['-C', g, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  git('init', '-b', 'main');
+  git('config', 'user.name', 'Test');
+  git('config', 'user.email', 'test@example.invalid');
+  fs.writeFileSync(path.join(g, 'a.txt'), 'base');
+  git('add', '.');
+  git('commit', '-m', 'base');
+  git('checkout', '-b', 'rescue/onlynoise', 'main');
+  fs.mkdirSync(path.join(g, '.work'));
+  fs.writeFileSync(path.join(g, '.work', 'scratch.md'), 'x\n');
+  git('add', '-f', '.');
+  git('commit', '-m', 'only noise');
+  git('checkout', 'main');
+  const empty = execFileSync(process.execPath, [script, '--repo', g, '--main', 'main', '--todo'], { encoding: 'utf8' });
+  assert.deepEqual(empty.trim().split('\n'), ['## rescue レビュー TODO (unique 1 → 実対象 0)', '- (なし)']);
+});
+
+test('CLI --todo と --json 併用時は --json が優先される', t => {
+  const f = todoFixture(t);
+  const script = path.join(dirOf(import.meta.url), 'rescue-review-scan.mjs');
+  const out = execFileSync(process.execPath, [script, '--repo', f.repo, '--main', 'main', '--todo', '--json'], { encoding: 'utf8' });
+  const parsed = JSON.parse(out);
+  assert.equal(parsed.summary.unique, 5);
+  assert.ok(!out.includes('## rescue レビュー TODO'));
 });

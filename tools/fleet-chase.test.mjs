@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { POLICY, CATEGORY, DAY, HOUR, iso, makeItem, ingest, checkLedger, chase, digest, digestText,
   control, work, runChase, loadLedger, saveJson, ledgerPath, parseArgs, resendBody } from './fleet-chase.mjs';
+import { SEND_CAP_PER_TARGET } from './lib/fleet-chase-actions.mjs';
 import { TERMINAL_STATUSES, parseExecMarkers, acquireLock } from './fleet-mail.mjs';
 import { main as register, TASK_NAME } from './register-fleet-chase.mjs';
 const NOW = Date.parse('2026-10-18T03:00:00Z');
@@ -59,7 +60,7 @@ test('initial age > policy threshold is stale, never re-stales revived entries',
   assert.equal(item.status, 'open'); assert.match(digestText(f.ledger, f.ctx), /蘇生: --revive/);
 });
 test('GAS done closes outbound, cache done alone cannot; blockers derive a single inbound item', async t => {
-  const f = fixture(t), done = f.add(), blocked = f.add(mail('mail-blocked')), cached = f.add(mail('mail-cached'));
+  const f = fixture(t), done = f.add(), blocked = f.add(mail('mail-blocked', { from: 'other-PC' })), cached = f.add(mail('mail-cached'));
   saveJson(path.join(f.dir, 'fleet-mail-sent-status.json'), { [cached.mailId]: { status: 'done', resultBody: '完了' } });
   const request = async (_kind, { id }) => ({ ok: true, mail: { id, status: id === cached.mailId ? 'expired' : 'done',
     resultBody: id === blocked.mailId ? 'BLOCKED: push の権限がない' : 'commit abc123', resultAt: iso(NOW) } });
@@ -239,13 +240,60 @@ test('unverified originals or failed checks cannot trigger a blind resend after 
   plans = await chase(f.ledger, f.ctx); assert.equal(plans[0].action, '状態確認待ち'); assert.equal(f.requests.length, 0);
 });
 test('recovering blocker closes derived debt on fresh authoritative evidence', async t => {
-  const f = fixture(t), item = f.add();
+  const f = fixture(t), item = f.add(mail('mail-original', { from: 'other-PC' }));
   const request = body => async (_kind, { id }) => ({ ok: true, mail: { id, status: 'done', resultBody: body, resultAt: iso(NOW) } });
   await checkLedger(f.ledger, { ...f.ctx, request: request('BLOCKED') });
   assert.equal(item.status, 'blocked');
   await checkLedger(f.ledger, { ...f.ctx, request: request('commit abc123') });
   assert.equal(item.status, 'done');
   assert.ok(Object.values(f.ledger.items).filter(i => i.derivedFrom === item.id).every(i => i.status === 'done'));
+});
+for (const reason of ['self-originated', 'reply', 'auto-reply', 'inbox-done']) {
+  test(`blocker guard excludes ${reason} at creation and from persisted work`, async t => {
+    const f = fixture(t);
+    // Resolve the configured label, rather than hard-coding kim-PC.
+    fs.writeFileSync(path.join(f.dir, 'cost-reporter.env'), 'REPORTER_LABEL=local-PC\n');
+    const original = mail('mail-loop', { from: reason === 'self-originated' ? 'local-PC' : 'other-PC' });
+    const parent = f.add(original);
+    if (reason === 'inbox-done') f.put({ ...original, status: 'done', resultBody: 'BLOCKED' });
+    else if (reason !== 'self-originated') f.sent([{ id: original.id, action: reason, at: iso(NOW) }]);
+    const ctx = { ...f.ctx, request: async () => ({ ok: true, mail: { id: original.id, status: 'done', resultBody: 'exit=1' } }) };
+    await checkLedger(f.ledger, ctx);
+    assert.equal(parent.status, 'blocked'); // The original request is still unresolved.
+    const id = `inbound-blocker-${original.id}`;
+    assert.equal(f.ledger.items[id], undefined);
+    assert.ok(f.errors.includes(`fleet-chase: skip ${original.id} (${reason})`));
+
+    // A previous version may already have stored the blocker with a rewritten sender.
+    f.ledger.items[id] = { ...makeItem({ ...original, from: original.to, to: 'local-PC' }, 'inbound', NOW),
+      id, derivedFrom: parent.id };
+    saveJson(path.join(f.dir, 'fleet-agent-optin.json'), { accept: ['prompt'] });
+    f.errors.length = 0;
+    const result = await work(f.ledger, { ...f.ctx,
+      resolveExe: () => assert.fail('must not resolve worker'), run: () => assert.fail('must not dispatch') });
+    assert.deepEqual(result.ids, []);
+    assert.deepEqual(f.errors, [`fleet-chase: skip ${original.id} (${reason})`]);
+    assert.equal(f.ledger.items[id].attempts.length, 0);
+    const preview = await work(f.ledger, { ...f.ctx, dryRun: true });
+    assert.deepEqual(preview.ids, []);
+    // Recover the sender from the inbox if the parent entry is absent.
+    delete f.ledger.items[parent.id];
+    if (reason === 'self-originated') f.put(original);
+    assert.deepEqual((await work(f.ledger, { ...f.ctx, dryRun: true })).ids, []);
+  });
+}
+test('unanswered blocker from another PC can still be dispatched', async t => {
+  const f = fixture(t);
+  f.add(mail('mail-unanswered', { from: 'other-PC' }));
+  await checkLedger(f.ledger, { ...f.ctx, request: async () => ({
+    ok: true, mail: { id: 'mail-unanswered', status: 'done', resultBody: 'BLOCKED' },
+  }) });
+  saveJson(path.join(f.dir, 'fleet-agent-optin.json'), { accept: ['prompt'] });
+  let calls = 0;
+  const result = await work(f.ledger, { ...f.ctx, resolveExe: async () => 'claude',
+    run: async () => { calls++; return { exitCode: 0, stdoutTail: 'CHASE_RESULT: blocked' }; } });
+  assert.deepEqual(result.ids, ['inbound-blocker-mail-unanswered']);
+  assert.equal(calls, 1);
 });
 test('headless cannot cancel debts and cannot bypass kim-only guard', async t => {
   const f = fixture(t), item = f.add(); f.ctx.persist();
@@ -271,3 +319,40 @@ test('resend tracking header cannot hide a body-only human decision tag from rec
 
 // Include rollout integration in the established task-A test entrypoint.
 import './fleet-chase-rollout.test.mjs';
+
+for (const seen of [false, true]) test(`send cap covers ${seen ? 'reminders' : 'resends'}, oldest first and resumes after 30 minutes`, async t => {
+  const f = fixture(t);
+  const items = Array.from({ length: SEND_CAP_PER_TARGET + 2 }, (_, n) => {
+    const item = f.add(mail(`mail-cap-${n}`, { createdAt: iso(NOW - 4 * DAY + n * HOUR) }));
+    if (seen) item.seenAt = iso(NOW - POLICY.reminder);
+    return item;
+  });
+  // Reverse insertion order to verify chronological priority.
+  f.ledger.items = Object.fromEntries([...items].reverse().map(i => [i.id, i]));
+  const preview = structuredClone(f.ledger);
+  const dryPlans = await chase(preview, { ...f.ctx, dryRun: true, persist: () => assert.fail('dry-run write') });
+  assert.equal(f.requests.length, 0);
+  const plans = await chase(f.ledger, f.ctx);
+  assert.deepEqual(plans, dryPlans);
+  assert.equal(f.requests.length, SEND_CAP_PER_TARGET);
+  assert.deepEqual(plans.filter(p => !p.action.includes('rate-limited')).map(p => p.id), items.slice(0, SEND_CAP_PER_TARGET).map(i => i.id));
+  assert.equal(plans.filter(p => p.action.endsWith('(rate-limited)')).length, 2);
+  for (const item of items.slice(SEND_CAP_PER_TARGET)) assert.equal(item.nextActionAt, iso(NOW + HOUR / 2));
+  const loaded = loadLedger(f.home);
+  await chase(loaded, { ...f.ctx, now: NOW + HOUR / 2 - 1, persist() {} });
+  assert.equal(f.requests.length, SEND_CAP_PER_TARGET);
+  await chase(loaded, { ...f.ctx, now: NOW + HOUR / 2, persist() {} });
+  assert.equal(f.requests.length, items.length);
+});
+test('send caps are per target and include ambiguous failed attempts; owner DMs are excluded', async t => {
+  const f = fixture(t);
+  for (const to of ['nishi-PC', 'cr-PC', 'stopped-PC']) {
+    for (let n = 0; n < SEND_CAP_PER_TARGET + 2; n++) f.add(mail(`mail-${to}-${n}`, { to }));
+  }
+  const calls = [];
+  await chase(f.ledger, { ...f.ctx, pcMap: { 'stopped-PC': { person: '担当者' } },
+    freshness: async to => ({ stale: to === 'stopped-PC' }),
+    request: async (_kind, payload) => { calls.push(payload.to); throw Error('response lost'); } });
+  for (const to of ['nishi-PC', 'cr-PC']) assert.equal(calls.filter(t => t === to).length, SEND_CAP_PER_TARGET);
+  assert.equal(f.dms.length, SEND_CAP_PER_TARGET + 2);
+});

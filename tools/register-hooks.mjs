@@ -36,6 +36,11 @@ try {
   ({ HOOK_MATCHER: SHARE_BEFORE_SEND_MATCHER } = await import('./share-before-send-gate.mjs'));
 } catch { /* 同期途中でも既存登録を維持 */ }
 
+let BIHIN_KCOL_MATCHER = 'mcp__.*Google_Sheets__(update_values|append_values|update_formulas|batch_clear_values|update_spreadsheet|batch_update)$|Bash|PowerShell';
+try {
+  ({ HOOK_MATCHER: BIHIN_KCOL_MATCHER } = await import('./bihin-kcol-gate.mjs'));
+} catch { /* 同期途中でも登録を継続する */ }
+
 const hooksOnly = process.argv.includes('--hooks-only');
 const expectedJson = process.argv.includes('--expected-json');
 const home = process.env.ORGIAST_HOME || os.homedir();
@@ -131,7 +136,12 @@ function add(groups, scriptName, group) {
   // 既存PCは .ps1 版が登録済みのことがある(Windows install)。拡張子を無視して重複判定しないと
   // .mjs と .ps1 の二重登録になり、同じ context が2回注入される。
   const base = scriptName.replace(/\.(mjs|ps1)$/, '');
-  if (commands(groups).some((cmd) => cmd.includes(base))) return false;
+  // A worktree/directory may itself be named after the gate. Compare script
+  // filenames, not arbitrary path substrings, or every prior hook looks equal.
+  const fileBase = path.posix.basename(base.replace(/\\/g, '/'));
+  const escaped = fileBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const scriptPattern = new RegExp(`(?:^|[\\\\/\\s"'])${escaped}\\.(?:mjs|ps1)(?=["'\\s]|$)`);
+  if (commands(groups).some((cmd) => scriptPattern.test(cmd))) return false;
   groups.push(group); return true;
 }
 function migrate(groups, oldName, newName, newCommand) {
@@ -217,7 +227,7 @@ try {
     ['fleet-convergence-sync.mjs', 360, true, ''],
     // あるべき状態への収束(検査→修復→再検査)。onboarding-sync が repo を新しくした後に走る。
     // リポジトリ直接参照・コピー配布なし = main を変えれば全PC追従(配り直し不要)。
-    ['setup.mjs', 60, true, ' --converge'],
+    ['setup.mjs', 1200, true, ' --converge'],
     ['claude-cost-reporter.mjs', 15, true, ''],
     ['tool-adoption-check.mjs', 60, true, ' --fix'],
     ['cost-loop.mjs', 15, false, ''],
@@ -238,6 +248,9 @@ try {
     if (async) hook.async = true;
     if (add(settings.hooks.SessionStart, name, { hooks: [hook] })) added += 1;
   }
+  // Node security downloads/MSI/WSL + UAC read-back exceed the old 60s limit.
+  // Migrate existing PCs too; changing the initial registration alone leaves them at 60s.
+  added += setTimeoutFor(settings.hooks.SessionStart, 'setup.mjs', 1200);
   added += setTimeoutFor(settings.hooks.SessionStart, 'tool-adoption-check', 60);
   added += migrate(settings.hooks.SessionStart, 'sessionstart-lane-health.mjs', 'sessionstart-lane-health.mjs', command('sessionstart-lane-health.mjs', ' --hook'));
   if (add(settings.hooks.SessionStart, 'sessionstart-lane-health.mjs', { hooks: [{ type: 'command', command: command('sessionstart-lane-health.mjs', ' --hook'), timeout: 5 }] })) added += 1;
@@ -287,6 +300,7 @@ try {
   // inline target の予約を次セッションへ同期注入するため async は付けない。
   if (add(settings.hooks.SessionStart, 'session-relaunch.mjs', { hooks: [{ type: 'command', command: command('session-relaunch.mjs', ' --hook'), timeout: 10 }] })) added += 1;
   // AIニュースとGoogleタスクの通知は nightly の daily-notice-digest に集約する。
+  if (add(settings.hooks.UserPromptSubmit, 'plan-usage-report.mjs', { hooks: [{ type: 'command', command: command('plan-usage-report.mjs', ' --hook'), timeout: 5 }] })) added += 1;
   added += migrate(settings.hooks.UserPromptSubmit, 'current-session.mjs', 'current-session.mjs', command('current-session.mjs'));
   if (add(settings.hooks.UserPromptSubmit, 'current-session.mjs', { hooks: [{ type: 'command', command: command('current-session.mjs'), timeout: 5 }] })) added += 1;
   added += migrate(settings.hooks.UserPromptSubmit, 'delegation-gate', 'cost-routing-gate.mjs', command('cost-routing-gate.mjs'));
@@ -311,6 +325,7 @@ try {
   // 過去に受領済みのクレデンシャルをuserへ再質問する前に復元経路を注入する。
   for (const event of ['SessionStart', 'UserPromptSubmit']) {
     if (add(settings.hooks[event], 'fleet-inbox-context.mjs', { hooks: [{ type: 'command', command: command('fleet-inbox-context.mjs'), timeout: 5 }] })) added += 1;
+    if (add(settings.hooks[event], 'auto-progress-inbox-hook.mjs', { hooks: [{ type: 'command', command: command('auto-progress-inbox-hook.mjs'), timeout: 5 }] })) added += 1;
     if (resolveFleetLabel(home) === 'kim-PC') {
       if (add(settings.hooks[event], 'fleet-chase-context.mjs', { hooks: [{ type: 'command', command: command('fleet-chase-context.mjs'), timeout: 5 }] })) added += 1;
     }
@@ -349,6 +364,10 @@ try {
   if (add(settings.hooks.PreToolUse, 'pipe-stage-permissions.mjs', { matcher: 'Bash', hooks: [{ type: 'command', command: command('pipe-stage-permissions.mjs'), timeout: 5 }] })) added += 1;
   // 社内アプリを不具合・要望フォーム未搭載のまま本番反映させない(§2.11・2026-10-08 カフェアプリ事故の再発防止)。
   if (add(settings.hooks.PreToolUse, 'feedback-form-gate.mjs', { matcher: 'Bash|PowerShell', hooks: [{ type: 'command', command: command('feedback-form-gate.mjs'), timeout: 10 }] })) added += 1;
+  // 備品管理表K列は配列式の展開先。値を書いて全在庫表示を壊す事故を防ぐ。
+  if (add(settings.hooks.PreToolUse, 'bihin-kcol-gate.mjs', { matcher: BIHIN_KCOL_MATCHER, hooks: [{ type: 'command', command: command('bihin-kcol-gate.mjs'), timeout: 10 }] })) added += 1;
+  // 全プロジェクトを「別アカウントへ移管できる前提」で作らせる。HANDOVER.md 無しの本番反映を止める(§1.12.1・2026-10-22 kim 厳命)。
+  if (add(settings.hooks.PreToolUse, 'handover-doc-gate.mjs', { matcher: 'Bash|PowerShell', hooks: [{ type: 'command', command: command('handover-doc-gate.mjs'), timeout: 10 }] })) added += 1;
   added += migrate(settings.hooks.Stop, 'verify-before-done-detector.ps1', 'verify-before-done-detector.mjs', command('verify-before-done-detector.mjs'));
   // 人に手作業を頼むとき、初見の人でも実行できる手順になっているかを検査する(§1.5.1)。
   if (add(settings.hooks.Stop, 'verify-before-done-detector.mjs', { hooks: [{ type: 'command', command: command('verify-before-done-detector.mjs') }] })) added += 1;
@@ -369,6 +388,7 @@ try {
   // 生URLと日本語・全角文字の直接隣接によるリンク破損を差し戻す。
   if (add(settings.hooks.Stop, 'url-format-guard.mjs', { hooks: [{ type: 'command', command: command('url-format-guard.mjs'), timeout: 8 }] })) added += 1;
   // 完了報告にLayer 1/2・e2e等の検証記載がなければ同期警告する。
+  added += migrate(settings.hooks.Stop, 'check-e2e-before-stop.ps1', 'check-e2e-before-stop.mjs', command('check-e2e-before-stop.mjs'));
   if (add(settings.hooks.Stop, 'check-e2e-before-stop.mjs', { hooks: [{ type: 'command', command: command('check-e2e-before-stop.mjs'), timeout: 8 }] })) added += 1;
   const permanentTimeouts = [
     ['pretooluse-delegation-warn.mjs', 5], ['model-agent-guard.mjs', 5],
@@ -383,6 +403,8 @@ try {
   }
   // 全PC・全アカウントの全セッションで Remote Control を自動開始する(kim 2026-10-09)。CLI と VS Code 拡張の両方がこのキーを読む。
   if (settings.remoteControlAtStartup !== true) { settings.remoteControlAtStartup = true; added += 1; }
+  // 全PC・全アカウントの応答・セッション名を日本語に固定する。途中で英語に切り替わった事故の再発防止(cr 2026-10-18)。
+  if (settings.language !== 'japanese') { settings.language = 'japanese'; added += 1; }
   // 旧PCは hook が `powershell -NoProfile -File ...ps1` で登録され、実行ポリシーで無音死している。
   policyRepaired = repairPowerShellExecutionPolicy(settings.hooks);
   added += policyRepaired;
@@ -414,7 +436,7 @@ try {
     // Preserve supported legacy migrations outside tools/ (old installer copies).
     for (const [event, groups] of Object.entries(retained)) {
       for (const group of groups) group.hooks = group.hooks.filter(hook =>
-        !/(?:ai-news-inject|gtasks-pending-notice|purge-hidden-sessions|purge-closed-sessions|session-list-tidy)\.(?:mjs|ps1|py)(?:["'\s]|$)/.test(hook.command || '') && !/(?:cost-loop|onboarding-sync|verify-before-done-detector)\.ps1(?:["'\s]|$)/.test(hook.command || ''));
+        !/(?:ai-news-inject|gtasks-pending-notice|purge-hidden-sessions|purge-closed-sessions|session-list-tidy)\.(?:mjs|ps1|py)(?:["'\s]|$)/.test(hook.command || '') && !/(?:cost-loop|onboarding-sync|verify-before-done-detector|check-e2e-before-stop)\.ps1(?:["'\s]|$)/.test(hook.command || ''));
       retained[event] = groups.filter(group => group.hooks.length);
     }
     repairPowerShellExecutionPolicy(retained);

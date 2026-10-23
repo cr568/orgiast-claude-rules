@@ -145,6 +145,20 @@ test('fleet mail scheduled task is skipped until its transport config exists', (
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+test('ifEnv 付き scheduled-task はフラグ未設定の PC で NOTICE になる', () => {
+  const home = temp('setup-fleet-mail-guard-');
+  const mf = path.join(home, 'manifest.json');
+  const spec = { name: 'OrgiastFleetMailWatchdog-test-missing', ifPresent: '.claude/fleet-sheet.env', ifEnv: { path: '.claude/fleet-sheet.env', regex: '(?:^|\\r?\\n)\\s*FLEET_MAIL_WATCHDOG=1' } };
+  write(mf, JSON.stringify(manifest([item('task:fleet-mail-watchdog', 'scheduled-task', spec, 'optional')])));
+  // フラグが無い PC では登録側(.ps1)がタスクを作らないので、未登録でも NG にしない
+  write(path.join(home, '.claude/fleet-sheet.env'), 'FLEET_SHEET_URL=x\n');
+  assert.equal(JSON.parse(run(['--json', '--home', home, '--manifest', mf]).stdout).items[0].status, 'NOTICE');
+  // フラグがある PC では登録を検査し、未登録なら NG
+  write(path.join(home, '.claude/fleet-sheet.env'), 'FLEET_SHEET_URL=x\nFLEET_MAIL_WATCHDOG=1\n');
+  assert.equal(JSON.parse(run(['--json', '--home', home, '--manifest', mf]).stdout).items[0].status, 'NG');
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test('async:false manifest accepts synchronous hooks and rejects async hooks', (t) => {
   const home = temp('setup-sync-hook-');
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -289,4 +303,35 @@ test('playbook配布は未導入だけコピーしPCの追記を保持する', a
   const mf = path.join(home, 'manifest.json'); write(mf, JSON.stringify(manifest([])));
   const result = run(['--converge', '--home', home, '--manifest', mf, '--json']); assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).items.find(i => i.id === 'playbooks').status, 'OK');
+});
+
+
+test('inbox verifier accepts nightly runtime with old bootstrap main and still rejects a missing hook', t => {
+  const home = temp('setup-inbox-anchor-');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const entry = JSON.parse(fs.readFileSync(path.join(toolsDir, 'setup-manifest.json'), 'utf8')).items.find(x => x.id === 'hook:auto-progress-inbox');
+  const mf = path.join(home, 'manifest.json');
+  write(mf, JSON.stringify(manifest([entry])));
+  write(path.join(home, 'orgiast-claude-rules/tools/setup.mjs'), '// old main');
+  assert.equal(run(['--verify', '--home', home, '--manifest', mf]).status, 1);
+  write(path.join(home, '.claude/nightly-repo/tools/auto-progress-inbox-hook.mjs'), fs.readFileSync(path.join(toolsDir, 'auto-progress-inbox-hook.mjs')));
+  const result = run(['--verify', '--home', home, '--manifest', mf]);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  // The original PR only inspected the old main installation: reproduce its failure.
+  write(mf, JSON.stringify(manifest([{ ...entry, spec: { paths: entry.spec.paths.filter(p => !p.startsWith('.claude/')) } }])));
+  assert.equal(run(['--verify', '--home', home, '--manifest', mf]).status, 1);
+});
+
+test('verify-before-done manifest validates synchronous wrapped Stop registration', t => {
+  const home = temp('setup-verify-done-');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const entry = JSON.parse(fs.readFileSync(path.join(toolsDir, 'setup-manifest.json'), 'utf8')).items.find(e => e.id === 'settings:verify-before-done');
+  const mf = path.join(home, 'manifest.json');
+  write(mf, JSON.stringify(manifest([entry])));
+  const hook = { type: 'command', command: `node "${path.join(toolsDir, 'gate-hook-runner.mjs')}" "${path.join(toolsDir, 'verify-before-done-detector.mjs')}"`, timeout: 15 };
+  for (const [change, event, expected] of [[{}, 'Stop', 0], [{ async: true }, 'Stop', 1], [{ command: 'pwsh -File verify-before-done-detector.ps1' }, 'Stop', 1], [{}, 'SessionStart', 1]]) {
+    write(path.join(home, '.claude/settings.json'), JSON.stringify({ hooks: { [event]: [{ hooks: [{ ...hook, ...change }] }] } }));
+    const result = run(['--verify', '--home', home, '--manifest', mf]);
+    assert.equal(result.status, expected, result.stdout + result.stderr);
+  }
 });

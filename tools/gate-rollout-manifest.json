@@ -37,6 +37,13 @@
       "rollout": "deny",
       "legacy": true
     },
+    "bihin-kcol-gate": { "rollout": "deny", "immediatePolicy": "2026-10-23 古川さん依頼: 備品管理表K列のデータ破損防止", "distributedAt": "2026-10-23T00:00:00Z" },
+    "handover-doc-gate": {
+      "rollout": "deny",
+      "distributedAt": "2026-10-22T00:00:00Z",
+      "denyAfter": "2026-10-29T00:00:00Z",
+      "pilotDeny": true
+    },
     "gh-handoff-gate": {
       "rollout": "deny",
       "legacy": true
@@ -147,6 +154,11 @@
       "rollout": "deny",
       "legacy": true
     },
+    "japanese-response-gate": {
+      "rollout": "deny",
+      "distributedAt": "2026-10-18T00:00:00Z",
+      "denyAfter": "2026-10-25T00:00:00Z"
+    },
     "shallow-answer-gate": {
       "rollout": "deny",
       "distributedAt": "2026-10-10T00:00:00Z",
@@ -185,6 +197,12 @@
       "rollout": "deny",
       "distributedAt": "2026-10-17T00:00:00Z",
       "denyAfter": "2026-10-24T00:00:00Z",
+      "pilotDeny": true
+    },
+    "deferral-wait-gate": {
+      "rollout": "deny",
+      "distributedAt": "2026-10-20T00:00:00Z",
+      "denyAfter": "2026-10-27T00:00:00Z",
       "pilotDeny": true
     },
     "past-log-search-gate": {

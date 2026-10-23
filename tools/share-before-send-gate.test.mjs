@@ -19,6 +19,7 @@ test('no link passes; Google link without evidence blocks', t => {
   assert.equal(judge(message('hello'), opts).decision, 'pass');
   assert.equal(judge(message(), opts).decision, 'block');
   assert.match(judge(message(), opts).reason, /--id file123 --to/);
+  assert.match(judge(message(), opts).reason, /--to syain@orgiast\.jp で全社員に共有/);
 });
 test('recent ledger passes, old or future timestamps do not', t => {
   const opts = fixture(t);
