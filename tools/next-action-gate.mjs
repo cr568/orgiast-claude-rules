@@ -157,7 +157,10 @@ export function judgeNextAction(text, transcriptRaw = '', input = {}) {
 
   const footer = footerValues(source);
   // フッターを書いた短文も定型文を検査する（短文素通しで『閉じてOKです』が通った 2026-10-09 実害）。
-  if (!footer && source.length < MIN_ENFORCED_LENGTH) return permanentFix || { decision: 'pass', reason: 'short-response' };
+  // 短文素通しは雑談・相槌だけ。ツールで作業したターンは短文・空文でもフッター必須
+  // （作業後に「No response requested.」だけで終わり、自動進行が台帳に載らず kim が進捗を聞く羽目になった 2026-10-23 実害）。
+  const worked = blocks(currentTurnEntries(transcriptRaw), 'tool_use').length > 0;
+  if (!footer && (!worked || !source) && source.length < MIN_ENFORCED_LENGTH) return permanentFix || { decision: 'pass', reason: 'short-response' };
   if (!footer) {
     return {
       decision: 'block',
