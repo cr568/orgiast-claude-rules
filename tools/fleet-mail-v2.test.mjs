@@ -8,6 +8,10 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { backgroundSpawnOptions } from './lib/background-spawn.mjs';
 import { main, pollOnce, readInbox, syncMailState, resolveMailTarget, mailId, parseArgs, waitForReply, createClient, TERMINAL_STATUSES, hasDecisionRequest, updateInbox, presentMail, ACK_BATCH_LIMIT, SERVER_MAX_ATTEMPTS, CAPABILITY_BACKOFF_MS, INTERRUPTED_PROMPT_MS, INTERRUPTED_PROMPT_BODY, INBOX_LOCK_RETRIES, INBOX_LOCK_DELAY_MS, INBOX_LOCK_STALE_MS, COMMAND_LOCK_RETRIES, COMMAND_LOCK_DELAY_MS, LOCK_BUSY_EXIT, notifyPendingArrivals } from './fleet-mail.mjs';
+// --answer は headless 実行中（CLAUDE_HEADLESS=1 / ORGIAST_HEADLESS_JOB）に判断代行を拒否して 2 を返す。
+// このテストを headless セッション（夜間 auto-session / CI 外の手動実行）から回すと answer 系だけが
+// 環境依存で落ちるため、テストプロセス側で無効化する。本番の安全弁そのものは変更しない。
+for (const key of ['CLAUDE_HEADLESS', 'ORGIAST_HEADLESS_JOB']) delete process.env[key];
 const pcMap = JSON.parse(fs.readFileSync(new URL('../fleet-pc-map.json', import.meta.url), 'utf8'));
 const labels = Object.keys(pcMap).filter(key => !key.startsWith('_'));
 const receiver = labels[0], sender = labels.find(label => label !== receiver && pcMap[label].hostname);
