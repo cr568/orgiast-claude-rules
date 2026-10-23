@@ -230,6 +230,9 @@ const CODEX_MODEL_AUTH_MISMATCH = /is not supported when using codex with a chat
 // 最後の砦として ChatGPT の購入URL)も一致させる。
 const CODEX_USAGE_LIMIT = /You(?:[’']ve| have) hit your usage limit|your usage limit[.!]?\s*Upgrade to Pro|Upgrade to Pro \(https:\/\/chatgpt\.com\/explore\/pro\)|Usage limit (?:reached|exceeded)/i;
 
+// 選択モデルが一時的に満員のときは、codex 自体の出力異常ではない。
+const CODEX_MODEL_CAPACITY = /Selected model is at capacity\. Please try a different model\./i;
+
 export function emptyOutputReason(row) {
   if (row?.timedOut === true) return 'timeout';
   // 旧行(timedOut 未記録)は経過秒数から推定する。codex の正常終了は実測で中央値~100秒、
@@ -257,6 +260,7 @@ export function emptyOutputReason(row) {
   if (CODEX_AUTH_FAILED.test(String(row?.stderrTail || ''))) return 'auth_failed';
   if (CODEX_MODEL_AUTH_MISMATCH.test(String(row?.stderrTail || ''))) return 'model_auth_mismatch';
   if (CODEX_USAGE_LIMIT.test(String(row?.stderrTail || ''))) return 'usage_limit';
+  if (CODEX_MODEL_CAPACITY.test(String(row?.stderrTail || ''))) return 'model_capacity';
   if (INFRA_TRANSIENT.test(String(row?.stderrTail || ''))) return 'infra_transient';
   // 台帳の status は数値(終了コード)だけではない。llm-fallback / cheap-code は失敗の種類を
   // そのまま文字列で書く(http_429 / http_402 / cooldown)。これを知らずに catch-all の
@@ -420,7 +424,7 @@ export function collectFindings({ home, now = new Date(), codexUsedPercent = nul
     const lastFailureTime = Math.max(...failures.map((row) => Date.parse(row.t)));
     return codexSuccessTimes.some((time) => time > lastFailureTime);
   };
-  const realEmpty = empty.filter((item) => !['infra_transient', 'launch_failed', 'auth_failed', 'model_auth_mismatch', 'preflight_blocked', 'spawn_failed', 'usage_limit'].includes(item.reason));
+  const realEmpty = empty.filter((item) => !['infra_transient', 'launch_failed', 'auth_failed', 'model_auth_mismatch', 'preflight_blocked', 'spawn_failed', 'usage_limit', 'model_capacity'].includes(item.reason));
   const launchFailed = empty.filter((item) => item.reason === 'launch_failed');
   const authFailed = empty.filter((item) => item.reason === 'auth_failed');
   const modelAuthMismatch = empty.filter((item) => item.reason === 'model_auth_mismatch');

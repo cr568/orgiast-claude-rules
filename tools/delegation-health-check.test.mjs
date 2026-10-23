@@ -218,6 +218,39 @@ test('先頭切り詰めの usage limit 2件で codex_empty_output を出さな�
   assert.deepEqual(limit.evidence, ['2件', 'usage_limit(2件)']);
 });
 
+test('emptyOutputReason はモデル容量超過を model_capacity に分類する', () => {
+  assert.equal(emptyOutputReason({
+    status: 'error',
+    exitCode: 1,
+    launched: true,
+    timedOut: false,
+    stderrTail: 'ERROR: selected MODEL is AT capacity. PLEASE try a DIFFERENT model.',
+  }), 'model_capacity');
+});
+
+test('実台帳行のモデル容量超過で collectFindings が codex_empty_output を出さない', () => {
+  const dir = home();
+  const realCapacityRow = {
+    t: '2026-10-21T10:00:00.000Z',
+    provider: 'codex',
+    model: 'codex-cli/default',
+    lane: 'chatgpt_auth_default:default_sol',
+    in: 3531,
+    out: 0,
+    launched: true,
+    timedOut: false,
+    status: 'error',
+    exitCode: 1,
+    fastFail: true,
+    attempts: 1,
+    secs: 2.193,
+    stderrTail: 'ERROR: Selected model is at capacity. Please try a different model.',
+  };
+  write(dir, 'executor-usage.jsonl', row(realCapacityRow));
+  const findings = collectFindings({ home: dir, now: new Date('2026-10-21T10:00:03.000Z'), codexUsedPercent: null });
+  assert.ok(!findings.some((finding) => finding.id === 'codex_empty_output'));
+});
+
 test('実台帳行の Codex 上限到達行で collectFindings が codex_empty_output を出さず codex_usage_limit を出す', () => {
   const dir = home();
   const realUsageRow = {
