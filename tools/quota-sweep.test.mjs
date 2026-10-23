@@ -143,6 +143,19 @@ test('two failed ticks stop; before-spawn reservations survive interruption', as
   assert.equal(ctx.state.lastRun.claude[decision.resetsAt].ticks, 2);
   const budget = JSON.parse(fs.readFileSync(path.join(ctx.tree, '.loop/quota-sweep-claude-budget.json'))); assert.equal(budget.ticks, 2);
 });
+test('失敗した tick の理由と failureKey は executor-usage にも残す（no_output と誤診させない）', async t => {
+  const ctx = context(t, async () => ({ code: 1, stdout: '', stderr: "EPERM: operation not permitted, open '.git'" }));
+  await runSweep(decision, ctx);
+  const rows = fs.readFileSync(path.join(ctx.home, '.claude/executor-usage.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(rows.length >= 1);
+  for (const usage of rows) {
+    assert.equal(usage.provider, 'quota-sweep:claude');
+    assert.equal(usage.status, 'failed');
+    assert.match(usage.reason, /child exit=1/);
+    assert.match(usage.reason, /EPERM/);
+    assert.equal(usage.failureKey, 'child-1');
+  }
+});
 test('ceiling refreshed before Phase A prevents any model invocation', async t => {
   let calls = 0; const ctx = context(t, async () => { calls++; });
   ctx.windows = async () => windows.map(w => ({ ...w, usedPercent: 98 }));

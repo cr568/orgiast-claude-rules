@@ -85,6 +85,8 @@ git fetch/push は1回300秒、失敗時に1回だけ再試行します。他の
 
 同じproviderで同じ原因が2回連続したら、既存の `handoff-audit-nightly.enqueueTodos` と `next-session-rotate.writeHandoff` で `next-session.md` に調査・回帰テスト・修正PRのタスクを重複なく起票します。利用窓が変わっても失敗回数は保持し、失敗以外の結果でリセットします。配布は既存の同期リポ・setup converge経路を使用します。
 
+`executor-usage.jsonl` の `quota-sweep:<provider>` 行にも同じ `reason` / `failureKey` を書きます。これは `delegation-health` が `executor-usage.jsonl` しか読まないためです。`quota-sweep.jsonl` にだけ理由を置くと、全滅行が `no_output`（原因不明）と表示され、EPERM・窓情報不足・対話検出のどれだったのかを追えません（2026-10-21 の codex 6連続 failed がこの状態でした）。
+
 ### 2026-10-23 調査証跡
 
 - kim-PC `quota-sweep.log` 2026-10-21T12:55:55.781Z: `spawnSync git ETIMEDOUT`。旧commandRunnerは全コマンド60秒固定、再試行なし。旧ログにはサブコマンドがなくfetch等のどのgit操作だったかは確定不能。

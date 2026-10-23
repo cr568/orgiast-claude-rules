@@ -734,6 +734,16 @@ test('quota-sweep:codex は失敗の後に exhausted(トークン消費)が1件�
   const outage = collectFindings({ home: dir, now: NOW }).find(f => f.id === 'lane_outage_unrepaired');
   assert.equal(outage.provider, 'quota-sweep:codex'); assert.equal(outage.severity, 'high');
 });
+test('quota-sweep の失敗行は reason を証跡に出す（no_output と誤診しない）', () => {
+  const dir = home();
+  const reason = "codex child exit=1 stop=failed: EPERM: operation not permitted, open '.git'";
+  const rows = [0, 1, 2].map(i => ({ t: `2026-09-09T10:0${i}:00Z`, provider: 'quota-sweep:codex', model: 'codex', in: 0, out: 0, tokens: 0, status: 'failed', reason, failureKey: 'child-1' }));
+  write(dir, 'executor-usage.jsonl', rows.map(row).join(''));
+  const outage = collectFindings({ home: dir, now: NOW }).find(f => f.id === 'lane_outage_unrepaired');
+  assert.equal(outage.provider, 'quota-sweep:codex');
+  assert.ok(outage.evidence.some(e => /EPERM/.test(e)), outage.evidence.join(' / '));
+  assert.ok(!outage.evidence.some(e => /no_output/.test(e)));
+});
 test('全レーンの未修理全滅は provider ごとに集計し集計窓外を除く', () => {
   const dir = home();
   write(dir, 'executor-usage.jsonl', ['gemini', 'qwen'].flatMap(provider => Array.from({length:3}, (_,i) => row({t:`2026-09-09T10:0${i}:00Z`,provider,status:'error',out:5,stderrTail:'HTTP 402'}))).join('') + row({t:'2020-01-01T00:00:00Z',provider:'gemini',status:'ok',out:10}));
