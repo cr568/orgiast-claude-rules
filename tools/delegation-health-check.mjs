@@ -262,6 +262,46 @@ export function emptyOutputReason(row) {
   return 'no_output';
 }
 
+// #964 が入ったマージ時刻。これ以前の停滞は打ち切り実装が無かったので対象外。
+export const POLICY_STALL_SINCE = '2026-10-21T17:04:12Z';
+// 打ち切り判定（POLICY_STALL_MIN_ELAPSED_SECS=300）に届いた停滞だけを「打ち切られるべきだった」と数える。
+export const POLICY_STALL_MIN_ABORTABLE_SECS = 300;
+export const POLICY_DENIAL_RE = /tool execution denied by policy/gi;
+
+export function countPolicyDenial(text) {
+  return typeof text === 'string' ? (String(text).match(POLICY_DENIAL_RE) || []).length : 0;
+}
+
+// 台帳1行（chain があれば試行ごと）から、ポリシー拒否の痕跡がある試行を抽出する。
+// stderrTail は末尾200字へ切り詰められているため回数は下限値。outcome は #964 以降
+// 'blocked'（早期打ち切り）, 'timeout'（締切）, 'ok'/'failed' のいずれか。
+export function policyStallAttempts(rows) {
+  const attempts = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || typeof row !== 'object') continue;
+    const chain = Array.isArray(row.chain) && row.chain.length ? row.chain : null;
+    const list = chain ?? [null];
+    for (const attempt of list) {
+      const stderr = String(attempt?.stderrTail ?? (chain ? '' : row.stderrTail) ?? '');
+      const denials = countPolicyDenial(stderr);
+      if (!denials) continue;
+      const secs = Number(attempt?.secs ?? row.secs);
+      const out = Number(attempt?.out ?? row.out);
+      attempts.push({
+        t: String(row.t || ''),
+        backend: attempt?.backend ?? row.provider ?? null,
+        model: attempt?.model ?? row.model ?? null,
+        outcome: attempt?.outcome ?? (row.timedOut === true || row.status === 'timeout' ? 'timeout' : 'ok'),
+        secs: Number.isFinite(secs) ? secs : 0,
+        out: Number.isFinite(out) ? out : 0,
+        budgetSecs: Number(attempt?.budgetSecs ?? row.timeoutSecs) || null,
+        denials,
+      });
+    }
+  }
+  return attempts;
+}
+
 export function collectFindings({ home, now = new Date(), codexUsedPercent = null }) {
   const current = now instanceof Date ? now : new Date(now);
   const nowMs = current.getTime(), cutoff = nowMs - DAY;
@@ -299,6 +339,27 @@ export function collectFindings({ home, now = new Date(), codexUsedPercent = nul
       title: 'タイムアウトで捨てた秒数が上限超過（#773 の回帰）',
       evidence: [`${timeoutWaste.overCapRows}件`, `最大試行 ${timeoutWaste.maxAttemptSecs}秒`, `上限 ${timeoutWaste.capSecs}秒`, ...overCap],
       fixTask: 'killProcessTree と fallbackBackendTimeoutSecs(#773)が効いていない。timeout 行の chain[].secs を実測し、上限を超えた試行のバックエンドと起動経路を特定して修正・テスト追加',
+    });
+  }
+  // #964（2026-10-21T17:04Z マージ）は、gemini CLI が run_shell_command をポリシー拒否し続けて
+  // 900 秒締切まで空回りする症状に早期打ち切り（300秒・拒否3回・出力400字未満で outcome='blocked'）と
+  // 1試行600秒上限を入れた。効果は「実 chain が policy 拒否で停滞した時」しか観測できないため、
+  // 台帳を毎晩ここで走査し、打ち切られずに時間を消費した停滞だけを起票する（Claude の手動再計測を不要にする）。
+  const policyStalls = policyStallAttempts(readJsonl(path.join(claudeDir, 'executor-usage.jsonl')))
+    .filter((a) => a.t >= POLICY_STALL_SINCE);
+  const unabortedStalls = policyStalls.filter((a) => a.outcome !== 'blocked' && a.secs >= POLICY_STALL_MIN_ABORTABLE_SECS);
+  if (unabortedStalls.length) {
+    findings.push({
+      id: 'policy_stall_not_aborted',
+      severity: 'medium',
+      title: 'ポリシー拒否の停滞が打ち切られずに時間を消費（#964 の回帰）',
+      evidence: [
+        `${unabortedStalls.length}件`,
+        `最大 ${Math.round(Math.max(...unabortedStalls.map((a) => a.secs)))}秒`,
+        `打ち切り済み ${policyStalls.filter((a) => a.outcome === 'blocked').length}件`,
+        ...unabortedStalls.slice(-3).map((a) => `${a.t} ${a.backend ?? '不明'} ${Math.round(a.secs)}秒/予算${a.budgetSecs ?? '不明'}秒 out${a.out} outcome=${a.outcome}`),
+      ],
+      fixTask: 'codex-do の shouldAbortPolicyStall が実 chain で発火していない。stderrTail の拒否回数・経過秒・出力字数を実測し、打ち切り判定が実行ループ（stderr 逐次監視）に繋がっているか確認して修正・テスト追加',
     });
   }
   if (limitRows.length && metric && !supersededWindow && metric.usedPercent < 90) findings.push({
