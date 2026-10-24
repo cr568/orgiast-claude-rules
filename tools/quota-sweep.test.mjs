@@ -355,6 +355,25 @@ test('usage monitor stops active process before its time limit', async () => {
   const stopped = await result; assert.equal(stopped.stopReason, 'ceiling'); assert.equal(stopped.timedOut, false);
 });
 
+// 2026-10-24T14:59Z 実測: monitor が deferred を返したあと taskkill が効かず子が残り、
+// 期限タイマーが stopReason を 'deadline' に上書きした。結果は reason=deferred なのに
+// status=failed / failureKey=child-deadline で台帳に載り、quota-sweep:claude の
+// lane_outage_unrepaired が再発した。停止理由は最初に決めたものが勝たなければならない。
+test('monitor が決めた停止理由は期限タイマーに上書きされない', async () => {
+  const child = new EventEmitter(); child.pid = 322; child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough();
+  const callbacks = []; const kills = [];
+  const result = runBounded('fixture', [], { deadline: now + 1000, now: () => now, watchdog: false, platform: 'win32', spawnImpl: () => child,
+    setTimer: fn => { callbacks.push(fn); return callbacks.length; }, clearTimer: () => {}, monitor: async () => 'deferred',
+    kill: () => { kills.push(now); } }); // kill しても子は閉じない（Windows の taskkill 失敗を再現）
+  await callbacks[1]();     // monitor ポーリング → deferred で停止
+  await callbacks[0]();     // 期限タイマー → 理由を変えず再 kill だけ行う
+  child.emit('close', 1);
+  const stopped = await result;
+  assert.equal(stopped.stopReason, 'deferred');
+  assert.equal(stopped.timedOut, false);
+  assert.equal(kills.length, 2);
+});
+
 test('single Codex usage record is counted once', () => {
   const parsed = parseOutput(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 11, output_tokens: 7 } }));
   assert.equal(parsed.input, 11); assert.equal(parsed.output, 7);
