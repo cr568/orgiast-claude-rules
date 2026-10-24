@@ -7,7 +7,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { isEntry } from './is-entry.mjs';
 import { DEFAULT_REPO_MAP, parseRepoMap } from './feedback-to-issues.mjs';
 import { ledgerRows, runTaskLedger } from './task-ledger.mjs';
-import { alternateCheapProvider, autoSessionExecutor, buildClaudeHeadlessArgs, buildCheapCodeArgs, claudeFallbackEnabled, recordFallbackToClaude, recordSkippedNoExecutor } from './auto-session-executor.mjs';
+import { alternateCheapProvider, autoSessionExecutor, buildClaudeHeadlessArgs, buildCheapCodeArgs, claudeFallbackEnabled, prepareExecutorRoot, recordFallbackToClaude, recordSkippedNoExecutor } from './auto-session-executor.mjs';
 import { findClaudeInVersionedDir, sanitizeClaudeSupervisorEnv } from './claude-exe.mjs';
 import { sweepFile as sweepRescueTodoFile } from './rescue-todo-sweep.mjs';
 
@@ -729,7 +729,10 @@ function extensionExecutables() {
   } catch { return []; }
 }
 
-export function runChild(executable, prompt, repoCwd, historyCwd, timeoutMs, runOptions = {}) {
+export async function runChild(executable, prompt, repoCwd, historyCwd, timeoutMs, runOptions = {}) {
+  // 実行役のコードは origin/main の専用 worktree から読む。pinned tree はセッションが作業ブランチを
+  // 切るため、夜間に main へ入った修正が同じ夜の後続セッションへ届かない(2026-10-25 実測)。
+  const executorRoot = runOptions.executorRoot ?? prepareExecutorRoot({ repoRoot: REPO_ROOT });
   return new Promise((resolve) => {
     const startedAt = new Date();
     const configuredChoice = autoSessionExecutor();
@@ -746,7 +749,7 @@ export function runChild(executable, prompt, repoCwd, historyCwd, timeoutMs, run
       const cheap = choice.executor === 'cheap-code' && !fallback;
       let child;
       try { child = spawn(cheap ? process.execPath : executable, cheap
-        ? buildCheapCodeArgs({ repoRoot: REPO_ROOT, provider: cheapProvider, promptFile, cwd: historyCwd })
+        ? buildCheapCodeArgs({ repoRoot: executorRoot, provider: cheapProvider, promptFile, cwd: historyCwd })
         : buildClaudeHeadlessArgs({ repoCwd, historyCwd, resumeSessionId: runOptions.resumeSessionId, ...(runOptions.model ? { model: runOptions.model } : {}) }), { detached: process.platform !== 'win32', cwd: historyCwd,
         // cheap-code 側でも浄化するが、claude フォールバック(監督セッション)はここで
         // デスクトップ由来の CLAUDECODE / CLAUDE_CODE_* / MCP_* を外しておく。
