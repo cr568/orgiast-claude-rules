@@ -245,6 +245,10 @@ LINE の全員配信が本当に必要なら、kim が同じセッションで�
 
 メールは seisaku-team@orgiast.jp の下書きに作る: `node tools/gmail-draft.mjs --to <宛先> --subject "<件名>" --body-file <本文ファイル> --json` → 読み戻し `node tools/gmail-search.mjs --user seisaku-team@orgiast.jp --query "in:drafts subject:<件名>" --json` → user が「送って」と言ったら重複・矛盾照会後 `node tools/gmail-draft.mjs --send <draftId> --json`。緊急退避のみ `ORGIAST_MAIL_ACCOUNT_GATE=off`。
 
+## mail-consistency-gate
+
+生の Gmail API 送信は使わず、`node tools/gmail-draft.mjs --send <draftId> --json` で送る。この経路はスレッド全体の合意と下書きを自動照合する。block は下書きを直して解消する。やむを得ない場合のみ `--ack-consistency "<理由>"` を付け、理由を完了報告に記載する。
+
 ## merge-handoff-gate
 
 PR のマージを人に頼む文（本文の「次に kim がすること」・依頼文、Discord DM、fleet-mail）は、同じターンに PR の状態照会（`gh pr view <N> --json state,mergedAt,mergedBy` 等）と自分でのマージ試行（`gh pr merge <N> --squash --auto` か `gh pr edit <N> --add-label automerge`）の記録がある時だけ通す。MERGED なら依頼を消し、自動マージされるなら「この後の自動進行」に書く。両方試して失敗した時だけ、その出力を添えて依頼する。人の承認が本当に要る時は `[MERGE-HANDOFF-OK: <理由>]`。
