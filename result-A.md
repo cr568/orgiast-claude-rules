@@ -15,6 +15,7 @@ https://github.com/kimkon1011/orgiast-claude-rules/pull/1127
 - `tools/register-hooks.mjs`
 - `tools/register-hooks.test.mjs`
 - `tools/gate-rollout-manifest.json`
+- `tools/distribution-manifest.json`
 - `tools/gate-remedies.md`
 - `ONBOARDING.md`
 - `CLAUDE.md.template`
@@ -43,6 +44,8 @@ node --test tools/mail-consistency-check.test.mjs tools/mail-consistency-gate.te
 ```
 
 併せて `node --check` を `mail-consistency-check.mjs`、`mail-consistency-gate.mjs`、`gmail-draft.mjs` に実行し、全て成功した。
+
+POSIX CI 初回で見つかった日付タイムゾーン、rollout 7日窓、結果ファイル配布分類を修正後、関連する `mail-consistency-check` / `gate-contract` / `distribution-coverage` は 71 tests / 71 pass / 0 fail。
 
 ## 実データ実行
 

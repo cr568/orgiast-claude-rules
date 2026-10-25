@@ -62,10 +62,11 @@ export function deterministicFindings({ body, timeline, extras = [], now = new D
       if (exclusion.test(sentence) && target.test(sentence)) findings.push({ severity: 'block', category: '除外項目', thread_fact: sentence.trim(), thread_ref: { date: item.date, from: item.from }, draft_claim: body.match(/[^。\n]*(?:見積|請求|金額|ご請求)[^。\n]*/u)?.[0] ?? body, suggestion: '合意済みの除外項目が見積・請求に残っていないか要照合してください。' });
     }
   }
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo', year: 'numeric', month: 'numeric', day: 'numeric' }).formatToParts(now).filter(p => p.type !== 'literal').map(p => [p.type, Number(p.value)]));
+  const todayNumber = parts.year * 10000 + parts.month * 100 + parts.day;
   for (const match of body.matchAll(/(?<!\d)(\d{1,2})(?:\/|月)(\d{1,2})(?:日)?/gu)) {
-    const date = new Date(now.getFullYear(), Number(match[1]) - 1, Number(match[2]));
-    if (date < today) findings.push({ severity: 'warn', category: '日付', thread_fact: `本日: ${today.toLocaleDateString('ja-JP')}`, thread_ref: null, draft_claim: match[0], suggestion: '過去の日付が意図どおりか確認してください。' });
+    const draftNumber = parts.year * 10000 + Number(match[1]) * 100 + Number(match[2]);
+    if (draftNumber < todayNumber) findings.push({ severity: 'warn', category: '日付', thread_fact: `本日: ${parts.year}/${parts.month}/${parts.day}`, thread_ref: null, draft_claim: match[0], suggestion: '過去の日付が意図どおりか確認してください。' });
   }
   return findings;
 }
