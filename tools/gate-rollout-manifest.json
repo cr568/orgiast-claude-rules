@@ -196,6 +196,12 @@
       "rollout": "deny",
       "legacy": true
     },
+    "merge-handoff-gate": {
+      "rollout": "deny",
+      "distributedAt": "2026-10-25T00:00:00Z",
+      "denyAfter": "2026-11-01T00:00:00Z",
+      "pilotDeny": true
+    },
     "side-effect-left-gate": {
       "rollout": "deny",
       "distributedAt": "2026-10-17T00:00:00Z",

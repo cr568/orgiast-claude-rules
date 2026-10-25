@@ -244,3 +244,9 @@ LINE の全員配信が本当に必要なら、kim が同じセッションで�
 ## mail-draft-account-gate
 
 メールは seisaku-team@orgiast.jp の下書きに作る: `node tools/gmail-draft.mjs --to <宛先> --subject "<件名>" --body-file <本文ファイル> --json` → 読み戻し `node tools/gmail-search.mjs --user seisaku-team@orgiast.jp --query "in:drafts subject:<件名>" --json` → user が「送って」と言ったら重複・矛盾照会後 `node tools/gmail-draft.mjs --send <draftId> --json`。緊急退避のみ `ORGIAST_MAIL_ACCOUNT_GATE=off`。
+
+## merge-handoff-gate
+
+PR のマージを人に頼む文（本文の「次に kim がすること」・依頼文、Discord DM、fleet-mail）は、同じターンに PR の状態照会（`gh pr view <N> --json state,mergedAt,mergedBy` 等）と自分でのマージ試行（`gh pr merge <N> --squash --auto` か `gh pr edit <N> --add-label automerge`）の記録がある時だけ通す。MERGED なら依頼を消し、自動マージされるなら「この後の自動進行」に書く。両方試して失敗した時だけ、その出力を添えて依頼する。人の承認が本当に要る時は `[MERGE-HANDOFF-OK: <理由>]`。
+
+2026-10-25 cr 指摘: kim に「マージして」と頼んだ PR は、開くとほぼ全て既にマージ済みだった（cr568 は 2026-10-23 から push 権限があり、cr-PC の自動セッションが 10〜15分でマージ。kimkon1011 の PR は auto-merge.yml）。既存 Stop runner から呼ぶので Stop hook の追加登録は不要。`ORGIAST_MERGE_HANDOFF_GATE=0` で無効化できる。
