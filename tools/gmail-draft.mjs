@@ -6,20 +6,23 @@
  *       作成時の内部宛は認証前に停止。送信時は下書きの宛先を再検査。
  * 使い方:
  *   node tools/gmail-draft.mjs --check [--user <addr>] [--json]
- *   node tools/gmail-draft.mjs --send <draftId> [--user <addr>] [--json]
+ *   node tools/gmail-draft.mjs --send <draftId> [--user <addr>] [--ack-consistency <理由>] [--json]
  *   返信作成: --thread-id <threadId>（返信先ヘッダ・省略時の件名を自動取得）
  *   node tools/gmail-draft.mjs --delete <draftId> [--user <addr>] [--json]
  *   node tools/gmail-draft.mjs --to <addr> [--cc <addr>] --subject <件名>
- *     (--body <本文> | --body-file <path>) [--thread-id <threadId>] [--user <addr>] [--dry-run] [--json]
+ *     (--body <本文> | --body-file <path>) [--attach <path>]... [--thread-id <threadId>] [--user <addr>] [--dry-run] [--json]
  *   宛先は裸のメールアドレス（複数はカンマ区切り、またはオプションを反復）。
- *   --check はトークン取得だけ。--dry-run は認証も API 呼び出しもしない。
+ *   --check はトークン取得だけ。--send はスレッド全体との整合性を自動検査する。
  * 終了コード: 0 成功 / 3 内部宛 / 2 設定エラー / 1 その他。
  */
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
 import { isEntry } from './is-entry.mjs';
 import { defaultDriveKeyPath } from './lib/drive-auth.mjs';
 import { loadLedger, isInternal, extractAddresses } from './internal-recipient-gmail-guard.mjs';
+import { bodyHash, checkConsistency, statePath, mimeText, render as renderConsistency } from './mail-consistency-check.mjs';
 
 export const GMAIL_COMPOSE_SCOPE = 'https://www.googleapis.com/auth/gmail.compose';
 export const DEFAULT_USER = 'seisaku-team@orgiast.jp';
@@ -39,7 +42,9 @@ function addresses(value, required = false) {
   return list;
 }
 
-export function buildRawMessage({ from, to, cc, subject, body, inReplyTo, references }) {
+const MIME_TYPES = { '.pdf':'application/pdf','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.csv':'text/csv','.txt':'text/plain','.xlsx':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','.docx':'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
+function encodedWord(value) { return `=?UTF-8?B?${Buffer.from(value).toString('base64')}?=`; }
+export function buildRawMessage({ from, to, cc, subject, body, inReplyTo, references, attachments = [] }) {
   if (inReplyTo !== undefined && (typeof inReplyTo !== 'string' || !/^<[^<>\s]+@[^<>\s]+>$/u.test(inReplyTo))) throw configError();
   if (references !== undefined && (typeof references !== 'string' || /[\r\n]/u.test(references))) throw configError();
   const sender = addresses(from, true);
@@ -59,10 +64,18 @@ export function buildRawMessage({ from, to, cc, subject, body, inReplyTo, refere
     ...(copy.length ? [`Cc: ${copy.join(', ')}`] : []),
     `Subject: ${encodedSubject}`,
     ...(inReplyTo ? [`In-Reply-To: ${inReplyTo}`, `References: ${references || inReplyTo}`] : []), 'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset="UTF-8"', 'Content-Transfer-Encoding: base64',
   ];
   const encodedBody = Buffer.from(body.replace(/\r\n|\r|\n/gu, '\r\n')).toString('base64');
-  return b64url(`${headers.join('\r\n')}\r\n\r\n${(encodedBody.match(/.{1,76}/gu) ?? []).join('\r\n')}\r\n`);
+  if (!attachments.length) return b64url(`${[...headers, 'Content-Type: text/plain; charset="UTF-8"', 'Content-Transfer-Encoding: base64'].join('\r\n')}\r\n\r\n${(encodedBody.match(/.{1,76}/gu) ?? []).join('\r\n')}\r\n`);
+  const boundary = `orgiast_${crypto.randomBytes(12).toString('hex')}`;
+  const parts = [`--${boundary}`, 'Content-Type: text/plain; charset="UTF-8"', 'Content-Transfer-Encoding: base64', '', (encodedBody.match(/.{1,76}/gu) ?? []).join('\r\n')];
+  for (const attachment of attachments) {
+    const name = attachment.name; const type = attachment.type ?? MIME_TYPES[(name.match(/\.[^.]+$/u)?.[0] ?? '').toLowerCase()] ?? 'application/octet-stream';
+    const data = Buffer.from(attachment.data).toString('base64').match(/.{1,76}/gu)?.join('\r\n') ?? '';
+    parts.push(`--${boundary}`, `Content-Type: ${type}; name="${encodedWord(name)}"`, 'Content-Transfer-Encoding: base64', `Content-Disposition: attachment; filename="${encodedWord(name)}"`, '', data);
+  }
+  parts.push(`--${boundary}--`, '');
+  return b64url(`${[...headers, `Content-Type: multipart/mixed; boundary="${boundary}"`].join('\r\n')}\r\n\r\n${parts.join('\r\n')}`);
 }
 
 export function renderChatDisplay({ to, cc, subject = '', body = '' }) {
@@ -191,6 +204,13 @@ export async function deleteDraft({ user = DEFAULT_USER, id, fetchImpl = globalT
   } catch (error) { throw Object.assign(new Error(safeFailure(error).error), safeFailure(error)); }
 }
 
+async function fetchDraftBody({ user, id, fetchImpl, getToken }) {
+  const token = await getToken({ user, scope: GMAIL_COMPOSE_SCOPE });
+  const res = await fetchImpl(`https://gmail.googleapis.com/gmail/v1/users/me/drafts/${id}?format=full`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(25000) });
+  if (!res.ok) throw new Error('Gmail API 失敗');
+  return mimeText((await res.json())?.message?.payload).text;
+}
+
 /** Read the existing MIME headers before sending; include hidden Bcc recipients. */
 export async function sendDraft({ user = DEFAULT_USER, id, ledger = loadLedger(), fetchImpl = globalThis.fetch, getToken }) {
   if (typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/u.test(id)) throw configError();
@@ -223,10 +243,10 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i];
     if (['--check', '--json', '--dry-run'].includes(name)) { args[name.slice(2)] = true; continue; }
-    if (!['--to', '--cc', '--subject', '--body', '--body-file', '--user', '--delete', '--send', '--thread-id', '--in-reply-to'].includes(name) || i + 1 >= argv.length || argv[i + 1].startsWith('--')) throw configError();
+    if (!['--to', '--cc', '--subject', '--body', '--body-file', '--user', '--delete', '--send', '--thread-id', '--in-reply-to', '--attach', '--ack-consistency'].includes(name) || i + 1 >= argv.length || argv[i + 1].startsWith('--')) throw configError();
     const field = name.slice(2);
     const value = argv[++i];
-    if (field === 'to' || field === 'cc') (args[field] ??= []).push(value);
+    if (field === 'to' || field === 'cc' || field === 'attach') (args[field] ??= []).push(value);
     else { if (Object.hasOwn(args, field)) throw configError(); args[field] = value; }
   }
   return args;
@@ -249,7 +269,27 @@ export async function runCli({ argv = process.argv.slice(2), deps = {} } = {}) {
     const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
     const mintToken = deps.mintToken ?? (options => mintDwdToken({ ...options, fetchImpl }));
     if (Object.hasOwn(args, 'send')) {
-      if (['delete', 'check', 'to', 'cc', 'subject', 'body', 'body-file', 'dry-run', 'thread-id', 'in-reply-to'].some(k => Object.hasOwn(args, k))) throw configError();
+      if (['delete', 'check', 'to', 'cc', 'subject', 'body', 'body-file', 'dry-run', 'thread-id', 'in-reply-to', 'attach'].some(k => Object.hasOwn(args, k))) throw configError();
+      const inspect = deps.inspectDraft ?? (async () => {
+        const result = await checkConsistency({ target: args.send, draftId: args.send, user, deps: { fetchImpl, getToken: deps.readonlyToken, llm: deps.llm } });
+        return result;
+      });
+      let consistency;
+      try {
+        const file = statePath(args.send, deps.home);
+        const cached = (deps.readState ?? (p => JSON.parse(fs.readFileSync(p, 'utf8'))))(file);
+        const age = Date.now() - Date.parse(cached.checkedAt);
+        const getToken = deps.getToken ?? (options => mintToken({ ...options, keyPath: DEFAULT_KEY }));
+        const current = await (deps.getDraftBody ?? (options => fetchDraftBody({ ...options, fetchImpl, getToken })))({ user, id: args.send });
+        consistency = age <= 86400000 && cached.bodyHash === bodyHash(current) ? cached : await inspect();
+      } catch { consistency = await inspect(); }
+      if (!consistency.ok && !args['ack-consistency']) { emit({ ok: false, errorKind: 'consistency_block', findings: consistency.findings }, renderConsistency(consistency)); return 2; }
+      if (args['ack-consistency']) {
+        const record = { t: new Date().toISOString(), draftId: args.send, user, reason: args['ack-consistency'], findings: consistency.findings };
+        const ledgerFile = path.join(deps.home ?? os.homedir(), '.claude', 'state', 'mail-consistency', 'ack-ledger.jsonl');
+        (deps.appendLedger ?? ((p,s) => { fs.mkdirSync(path.dirname(p), {recursive:true}); fs.appendFileSync(p,s); }))(ledgerFile, JSON.stringify(record)+'\n');
+        stdout(`整合性 block を理由付きで承認: ${args['ack-consistency']}`);
+      }
       const result = await sendDraft({ user, id: args.send, ledger: (deps.loadLedger ?? loadLedger)(), fetchImpl,
         getToken: deps.getToken ?? (options => mintToken({ ...options, keyPath: DEFAULT_KEY })),
       });
@@ -257,7 +297,7 @@ export async function runCli({ argv = process.argv.slice(2), deps = {} } = {}) {
       return 0;
     }
     if (Object.hasOwn(args, 'delete')) {
-      if (['check', 'to', 'cc', 'subject', 'body', 'body-file', 'dry-run', 'thread-id', 'in-reply-to'].some(k => Object.hasOwn(args, k))) throw configError();
+      if (['check', 'to', 'cc', 'subject', 'body', 'body-file', 'dry-run', 'thread-id', 'in-reply-to', 'attach', 'ack-consistency'].some(k => Object.hasOwn(args, k))) throw configError();
       const result = await deleteDraft({ user, id: args.delete, fetchImpl,
         getToken: deps.getToken ?? (options => mintToken({ ...options, keyPath: DEFAULT_KEY })),
       });
@@ -267,21 +307,22 @@ export async function runCli({ argv = process.argv.slice(2), deps = {} } = {}) {
       return 0;
     }
     if (args.check) {
-      if (['to', 'cc', 'subject', 'body', 'body-file', 'dry-run', 'thread-id', 'in-reply-to'].some(k => Object.hasOwn(args, k))) throw configError();
+      if (['to', 'cc', 'subject', 'body', 'body-file', 'dry-run', 'thread-id', 'in-reply-to', 'attach', 'ack-consistency'].some(k => Object.hasOwn(args, k))) throw configError();
       const results = await probeScopes({ user, keyPath: DEFAULT_KEY, scopes: SCOPES, mintToken });
       const failed = results.filter(r => !r.ok);
       emit({ ok: !failed.length, results, ...(failed.length ? { errorKind: failed[0].errorKind } : {}) },
         results.map(r => `${r.ok ? 'OK' : 'NG'} ${r.scope}${r.ok ? '' : ` ${r.errorKind}: ${r.error}`}`).join('\n'));
       return failed.some(r => r.errorKind === 'configuration_error') ? 2 : failed.length ? 1 : 0;
     }
-    if ((!Object.hasOwn(args, 'subject') && !Object.hasOwn(args, 'thread-id')) || Object.hasOwn(args, 'body') === Object.hasOwn(args, 'body-file')) throw configError();
+    if (Object.hasOwn(args, 'ack-consistency') || (!Object.hasOwn(args, 'subject') && !Object.hasOwn(args, 'thread-id')) || Object.hasOwn(args, 'body') === Object.hasOwn(args, 'body-file')) throw configError();
     let body = args.body;
     if (args['body-file'] !== undefined) {
       try { body = (deps.readFile ?? (p => fs.readFileSync(p, 'utf8')))(args['body-file']); }
       catch { throw configError(); }
     }
     if (args['thread-id'] !== undefined && !/^[A-Za-z0-9_-]+$/u.test(args['thread-id'])) throw configError();
-    const input = { inReplyTo: args['in-reply-to'], from: user, to: args.to, cc: args.cc, subject: args.subject ?? 'Re: (取得予定)', body };
+    const attachments = (args.attach ?? []).map(file => { try { return { name: path.basename(file), data: (deps.readAttachment ?? fs.readFileSync)(file) }; } catch { throw configError(); } });
+    const input = { inReplyTo: args['in-reply-to'], from: user, to: args.to, cc: args.cc, subject: args.subject ?? 'Re: (取得予定)', body, attachments };
     const guard = guardRecipients(input, (deps.loadLedger ?? loadLedger)());
     if (guard.blocked) {
       action = 'chat-display';

@@ -22,6 +22,8 @@ async function cli(argv, overrides = {}) {
     fetchImpl: async () => { calls++; throw new Error('unexpected fetch'); },
     getToken: async () => { tokens++; throw new Error('unexpected token'); },
     mintToken: async () => { tokens++; throw new Error('unexpected mint'); },
+    readState: () => { throw new Error('no cached state'); },
+    inspectDraft: async () => ({ ok: true, findings: [], llm: { provider: null, error: null } }),
     ...overrides,
   } });
   return { code, output, calls, tokens };
@@ -50,6 +52,14 @@ test('Cc と長い日本語件名・本文を折り返して復元できる', ()
   assert.ok(words.every(m => m[0].length <= 75));
   assert.equal(words.map(m => Buffer.from(m[1], 'base64').toString()).join(''), subject);
   assert.ok(decoded.split('\r\n\r\n')[1].split('\r\n').every(s => s.length <= 76));
+});
+
+test('添付は multipart/mixed、RFC 2047 ファイル名、推定 MIME type で格納', () => {
+  const decoded = Buffer.from(buildRawMessage({ ...input, attachments: [{ name: '見積書.pdf', data: Buffer.from('%PDF') }] }), 'base64url').toString();
+  assert.match(decoded, /Content-Type: multipart\/mixed/u);
+  assert.match(decoded, /Content-Type: application\/pdf/u);
+  assert.match(decoded, /filename="=\?UTF-8\?B\?/u);
+  assert.match(decoded, /JVBERg==/u);
 });
 
 test('内部ドメイン・個人 Gmail・Cc を既存の内部判定でブロック', () => {
@@ -329,6 +339,13 @@ test('返信ヘッダと threadId を作成 API に渡す・注入を拒否す�
 const draftHeaders = extra => ({ message: { payload: { headers: [
   { name: 'To', value: 'Customer <customer@example.com>' }, { name: 'Subject', value: '確認' }, ...extra,
 ] } } });
+test('整合性 block は送信せず、ack 理由がある時だけ ledger に残して送る', async () => {
+  const blocked = await cli(['--send','draft','--json'], { inspectDraft: async()=>({ok:false,findings:[{severity:'block'}],llm:{}}) });
+  assert.equal(blocked.code,2); assert.equal(blocked.calls,0);
+  const ledger=[]; let calls=0;
+  const acked = await cli(['--send','draft','--ack-consistency','緊急対応','--json'], { inspectDraft: async()=>({ok:false,findings:[{severity:'block'}],llm:{}}), appendLedger:(_p,s)=>ledger.push(s), getToken:async()=> 't', fetchImpl:async()=>{calls++; return calls===1?response(draftHeaders([])):response({id:'sent',threadId:'thread'})} });
+  assert.equal(acked.code,0); assert.match(ledger[0],/緊急対応/u);
+});
 test('送信は指定アカウントの下書きを取得後 compose で送信し JSON を返す', async () => {
   const requests = [];
   const result = await cli(['--send', 'draft-123', '--user', 'shared@orgiast.jp', '--json'], {
