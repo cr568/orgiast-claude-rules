@@ -284,7 +284,7 @@ async function fetchDraftBody({ user, id, fetchImpl, getToken }) {
 }
 
 /** Read the existing MIME headers before sending; include hidden Bcc recipients. */
-export async function sendDraft({ user = DEFAULT_USER, id, ledger = loadLedger(), fetchImpl = globalThis.fetch, getToken }) {
+export async function sendDraft({ user = DEFAULT_USER, id, ledger = loadLedger(), fetchImpl = globalThis.fetch, getToken, draft: suppliedDraft }) {
   if (typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/u.test(id)) throw configError();
   const token = await (getToken ?? (args => mintDwdToken({ ...args, fetchImpl })))({ user, scope: GMAIL_COMPOSE_SCOPE });
   const request = async (url, options = {}) => {
@@ -295,7 +295,7 @@ export async function sendDraft({ user = DEFAULT_USER, id, ledger = loadLedger()
     });
     return res.json();
   };
-  const draft = await request(`https://gmail.googleapis.com/gmail/v1/users/me/drafts/${id}?format=full`);
+  const draft = suppliedDraft ?? await request(`https://gmail.googleapis.com/gmail/v1/users/me/drafts/${id}?format=full`);
   const headers = draft?.message?.payload?.headers;
   if (!Array.isArray(headers)) throw new Error('下書きの宛先を取得できません');
   const values = name => headers.filter(h => String(h.name).toLowerCase() === name).map(h => h.value);
@@ -355,30 +355,39 @@ export async function runCli({ argv = process.argv.slice(2), deps = {} } = {}) {
     }
     if (Object.hasOwn(args, 'send')) {
       if (['delete', 'check', 'to', 'cc', 'subject', 'body', 'body-file', 'dry-run', 'thread-id', 'in-reply-to', 'attach'].some(k => Object.hasOwn(args, k))) throw configError();
+      if (!/^[A-Za-z0-9_-]+$/u.test(args.send)) throw configError();
+      const getToken = deps.getToken ?? (options => mintToken({ ...options, keyPath: DEFAULT_KEY }));
+      const token = await getToken({ user, scope: GMAIL_COMPOSE_SCOPE });
+      const draftResponse = await fetchImpl(`https://gmail.googleapis.com/gmail/v1/users/me/drafts/${args.send}?format=full`, {
+        headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(25000),
+      });
+      if (!draftResponse.ok) throw new Error('Gmail API 失敗');
+      const draft = await draftResponse.json();
+      const headers = draft?.message?.payload?.headers;
+      const isForward = Array.isArray(headers) && headers.some(header => String(header.name).toLowerCase() === 'x-orgiast-forward'
+        && /^[A-Za-z0-9_-]+$/u.test(header.value));
       const inspect = deps.inspectDraft ?? (async () => {
         const result = await checkConsistency({ target: args.send, draftId: args.send, user, deps: { fetchImpl, getToken: deps.readonlyToken, llm: deps.llm } });
         return result;
       });
-      let consistency;
-      try {
+      let consistency = 'skipped_forward';
+      if (!isForward) try {
         const file = statePath(args.send, deps.home);
         const cached = (deps.readState ?? (p => JSON.parse(fs.readFileSync(p, 'utf8'))))(file);
         const age = Date.now() - Date.parse(cached.checkedAt);
-        const getToken = deps.getToken ?? (options => mintToken({ ...options, keyPath: DEFAULT_KEY }));
         const current = await (deps.getDraftBody ?? (options => fetchDraftBody({ ...options, fetchImpl, getToken })))({ user, id: args.send });
         consistency = age <= 86400000 && cached.bodyHash === bodyHash(current) ? cached : await inspect();
       } catch { consistency = await inspect(); }
-      if (!consistency.ok && !args['ack-consistency']) { emit({ ok: false, errorKind: 'consistency_block', findings: consistency.findings }, renderConsistency(consistency)); return 2; }
-      if (args['ack-consistency']) {
+      if (!isForward && !consistency.ok && !args['ack-consistency']) { emit({ ok: false, errorKind: 'consistency_block', findings: consistency.findings }, renderConsistency(consistency)); return 2; }
+      if (!isForward && args['ack-consistency']) {
         const record = { t: new Date().toISOString(), draftId: args.send, user, reason: args['ack-consistency'], findings: consistency.findings };
         const ledgerFile = path.join(deps.home ?? os.homedir(), '.claude', 'state', 'mail-consistency', 'ack-ledger.jsonl');
         (deps.appendLedger ?? ((p,s) => { fs.mkdirSync(path.dirname(p), {recursive:true}); fs.appendFileSync(p,s); }))(ledgerFile, JSON.stringify(record)+'\n');
         stdout(`整合性 block を理由付きで承認: ${args['ack-consistency']}`);
       }
-      const result = await sendDraft({ user, id: args.send, ledger: (deps.loadLedger ?? loadLedger)(), fetchImpl,
-        getToken: deps.getToken ?? (options => mintToken({ ...options, keyPath: DEFAULT_KEY })),
+      const result = await sendDraft({ user, id: args.send, ledger: (deps.loadLedger ?? loadLedger)(), fetchImpl, getToken, draft,
       });
-      emit({ ok: true, ...result }, `送信しました: ${result.sentMessageId} (${user})`);
+      emit({ ok: true, ...(isForward ? { consistency } : {}), ...result }, `送信しました: ${result.sentMessageId} (${user})`);
       return 0;
     }
     if (Object.hasOwn(args, 'delete')) {
