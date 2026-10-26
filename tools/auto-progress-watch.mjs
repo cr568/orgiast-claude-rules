@@ -13,7 +13,7 @@ import { ledgerFile, readLedger, writeLedger, OPEN_STATUSES, latestOpenPromises,
 export { MAX_RESUMES } from './auto-progress-ledger.mjs';
 import { resolveFleetLabel } from './lib/fleet-label.mjs';
 import { notifyOwner, resolveOwner } from './notify-owner.mjs';
-import { kimAction } from './auto-progress-digest.mjs';
+import { isQuietHours, kimAction } from './auto-progress-digest.mjs';
 import { checkPromise } from './auto-progress-check.mjs';
 import { appendInbox } from './auto-progress-inbox-hook.mjs';
 import { redactSecrets } from './redact-secrets.mjs';
@@ -199,6 +199,60 @@ export function logDoneDm(home, row, delivery, message, now = Date.now(), io = {
   }
 }
 
+export const DONE_NOTICE_RECENT_MS = 72 * 3600 * 1000;
+export const DONE_BACKLOG_MESSAGE_LIMIT = 1800;
+export const DONE_BACKLOG_MAX_MESSAGES = 3;
+
+function doneTime(row) {
+  for (const value of [row.doneAt, row.lastCheckedAt, row.ts]) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+function doneWasAlreadyReportedByCheck(row) {
+  // checkResult=done は checkPromise 自身が未達を再送する。掃除側でも送ると、
+  // 同じ巡回で check の結果通知と汎用完了DMが二重になる。
+  return row.check && row.checkResult === 'done';
+}
+
+export function doneNoticeSweepRows(rows, home, now = Date.now()) {
+  const eligible = rows.filter(row => row.status === 'done' && !row.doneNotifiedAt && !row.doneNotifySkipped &&
+    !isUnattendedRow(row, home) && !doneWasAlreadyReportedByCheck(row));
+  return {
+    recent: eligible.filter(row => now - doneTime(row) <= DONE_NOTICE_RECENT_MS),
+    backlog: eligible.filter(row => now - doneTime(row) > DONE_NOTICE_RECENT_MS),
+  };
+}
+
+const jstDay = value => new Intl.DateTimeFormat('ja-JP', {
+  timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit',
+}).format(new Date(value));
+
+export function formatDoneBacklogMessages(rows) {
+  const header = '📋 未通知だった自動進行の完了一覧\n過去に完了していたものをまとめてお知らせします。';
+  const entries = rows.map(row => ({
+    row,
+    line: `・${String(row.promise ?? '').replace(/\s+/g, ' ').trim().slice(0, 60) || '(約束なし)'}（${jstDay(doneTime(row))}）`,
+  }));
+  const messages = [];
+  let current = { text: header, rows: [] };
+  for (const entry of entries) {
+    const next = `${current.text}\n${entry.line}`;
+    if (next.length > DONE_BACKLOG_MESSAGE_LIMIT && current.rows.length) {
+      messages.push(current);
+      if (messages.length >= DONE_BACKLOG_MAX_MESSAGES) break;
+      current = { text: header, rows: [] };
+    }
+    if (`${current.text}\n${entry.line}`.length > DONE_BACKLOG_MESSAGE_LIMIT) continue;
+    current.text += `\n${entry.line}`;
+    current.rows.push(entry.row);
+  }
+  if (messages.length < DONE_BACKLOG_MAX_MESSAGES && current.rows.length) messages.push(current);
+  return messages;
+}
+
 // ---- Sheet ---------------------------------------------------------------
 export function sheetConfig(home) {
   try { const env = parseEnvText(fs.readFileSync(path.join(home, '.claude', 'fleet-sheet.env'), 'utf8')); return env.FLEET_SHEET_URL && env.FLEET_SHEET_TOKEN ? { url: env.FLEET_SHEET_URL, token: env.FLEET_SHEET_TOKEN } : null; }
@@ -291,6 +345,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
     `${originLine(row, { label: io.label ?? resolveFleetLabel(home), localOwner: ownerOf(row), home })}\n自動進行が判断待ちです: ${row.promise}\n${reason || ''}`, { home });
   const notifyDone = async (row, reason, artifact) => {
     if (row.doneNotifiedAt) return false;
+    if (isQuietHours(now)) return false;
     const message = formatDoneMessage(row, { reason, artifact, home, io, ownerOf });
     let delivery = null;
     try {
@@ -310,8 +365,9 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
   let candidates = latestOpenPromises(rows);
   const selected = new Set(candidates);
   const pendingChecks = rows.filter(row => row.check && row.status === 'done' && row.checkResult === 'done' && row.checkNotifiedResult !== 'done');
-  // 送信に失敗した完了DMは doneNotifiedAt が無いまま done で閉じるため、ここで拾い直して再送する。
-  const pendingDoneNotices = rows.filter(row => row.status === 'done' && row.doneNotifyPending && !row.doneNotifiedAt);
+  // 完了した経路に依存せず未通知を拾う。古い完了は個別DMを大量送信せず一覧にまとめる。
+  const doneSweep = doneNoticeSweepRows(rows, home, now);
+  summary.doneNotifications = { recent: doneSweep.recent.length, backlog: doneSweep.backlog.length };
   const normalized = rows.map((row) => {
     if (!WATCHED.has(row.status) || selected.has(row)) return row;
     summary.superseded += 1;
@@ -347,10 +403,22 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
       else if (state === 'unmet') summary.inProgress++;
     } catch (error) { summary.errors.push(`check: ${String(error?.message ?? error).slice(0, 120)}`); }
   }
-  for (const row of pendingDoneNotices) {
+  for (const row of doneSweep.recent) {
     if (dryRun || clock() + 60000 >= stopAt) break;
-    if (isUnattendedRow(row, home)) continue;
     await notifyDone(row, row.reason || '', row.doneNotifyArtifact || '');
+  }
+  if (!dryRun && !isQuietHours(now) && clock() + 60000 < stopAt) {
+    for (const group of formatDoneBacklogMessages(doneSweep.backlog)) {
+      let delivery = null;
+      try {
+        delivery = await (io.notifyOwner ?? notifyOwner)(ownerOf(group.rows[0]), group.text, { home });
+        if (delivery?.delivered !== 'dm') throw new Error(delivery?.reason || 'DM not delivered');
+        for (const row of group.rows) patch(rowKey(row), { doneNotifiedAt: new Date(now).toISOString(), doneNotifyMode: 'backlog', doneNotifyPending: false });
+      } catch (error) {
+        summary.errors.push(`notify-done-backlog: ${String(error?.message ?? error).slice(0, 120)}`);
+      }
+      logDoneDm(home, group.rows[0], delivery, group.text, now, io);
+    }
   }
   for (const row of candidates.filter(row => !row.check)) {
     // Reserve time for a 20-minute resume plus classification and reporting.

@@ -6,7 +6,7 @@ import test, { after } from 'node:test';
 import vm from 'node:vm';
 import { main as registerTasks } from './register-auto-progress-task.mjs';
 import { isNoopPromise, extractPromise, extractNextKim, applyPromise, buildRecord, record, readLedger, ledgerFile, rowKey, originLine } from './auto-progress-ledger.mjs';
-import { run as watch, parseVerdict, deterministicVerdict, judge, GRACE_MS, RESUME_INTERVAL_MS, MAX_RESUMES, postSheet, resumeSession, recentFiles, EXPIRE_UNATTENDED_MS, FALLBACK_STALL_MS, formatDoneMessage, readableReason } from './auto-progress-watch.mjs';
+import { run as watch, parseVerdict, deterministicVerdict, judge, GRACE_MS, RESUME_INTERVAL_MS, MAX_RESUMES, postSheet, resumeSession, recentFiles, EXPIRE_UNATTENDED_MS, FALLBACK_STALL_MS, formatDoneMessage, readableReason, formatDoneBacklogMessages } from './auto-progress-watch.mjs';
 import { run as digest, selectRows, formatDigest, isUnattendedRow, WINDOW_MS, MAX_ITEMS, needsDm, verdictOf, cleanText, isHumanActionRequired, waitingNotificationKey } from './auto-progress-digest.mjs';
 import { runRegisterPs1 } from './lib/run-register-ps1.mjs';
 
@@ -962,7 +962,7 @@ test('watch: 自動進行完了時に結果の中身つきDMを1通送り、2回
   // (a) resume が done を返すと notifyOwner が1回呼ばれ、本文に「結果:」と成果物パスが含まれる
   // (b) 2回目の巡回では送られない（doneNotifiedAt）
   const home = tmp();
-  const now = Date.parse('2026-10-23T12:00:00Z');
+  const now = Date.parse('2026-10-23T03:00:00Z');
   seed(home, [{
     sessionId: 'session-done-1',
     ts: new Date(now - 10 * H).toISOString(),
@@ -1022,7 +1022,7 @@ test('watch: 自動進行完了時に結果の中身つきDMを1通送り、2回
 test('watch: delivered!==dm なら doneNotifiedAt が付かず、errors に notify-done が入る', async () => {
   // (c) delivered!=='dm' なら doneNotifiedAt が付かず、errors に notify-done が入る
   const home = tmp();
-  const now = Date.parse('2026-10-23T12:00:00Z');
+  const now = Date.parse('2026-10-23T03:00:00Z');
   seed(home, [{
     sessionId: 'session-fail-1',
     ts: new Date(now - 10 * H).toISOString(),
@@ -1069,7 +1069,7 @@ test('watch: delivered!==dm なら doneNotifiedAt が付かず、errors に noti
 test('watch: judge 経由の done でも通知され、成果物は「なし」になる', async () => {
   // (d) judge 経由の done でも送られる
   const home = tmp();
-  const now = Date.parse('2026-10-23T12:00:00Z');
+  const now = Date.parse('2026-10-23T03:00:00Z');
   seed(home, [{
     sessionId: 'session-judge-1',
     ts: new Date(now - 10 * H).toISOString(),
@@ -1134,7 +1134,7 @@ test('formatDoneMessage: 1900字を超えず、readableで改行を保ちpc/sess
 
 test('watch: 完了DMの送信に失敗した行は次の巡回で再送し、成功したら doneNotifiedAt を付ける', async () => {
   const home = tmp();
-  const now = Date.parse('2026-10-23T12:00:00Z');
+  const now = Date.parse('2026-10-23T03:00:00Z');
   seed(home, [{
     sessionId: 'session-retry-1',
     ts: new Date(now - 10 * H).toISOString(),
@@ -1172,6 +1172,50 @@ test('watch: 完了DMの送信に失敗した行は次の巡回で再送し、�
 
   // 3回目は送らない。
   await watch({ home, now: now + 2 * H, io: noEvidenceIo({ resume: () => assert.fail('must not resume'), notifyOwner: () => assert.fail('must not notify') }) });
+});
+
+test('watch: 経路外の未通知doneを拾い、古い完了は一覧化し、通知済みcheckとunattendedを除外する', async () => {
+  const home = tmp(), now = Date.parse('2026-10-26T03:00:00Z');
+  const recent = { sessionId: 'recent', status: 'done', promise: 'hook経由の完了', doneAt: new Date(now - H).toISOString(), ts: new Date(now - 2 * H).toISOString(), reason: 'hookで完了' };
+  const oldRows = Array.from({ length: 20 }, (_, i) => ({ sessionId: `old-${i}`, status: 'done', promise: `過去作業${i}${'長'.repeat(55)}`, doneAt: new Date(now - 80 * H - i).toISOString(), ts: new Date(now - 90 * H).toISOString() }));
+  const checkSent = { sessionId: 'check', status: 'done', promise: 'check通知済み', check: {}, checkResult: 'done', checkNotifiedResult: 'done', doneAt: new Date(now - H).toISOString(), ts: new Date(now - 2 * H).toISOString() };
+  const unattended = { sessionId: 'probe', status: 'done', promise: '無人完了', cwd: 'C:\\Windows\\System32', doneAt: new Date(now - H).toISOString(), ts: new Date(now - 2 * H).toISOString() };
+  seed(home, [recent, ...oldRows, checkSent, unattended]);
+  const notices = [];
+  const result = await watch({ home, now, io: baseIo({ sheetConfig: () => null,
+    notifyOwner: async (owner, text) => { notices.push(text); return { delivered: 'dm' }; } }) });
+  assert.deepEqual(result.doneNotifications, { recent: 1, backlog: 20 });
+  assert.equal(notices.filter(text => text.includes('✅ 自動進行が完了しました')).length, 1);
+  const backlog = notices.filter(text => text.includes('未通知だった自動進行の完了一覧'));
+  assert.equal(backlog.length, 1);
+  assert.ok(backlog[0].length <= 1800);
+  assert.match(backlog[0], /過去作業0/);
+  const rows = readLedger(ledgerFile(home));
+  assert.ok(rows.find(row => row.sessionId === 'recent').doneNotifiedAt);
+  assert.equal(rows.find(row => row.sessionId === 'old-0').doneNotifyMode, 'backlog');
+  assert.equal(rows.find(row => row.sessionId === 'check').doneNotifiedAt, undefined);
+  assert.equal(rows.find(row => row.sessionId === 'probe').doneNotifiedAt, undefined);
+});
+
+test('watch: backlog送信失敗では印を付けず、夜間は翌朝まで送らない', async () => {
+  const home = tmp(), day = Date.parse('2026-10-26T03:00:00Z');
+  const row = { sessionId: 'old', status: 'done', promise: '古い完了', doneAt: new Date(day - 80 * H).toISOString(), ts: new Date(day - 90 * H).toISOString() };
+  seed(home, [row]);
+  const failed = await watch({ home, now: day, io: baseIo({ sheetConfig: () => null, notifyOwner: async () => ({ delivered: 'none', reason: 'network down' }) }) });
+  assert.ok(failed.errors.some(error => error.includes('notify-done-backlog: network down')));
+  assert.equal(readLedger(ledgerFile(home))[0].doneNotifiedAt, undefined);
+  let calls = 0;
+  await watch({ home, now: Date.parse('2026-10-26T18:00:00Z'), io: baseIo({ sheetConfig: () => null, notifyOwner: async () => { calls++; return { delivered: 'dm' }; } }) });
+  assert.equal(calls, 0);
+  assert.equal(readLedger(ledgerFile(home))[0].doneNotifiedAt, undefined);
+});
+
+test('formatDoneBacklogMessages: 1800字・最大3通に収める', () => {
+  const now = Date.parse('2026-10-26T03:00:00Z');
+  const rows = Array.from({ length: 200 }, (_, i) => ({ promise: `${i}-${'あ'.repeat(100)}`, doneAt: new Date(now - 80 * H).toISOString() }));
+  const messages = formatDoneBacklogMessages(rows);
+  assert.equal(messages.length, 3);
+  assert.ok(messages.every(group => group.text.length <= 1800));
 });
 
 test('watch: 他者待ちの通知は成功後24時間抑制し、失敗時は再試行する', async () => {
