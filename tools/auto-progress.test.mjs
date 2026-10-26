@@ -466,7 +466,7 @@ test('watch: 同一session・同一時刻の重複でも最後の行だけ再開
 
 
 test('digest routes each promise only to its owner', async () => {
-  const now = Date.now(), calls = [];
+  const now = Date.parse('2026-10-15T18:00:00+09:00'), calls = [];
   const rows = ['a', 'b'].map(owner => ({ owner, sessionId: `session-${owner}`, status: 'waiting_user', nextKim: '送信承認', promise: owner === 'a' ? '資料の確認' : '見積の確認', ts: new Date(now - H).toISOString() }));
   const result = await digest({ home: tmp(), now, io: {
     label: 'PC', readLedger: () => rows, readState: () => ({}), writeState() {},
@@ -479,7 +479,7 @@ test('digest routes each promise only to its owner', async () => {
 });
 
 test('digest: owner 未記録の行は自PCの持ち主へ送り、owner 空で notifyOwner を呼ばない', async () => {
-  const now = Date.now(), calls = [];
+  const now = Date.parse('2026-10-15T18:00:00+09:00'), calls = [];
   const rows = [
     { sessionId: 'legacy-1', status: 'waiting_user', nextKim: '送信承認', promise: '旧台帳の約束', ts: new Date(now - H).toISOString() },
     { owner: 'b@example.com', sessionId: 'session-b', status: 'waiting_user', nextKim: '送信承認', promise: '見積の確認', ts: new Date(now - H).toISOString() },

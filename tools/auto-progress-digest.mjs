@@ -406,6 +406,9 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
     : currentSlot === '朝'
       ? [...new Set([...newlyWaitingRows, ...newlyDoneRows, ...newlyStalledRows, ...newlyResumedRows, ...inProgressRows, ...waitingRows])]
       : [...new Set([...newlyWaitingRows, ...newlyDoneRows, ...newlyStalledRows, ...newlyResumedRows])];
+  const countedRows = isOutside
+    ? [...new Set(urgentItems)]
+    : [...new Set([...newlyWaitingRows, ...newlyDoneRows, ...newlyStalledRows, ...newlyResumedRows])];
   const groups = new Map();
   for (const row of changedRows) {
     const owner = ownerOf(row);
@@ -437,7 +440,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
 
   const messages = deliveries.map(d => d.message);
   const text = messages.join('\n');
-  const count = changedRows.length;
+  const count = countedRows.length;
 
   if (dryRun) return { sent: false, count, text, messages };
 
