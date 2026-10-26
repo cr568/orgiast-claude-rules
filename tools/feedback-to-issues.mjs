@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { backgroundSpawnOptions } from './lib/background-spawn.mjs';
 import { isEntry } from './is-entry.mjs';
+import { redactSecrets } from './redact-secrets.mjs';
 
 // アプリ名→リポの台帳。新アプリはここに1行足すと Issue 化と完了報告(feedback-done-notify)の対象に入る。
 // 追加漏れは feedback-form-gate.mjs が本番反映時に止める(§2.11)。
@@ -175,10 +176,13 @@ export function shellQuote(value) {
   return `'${text.replace(/'/g, `'"'"'`)}'`;
 }
 
-export function runGh(args, options = {}) {
-  // Windows の gh.cmd は直接 spawn できないため shell を使い、値はすべて個別に quote する。
+export function runGh(args, options = {}, spawn = spawnSync) {
+  // shell を通すと Windows で `"feedback-dm:x" in:body` の引用符が壊れ gh が unknown argument で落ちる(2026-10-23〜26 実害)。
+  // gh.exe は直接起動し、gh.cmd しか無い環境(ENOENT/EINVAL)だけ従来の quote 付き shell 経由に戻す。
+  const direct = spawn('gh', args, { ...options, encoding: 'utf8', windowsHide: true });
+  if (!['ENOENT', 'EINVAL'].includes(direct?.error?.code)) return direct;
   const command = ['gh', ...args].map(shellQuote).join(' ');
-  return spawnSync(command, { ...options, shell: true, encoding: 'utf8', windowsHide: true });
+  return spawn(command, { ...options, shell: true, encoding: 'utf8', windowsHide: true });
 }
 
 // 夜間巡回の一時的な 5xx / rate limit / ネットワーク断を吸収する。読み取り専用なので再試行してよい。
@@ -191,7 +195,14 @@ export function lookupFeedbackIssue(messageId, repo, gh, { attempts = 3, delayMs
     let lookup;
     try { lookup = gh(['issue','list','--repo',repo,'--state','all','--search',`"feedback-dm:${messageId}" in:body`,'--json','number,url,body','--limit','100']); }
     catch (error) { detail = error.message; continue; }
-    if (lookup?.error || lookup?.status !== 0) { detail = lookup?.error?.message || `status=${lookup?.status}`; continue; }
+    if (lookup?.error || lookup?.status !== 0) {
+      // Preserve the cause without copying credentials or unbounded CLI output into alerts.
+      const diagnostic = redactSecrets(String(lookup?.error?.message || lookup?.stderr || ''))
+        .replace(/https?:\/\/[^\s<>"']+/gi, '[URL REDACTED]')
+        .replace(/\s+/g, ' ').trim().slice(0, 500);
+      detail = `status=${lookup?.status}${diagnostic ? `: ${diagnostic}` : ''}`;
+      continue;
+    }
     try { return JSON.parse(lookup.stdout); } catch (error) { detail = `invalid JSON: ${error.message}`; }
   }
   throw new Error(`Issue lookup failed (${detail})`);
