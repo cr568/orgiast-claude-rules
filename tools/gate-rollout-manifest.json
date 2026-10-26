@@ -165,6 +165,10 @@
       "distributedAt": "2026-10-18T00:00:00Z",
       "denyAfter": "2026-10-25T00:00:00Z"
     },
+    "response-language-gate": {
+      "rollout": "deny",
+      "immediatePolicy": "2026-10-26 cr 指示: Stop hook の書き直しで英語へ逸脱した実害"
+    },
     "shallow-answer-gate": {
       "rollout": "deny",
       "distributedAt": "2026-10-10T00:00:00Z",
