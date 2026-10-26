@@ -328,6 +328,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
   const lastWaiting = { ...(state.lastWaiting || {}) };
   const notifiedUrgentKeys = new Set(state.notifiedUrgentKeys || []);
   const pendingNightKeys = new Set(state.pendingNightKeys || []);
+  const sentSlotOwners = new Set(state.sentSlotOwners || []);
   const lastSuccessAt = state.lastSuccessAt ? Date.parse(state.lastSuccessAt) : 0;
 
   const waitingRows = [];
@@ -392,17 +393,19 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
     return { skipped: 'already-sent', sent: false, count: 0 };
   }
 
-  // 変化0件なら送らない
+  // 変化0件なら送らない（ただし朝枠は進行中または判断待ちがあれば定時報告として送る）
   const totalChanges = newlyDoneRows.length + newlyStalledRows.length + newlyResumedRows.length + newlyWaitingRows.length;
-  if (!isOutside && totalChanges === 0) {
+  const isMorningHeartbeat = currentSlot === '朝' && (inProgressRows.length > 0 || waitingRows.length > 0);
+  if (!isOutside && totalChanges === 0 && !isMorningHeartbeat) {
     return { sent: false, count: 0 };
   }
 
-  // 送信の宛先は「変化のあった行」の持ち主だけ。既知の判断待ちは本文の一覧には載せるが、
-  // 宛先の決定には使わない（成功済みの宛先へ再送しないため）。
+  // 送信の宛先は「変化のあった行」の持ち主だけ。朝枠では進行中の行と判断待ちも定時報告の宛先に含める。
   const changedRows = isOutside
     ? [...new Set(urgentItems)]
-    : [...new Set([...newlyWaitingRows, ...newlyDoneRows, ...newlyStalledRows, ...newlyResumedRows])];
+    : currentSlot === '朝'
+      ? [...new Set([...newlyWaitingRows, ...newlyDoneRows, ...newlyStalledRows, ...newlyResumedRows, ...inProgressRows, ...waitingRows])]
+      : [...new Set([...newlyWaitingRows, ...newlyDoneRows, ...newlyStalledRows, ...newlyResumedRows])];
   const groups = new Map();
   for (const row of changedRows) {
     const owner = ownerOf(row);
@@ -410,7 +413,9 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
     groups.get(owner).push(row);
   }
 
-  const deliveries = [...groups].map(([owner, rows]) => {
+  const deliveries = [...groups]
+    .filter(([owner]) => !slotKey || !sentSlotOwners.has(`${slotKey}|${owner}`))
+    .map(([owner, rows]) => {
     const owned = activeRows.filter(r => ownerOf(r) === owner);
     const ownedWaiting = (isOutside ? rows : waitingRows).filter(r => ownerOf(r) === owner);
     const ownedDone = isOutside ? [] : newlyDoneRows.filter(r => ownerOf(r) === owner);
@@ -445,6 +450,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
     } catch (cause) { result = { reason: cause?.message || String(cause) }; }
     if (!['dm', 'toast'].includes(result?.delivered)) { error = result?.reason || 'DM not delivered'; break; }
     receipts.push({ owner, recipientId: result.recipientId, httpStatus: result.httpStatus, messageId: result.messageId, channelId: result.channelId });
+    if (slotKey) sentSlotOwners.add(`${slotKey}|${owner}`);
     for (const row of rows) {
       const key = rowKey(row);
       lastVerdicts[key] = verdictOf(row, now);
@@ -469,6 +475,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
       lastResumedAt,
       notifiedUrgentKeys: [...notifiedUrgentKeys],
       pendingNightKeys: [...pendingNightKeys],
+      sentSlotOwners: [...sentSlotOwners],
     });
   }
 
@@ -496,6 +503,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
     lastResumedAt,
     notifiedUrgentKeys: [...notifiedUrgentKeys],
     pendingNightKeys: [...pendingNightKeys],
+    sentSlotOwners: [...sentSlotOwners].slice(-100),
     lastSuccessAt: new Date(now).toISOString(),
     sentKeys: nextSentKeys,
   };
