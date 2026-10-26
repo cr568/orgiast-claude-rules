@@ -78,6 +78,7 @@ WAIT-STALL は返事待ちを手渡し理由にせず、催促・別経路を試
 ## internal-recipient-gmail-guard
 
 社内宛は `node ~/orgiast-claude-rules/tools/discord-dm.mjs "<名前 or メール>" --body "<本文>"` で Discord DM を送る（送れない時だけチャットに宛先/用件/本文を提示）。GitHubコメントの内部ハンドルは@を除く。
+既存メールの社内宛転送は `node tools/gmail-draft.mjs --forward <messageId> --to <宛先>` で下書きを作成できる。
 
 ## lane-abandonment-gate
 

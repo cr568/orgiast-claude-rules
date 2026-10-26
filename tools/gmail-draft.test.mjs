@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  GMAIL_COMPOSE_SCOPE, DEFAULT_USER, buildRawMessage, guardRecipients,
+  GMAIL_COMPOSE_SCOPE, DEFAULT_USER, buildRawMessage, buildForwardRaw, guardRecipients,
   renderChatDisplay, classifyTokenError, probeScopes, createDraft, deleteDraft, runCli,
 } from './gmail-draft.mjs';
 
@@ -12,6 +12,49 @@ const ledger = { domains: ['orgiast.jp', 'toho-kogyo.com'], addresses: ['staff@g
 const input = { from: DEFAULT_USER, to: 'customer@example.com', subject: '制作のお見積り', body: 'こんにちは。\nよろしくお願いします。' };
 const args = ['--to', input.to, '--subject', input.subject, '--body', input.body];
 const response = (value, status = 200) => new Response(JSON.stringify(value), { status });
+const originalMessage = subject => Buffer.from([
+  'From: 顧客 <customer@example.com>', 'Date: Sun, 25 Oct 2026 10:00:00 +0900',
+  `Subject: =?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`, 'To: seisaku-team@orgiast.jp',
+  'Content-Type: text/plain; charset=UTF-8', 'Content-Transfer-Encoding: base64', '',
+  Buffer.from('元メール本文').toString('base64'),
+].join('\r\n')).toString('base64url');
+
+test('forward MIME は件名・識別ヘッダ・本文・message/rfc822 添付を保持し Fwd を重ねない', () => {
+  for (const [sourceSubject, expected] of [['日本語件名', 'Fwd: 日本語件名'], ['Fwd: 済み', 'Fwd: 済み']]) {
+    const raw = buildForwardRaw({ from: DEFAULT_USER, to: 'staff@orgiast.jp', messageId: 'msg_123', preface: '確認してください', originalRaw: originalMessage(sourceSubject) });
+    const mime = Buffer.from(raw, 'base64url').toString('utf8');
+    assert.match(mime, /X-Orgiast-Forward: msg_123/u);
+    assert.match(mime, /Content-Type: message\/rfc822/u);
+    assert.match(mime, /filename="=\?UTF-8\?B\?/u);
+    const subjectLine = mime.match(/^Subject: ([\s\S]*?)\r\n(?! )/mu)[1].replace(/\r\n /gu, '');
+    const decodedSubject = subjectLine.replace(/=\?UTF-8\?B\?([^?]+)\?=/gu, (_m, value) => Buffer.from(value, 'base64').toString());
+    assert.equal(decodedSubject, expected);
+    assert.ok(mime.includes(Buffer.from('確認してください\r\n\r\n---------- Forwarded message ---------').toString('base64').slice(0, 30)));
+  }
+});
+
+test('forward CLI は内部宛を拒否せず raw 取得後に下書きを作る', async () => {
+  const requests = [];
+  const result = await cli(['--forward', 'msg_123', '--to', 'staff@orgiast.jp', '--body', '前置き', '--json'], {
+    getToken: async () => 't', fetchImpl: async (url, options = {}) => {
+      requests.push(url);
+      if (url.includes('/messages/msg_123?format=raw')) return response({ raw: originalMessage('日本語件名') });
+      const mime = Buffer.from(JSON.parse(options.body).message.raw, 'base64url').toString('utf8');
+      assert.match(mime, /To: staff@orgiast.jp/u);
+      return response({ id: 'forward-draft', message: { id: 'm' } });
+    },
+  });
+  assert.equal(result.code, 0);
+  assert.equal(requests.length, 2);
+  assert.equal(JSON.parse(result.output[0]).id, 'forward-draft');
+});
+
+test('forward は構築後25MB超を too_large で停止する', async () => {
+  const huge = Buffer.from(`Subject: large\r\nContent-Type: text/plain\r\n\r\n${'x'.repeat(19 * 1024 * 1024)}`).toString('base64url');
+  const result = await cli(['--forward', 'msg', '--to', 'staff@orgiast.jp', '--json'], { fetchMessageRaw: async () => huge });
+  assert.equal(result.code, 1);
+  assert.equal(JSON.parse(result.output[0]).errorKind, 'too_large');
+});
 
 async function cli(argv, overrides = {}) {
   const output = [];
@@ -375,6 +418,15 @@ test('送信前に To/Cc/Bcc の内部宛を拒否する（表示名・大小文
       assert.equal(JSON.parse(result.output[0]).errorKind, 'internal_recipient');
     }
   }
+});
+test('X-Orgiast-Forward 付き下書きだけ内部宛へ送信できる', async () => {
+  let calls = 0;
+  const result = await cli(['--send', 'draft', '--json'], { getToken: async () => 't', fetchImpl: async () => {
+    calls++;
+    return calls === 1 ? response(draftHeaders([{ name: 'To', value: 'staff@orgiast.jp' }, { name: 'X-Orgiast-Forward', value: 'msg_123' }])) : response({ id: 'sent', threadId: 'thread' });
+  } });
+  assert.equal(result.code, 0);
+  assert.equal(calls, 2);
 });
 test('送信引数の不正・競合は無通信、宛先不明・取得失敗では送らない', async () => {
   for (const flags of [['--send'], ['--send', '../send'], ['--send', 'd', '--delete', 'd'], ['--send', 'd', '--check'], ['--send', 'd', '--dry-run'], ['--send', 'd', ...args], ['--send', 'd', '--thread-id', 't']]) {

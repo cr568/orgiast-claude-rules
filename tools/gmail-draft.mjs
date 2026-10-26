@@ -7,6 +7,7 @@
  * 使い方:
  *   node tools/gmail-draft.mjs --check [--user <addr>] [--json]
  *   node tools/gmail-draft.mjs --send <draftId> [--user <addr>] [--ack-consistency <理由>] [--json]
+ *   node tools/gmail-draft.mjs --forward <messageId> --to <addr> [--cc <addr>] [--body <前置き> | --body-file <path>] [--user <addr>] [--dry-run] [--json]
  *   返信作成: --thread-id <threadId>（返信先ヘッダ・省略時の件名を自動取得）
  *   node tools/gmail-draft.mjs --delete <draftId> [--user <addr>] [--json]
  *   node tools/gmail-draft.mjs --to <addr> [--cc <addr>] --subject <件名>
@@ -44,7 +45,7 @@ function addresses(value, required = false) {
 
 const MIME_TYPES = { '.pdf':'application/pdf','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.csv':'text/csv','.txt':'text/plain','.xlsx':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','.docx':'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
 function encodedWord(value) { return `=?UTF-8?B?${Buffer.from(value).toString('base64')}?=`; }
-export function buildRawMessage({ from, to, cc, subject, body, inReplyTo, references, attachments = [] }) {
+export function buildRawMessage({ from, to, cc, subject, body, inReplyTo, references, attachments = [], extraHeaders = [] }) {
   if (inReplyTo !== undefined && (typeof inReplyTo !== 'string' || !/^<[^<>\s]+@[^<>\s]+>$/u.test(inReplyTo))) throw configError();
   if (references !== undefined && (typeof references !== 'string' || /[\r\n]/u.test(references))) throw configError();
   const sender = addresses(from, true);
@@ -63,7 +64,11 @@ export function buildRawMessage({ from, to, cc, subject, body, inReplyTo, refere
     `From: ${sender[0]}`, `To: ${addresses(to, true).join(', ')}`,
     ...(copy.length ? [`Cc: ${copy.join(', ')}`] : []),
     `Subject: ${encodedSubject}`,
-    ...(inReplyTo ? [`In-Reply-To: ${inReplyTo}`, `References: ${references || inReplyTo}`] : []), 'MIME-Version: 1.0',
+    ...(inReplyTo ? [`In-Reply-To: ${inReplyTo}`, `References: ${references || inReplyTo}`] : []),
+    ...extraHeaders.map(([name, value]) => {
+      if (!/^X-[A-Za-z0-9-]+$/u.test(name) || typeof value !== 'string' || /[\r\n]/u.test(value)) throw configError();
+      return `${name}: ${value}`;
+    }), 'MIME-Version: 1.0',
   ];
   const encodedBody = Buffer.from(body.replace(/\r\n|\r|\n/gu, '\r\n')).toString('base64');
   if (!attachments.length) return b64url(`${[...headers, 'Content-Type: text/plain; charset="UTF-8"', 'Content-Transfer-Encoding: base64'].join('\r\n')}\r\n\r\n${(encodedBody.match(/.{1,76}/gu) ?? []).join('\r\n')}\r\n`);
@@ -76,6 +81,71 @@ export function buildRawMessage({ from, to, cc, subject, body, inReplyTo, refere
   }
   parts.push(`--${boundary}--`, '');
   return b64url(`${[...headers, `Content-Type: multipart/mixed; boundary="${boundary}"`].join('\r\n')}\r\n\r\n${parts.join('\r\n')}`);
+}
+
+function decodeHeader(value = '') {
+  return value.replace(/=\?UTF-8\?B\?([^?]+)\?=/giu, (_m, data) => Buffer.from(data, 'base64').toString('utf8'));
+}
+function parseHeaders(text) {
+  const unfolded = text.replace(/\r?\n[ \t]+/gu, ' ');
+  const map = new Map();
+  for (const line of unfolded.split(/\r?\n/u)) {
+    const match = line.match(/^([^:]+):\s*(.*)$/u);
+    if (match) map.set(match[1].toLowerCase(), match[2]);
+  }
+  return map;
+}
+function decodePart(body, encoding = '') {
+  if (/base64/iu.test(encoding)) return Buffer.from(body.replace(/\s/gu, ''), 'base64').toString('utf8');
+  if (/quoted-printable/iu.test(encoding)) return body.replace(/=\r?\n/gu, '').replace(/=([0-9A-F]{2})/giu, (_m, hex) => String.fromCharCode(parseInt(hex, 16)));
+  return body;
+}
+function findPlainText(source) {
+  const split = source.search(/\r?\n\r?\n/u);
+  if (split < 0) return '';
+  const separator = source.slice(split).match(/^\r?\n\r?\n/u)?.[0] ?? '\r\n\r\n';
+  const headers = parseHeaders(source.slice(0, split));
+  const body = source.slice(split + separator.length);
+  const contentType = headers.get('content-type') ?? 'text/plain';
+  const boundary = contentType.match(/boundary=(?:"([^"]+)"|([^;\s]+))/iu)?.slice(1).find(Boolean);
+  if (/^multipart\//iu.test(contentType) && boundary) {
+    for (const part of body.split(`--${boundary}`).slice(1)) {
+      if (part.startsWith('--')) break;
+      const text = findPlainText(part.replace(/^\r?\n/u, ''));
+      if (text) return text;
+    }
+    return '';
+  }
+  return /^text\/plain/iu.test(contentType) ? decodePart(body, headers.get('content-transfer-encoding')) : '';
+}
+export function buildForwardRaw({ from, to, cc, preface = '', messageId, originalRaw }) {
+  if (typeof messageId !== 'string' || !/^[A-Za-z0-9_-]+$/u.test(messageId)) throw configError();
+  const original = Buffer.from(originalRaw, 'base64url');
+  const source = original.toString('utf8');
+  const split = source.search(/\r?\n\r?\n/u);
+  const headers = parseHeaders(split < 0 ? source : source.slice(0, split));
+  const subject = decodeHeader(headers.get('subject') ?? '(件名なし)');
+  const forwardedSubject = /^Fwd:/iu.test(subject) ? subject : `Fwd: ${subject}`;
+  const fields = [['From', 'from'], ['Date', 'date'], ['Subject', 'subject'], ['To', 'to'], ['Cc', 'cc']]
+    .flatMap(([label, key]) => headers.has(key) ? [`${label}: ${decodeHeader(headers.get(key))}`] : []);
+  const body = `${preface ? `${preface.replace(/\r\n|\r|\n/gu, '\n')}\n\n` : ''}---------- Forwarded message ---------\n${fields.join('\n')}\n\n${findPlainText(source)}`;
+  const safeName = subject.replace(/[\\/:*?"<>|\x00-\x1f]/gu, '_').slice(0, 120) || 'forwarded-message';
+  const raw = buildRawMessage({ from, to, cc, subject: forwardedSubject, body,
+    attachments: [{ name: `${safeName}.eml`, type: 'message/rfc822', data: original }],
+    extraHeaders: [['X-Orgiast-Forward', messageId]],
+  });
+  if (Buffer.from(raw, 'base64url').byteLength > 25 * 1024 * 1024) throw Object.assign(new Error('転送メールが25MBを超えています。'), { errorKind: 'too_large' });
+  return raw;
+}
+
+async function fetchMessageRaw({ user, id, fetchImpl, getToken }) {
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/u.test(id)) throw configError();
+  const token = await getToken({ user, scope: SCOPES[0] });
+  const res = await fetchImpl(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=raw`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(25000) });
+  if (!res.ok) throw new Error('Gmail API 失敗');
+  const json = await res.json();
+  if (typeof json.raw !== 'string' || !json.raw) throw new Error('元メールを取得できません');
+  return json.raw;
 }
 
 export function renderChatDisplay({ to, cc, subject = '', body = '' }) {
@@ -95,6 +165,7 @@ export function classifyTokenError(json) {
 
 function safeFailure(error) {
   const errorKind = error?.errorKind === 'configuration_error' ? 'configuration_error'
+    : error?.errorKind === 'too_large' ? 'too_large'
     : error?.tokenError ? classifyTokenError(error.detail)
       : ['scope_not_delegated', 'forbidden_no_access', 'unauthorized'].includes(error?.errorKind) ? error.errorKind : 'error';
   const messages = {
@@ -102,6 +173,7 @@ function safeFailure(error) {
     scope_not_delegated: 'DWD にこのスコープが未登録。Admin Console で SA client_id に追加が要る',
     forbidden_no_access: 'Gmail API へのアクセス権限がありません。',
     unauthorized: 'Gmail API の認証に失敗しました。',
+    too_large: '転送メールが25MBを超えています。',
     error: '処理に失敗しました（認証・通信・API 応答を確認してください）。',
   };
   return { errorKind, error: messages[errorKind] };
@@ -230,7 +302,8 @@ export async function sendDraft({ user = DEFAULT_USER, id, ledger = loadLedger()
   const recipients = extractAddresses({ to: values('to'), cc: values('cc'), bcc: values('bcc') });
   if (!recipients.length) throw new Error('下書きの宛先がありません');
   const internal = recipients.filter(addr => isInternal(addr, ledger));
-  if (internal.length) throw Object.assign(new Error('内部宛は Discord で連絡してください。'), { errorKind: 'internal_recipient', internal });
+  const isForward = values('x-orgiast-forward').some(value => /^[A-Za-z0-9_-]+$/u.test(value));
+  if (internal.length && !isForward) throw Object.assign(new Error('内部宛は Discord で連絡してください。'), { errorKind: 'internal_recipient', internal });
   const sent = await request('https://gmail.googleapis.com/gmail/v1/users/me/drafts/send', {
     method: 'POST', body: JSON.stringify({ id }),
   });
@@ -243,7 +316,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i];
     if (['--check', '--json', '--dry-run'].includes(name)) { args[name.slice(2)] = true; continue; }
-    if (!['--to', '--cc', '--subject', '--body', '--body-file', '--user', '--delete', '--send', '--thread-id', '--in-reply-to', '--attach', '--ack-consistency'].includes(name) || i + 1 >= argv.length || argv[i + 1].startsWith('--')) throw configError();
+    if (!['--to', '--cc', '--subject', '--body', '--body-file', '--user', '--delete', '--send', '--forward', '--thread-id', '--in-reply-to', '--attach', '--ack-consistency'].includes(name) || i + 1 >= argv.length || argv[i + 1].startsWith('--')) throw configError();
     const field = name.slice(2);
     const value = argv[++i];
     if (field === 'to' || field === 'cc' || field === 'attach') (args[field] ??= []).push(value);
@@ -257,7 +330,7 @@ export async function runCli({ argv = process.argv.slice(2), deps = {} } = {}) {
   const stdout = deps.stdout ?? (text => console.log(text));
   const jsonMode = argv.includes('--json');
   let user = DEFAULT_USER;
-  let action = argv.includes('--send') ? 'send' : argv.includes('--delete') ? 'delete' : argv.includes('--check') ? 'check' : argv.includes('--dry-run') ? 'dry-run' : 'create-draft';
+  let action = argv.includes('--send') ? 'send' : argv.includes('--forward') ? 'forward' : argv.includes('--delete') ? 'delete' : argv.includes('--check') ? 'check' : argv.includes('--dry-run') ? 'dry-run' : 'create-draft';
   let deletionId;
   const emit = (report, human) => stdout(jsonMode ? JSON.stringify({ action, user, ...report }) : human);
   try {
@@ -268,6 +341,18 @@ export async function runCli({ argv = process.argv.slice(2), deps = {} } = {}) {
     user = senders[0];
     const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
     const mintToken = deps.mintToken ?? (options => mintDwdToken({ ...options, fetchImpl }));
+    if (Object.hasOwn(args, 'forward')) {
+      if (['send', 'delete', 'check', 'subject', 'thread-id', 'in-reply-to', 'attach', 'ack-consistency'].some(k => Object.hasOwn(args, k)) || !Object.hasOwn(args, 'to') || (Object.hasOwn(args, 'body') && Object.hasOwn(args, 'body-file'))) throw configError();
+      let preface = args.body ?? '';
+      if (args['body-file'] !== undefined) { try { preface = (deps.readFile ?? (p => fs.readFileSync(p, 'utf8')))(args['body-file']); } catch { throw configError(); } }
+      const getToken = deps.getToken ?? (options => mintToken({ ...options, keyPath: DEFAULT_KEY }));
+      const originalRaw = await (deps.fetchMessageRaw ?? (options => fetchMessageRaw({ ...options, fetchImpl, getToken })))({ user, id: args.forward });
+      const raw = buildForwardRaw({ from: user, to: args.to, cc: args.cc, preface, messageId: args.forward, originalRaw });
+      if (args['dry-run']) { emit({ ok: true, raw, headers: Buffer.from(raw, 'base64url').toString('utf8').split('\r\n\r\n')[0] }, `raw: ${raw}`); return 0; }
+      const result = await createDraft({ user, raw, fetchImpl, getToken });
+      emit({ ok: true, ...result }, `転送下書きを作成しました: ${result.id} (${user})`);
+      return 0;
+    }
     if (Object.hasOwn(args, 'send')) {
       if (['delete', 'check', 'to', 'cc', 'subject', 'body', 'body-file', 'dry-run', 'thread-id', 'in-reply-to', 'attach'].some(k => Object.hasOwn(args, k))) throw configError();
       const inspect = deps.inspectDraft ?? (async () => {
