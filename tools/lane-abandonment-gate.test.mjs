@@ -34,7 +34,8 @@ for (const name of ['Bash', 'PowerShell']) {
 }
 test('codex nonzero followed by code Edit blocks',t=>assert.equal(evaluate(t,[...failure,use('Edit',{file_path:'/repo/a.js'})]).decision,'block'));
 test('all providers failed followed by three shell calls blocks',t=>assert.equal(evaluate(t,[use('Bash',{command:'node llm-ask.mjs'},'fail'),result('全候補が失敗'),...Array.from({length:3},()=>use('Bash',{command:'npm test'}))]).decision,'block'));
-test('doctor after failure exempts',t=>assert.equal(evaluate(t,[...failure,use('Bash',{command:'node tools/lane-doctor.mjs --probe'}),use('Write',{file_path:'a.js'})],{text:repair}).decision,'pass'));
+test('doctor after failure exempts only after a healthy result',t=>assert.equal(evaluate(t,[...failure,use('Bash',{command:'node tools/lane-doctor.mjs --probe'},'doctor'),result('生存: codex ✅','doctor'),use('Write',{file_path:'a.js'})],{text:repair}).decision,'pass'));
+test('running doctor without a healthy result does not exempt',t=>assert.equal(evaluate(t,[...failure,use('Bash',{command:'node tools/lane-doctor.mjs --probe'}),use('Write',{file_path:'a.js'})],{text:repair}).decision,'block'));
 test('fallback with reason exempts',t=>assert.equal(evaluate(t,[...failure,use('Edit',{file_path:'a.js'})],{text:'[LANE-FALLBACK] 全レーン停止を確認しSonnetへ委譲\n[LANE-REPAIR] codex: 修復不可 試行: 再インストールが拒否された'}).decision,'pass'));
 test('sonnet session passes',t=>assert.equal(evaluate(t,[...failure,use('Edit',{file_path:'a.js'})],{model:'claude-sonnet-5'}).decision,'pass'));
 test('doctor before failure does not exempt',t=>assert.equal(evaluate(t,[use('Bash',{command:'node tools/lane-doctor.mjs --probe'}),...failure,use('Edit',{file_path:'a.js'})]).decision,'block'));
@@ -86,7 +87,7 @@ test('期限切れの通知だけで本体作業が無い文は pass（原文の
 test('期限切れ後に再委譲する文は pass',t=>assert.equal(evaluate(t,[use('Read',{file_path:'a.md'})],{text:'Codex の待機がタイムアウトしたので、node tools/codex-do.mjs を前景で実行し直して完了まで見届けます。'}).decision,'pass'));
 test('期限切れ後の監督作業（テスト実行）は pass',t=>assert.equal(evaluate(t,[use('Read',{file_path:'a.md'})],{text:'Codex の待機がタイムアウトしたので、自分でテストを実行します。'}).decision,'pass'));
 test('Sonnet セッションは対象外',t=>assert.equal(evaluate(t,[use('Read',{file_path:'a.md'})],{model:'claude-sonnet-5',text:'Codex の待機がタイムアウトしたので、本体で実装を続けます。'}).decision,'pass'));
-test('全レーン停止の [LANE-FALLBACK] 明記は免除する',t=>assert.equal(evaluate(t,[use('Read',{file_path:'a.md'})],{text:'[LANE-FALLBACK] codex の待機がタイムアウトし全レーン停止。本体で実装を続けます。'}).decision,'pass'));
+test('全レーン停止の fallback も修復報告付きで免除する',t=>assert.equal(evaluate(t,[use('Read',{file_path:'a.md'})],{text:'[LANE-FALLBACK] codex の待機がタイムアウトし全レーン停止。本体で実装を続けます。\n[LANE-REPAIR] codex: 修復不可 試行: 前景で再実行し全滅を確認'}).decision,'pass'));
 test('LANE-ABANDON を優先し修理報告の要求を追記する',t=>{
   const r=evaluate(t,[...failure,use('Edit',{file_path:'a.js'})]);assert.equal(r.code,'LANE-ABANDON');assert.match(r.reason,/LANE-REPAIR/);
 });
@@ -101,6 +102,13 @@ test('修理報告だけでは失敗後の本体実装を免除しない',t=>{
   const r=evaluate(t,[...failure,use('Edit',{file_path:'a.js'})],{text:repair});
   assert.equal(r.decision,'block');assert.equal(r.code,'LANE-ABANDON');
 });
+
+test('assistant lane stop report requires a matching LANE-REPAIR line',t=>{
+  assert.equal(evaluate(t,[use('Read',{file_path:'a.md'})],{text:'Codex: 動作確認はまだ失敗します'}).decision,'block');
+  assert.equal(evaluate(t,[use('Read',{file_path:'a.md'})],{text:'Codex: 動作確認はまだ失敗します\n[LANE-REPAIR] codex: 修復不可 試行: native probe を再実行'}).decision,'pass');
+  assert.equal(evaluate(t,[use('Read',{file_path:'a.md'})],{text:'deepseek ✅(OpenRouter経由)'}).decision,'pass');
+});
+test('quoted and fenced lane stop reports are ignored',t=>assert.equal(evaluate(t,[use('Read',{file_path:'a.md'})],{text:'> Codex は失敗\n```\nDeepSeek は停止\n```'}).decision,'pass'));
 
 for (const prefix of ['✔ ', '✖ ', 'ok 1 - ', 'not ok 2 - ', 'ℹ ', '# Subtest: ', '  ✔ ', '\x1b[32m✔ ']) {
   test(`test runner line ${JSON.stringify(prefix)} is not a lane failure`, t => {
