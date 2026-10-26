@@ -383,11 +383,32 @@ const draftHeaders = extra => ({ message: { payload: { headers: [
   { name: 'To', value: 'Customer <customer@example.com>' }, { name: 'Subject', value: '確認' }, ...extra,
 ] } } });
 test('整合性 block は送信せず、ack 理由がある時だけ ledger に残して送る', async () => {
-  const blocked = await cli(['--send','draft','--json'], { inspectDraft: async()=>({ok:false,findings:[{severity:'block'}],llm:{}}) });
+  const blocked = await cli(['--send','draft','--json'], { inspectDraft: async()=>({ok:false,findings:[{severity:'block'}],llm:{}}), getToken:async()=> 't', fetchImpl:async()=>response(draftHeaders([])) });
   assert.equal(blocked.code,2); assert.equal(blocked.calls,0);
   const ledger=[]; let calls=0;
   const acked = await cli(['--send','draft','--ack-consistency','緊急対応','--json'], { inspectDraft: async()=>({ok:false,findings:[{severity:'block'}],llm:{}}), appendLedger:(_p,s)=>ledger.push(s), getToken:async()=> 't', fetchImpl:async()=>{calls++; return calls===1?response(draftHeaders([])):response({id:'sent',threadId:'thread'})} });
   assert.equal(acked.code,0); assert.match(ledger[0],/緊急対応/u);
+});
+test('X-Orgiast-Forward ありは整合性チェックを呼ばずに送る', async () => {
+  let inspected = 0; let calls = 0;
+  const result = await cli(['--send', 'draft', '--json'], {
+    inspectDraft: async () => { inspected++; return { ok: false, findings: [{ severity: 'block' }], llm: {} }; },
+    getToken: async () => 't', fetchImpl: async () => ++calls === 1
+      ? response(draftHeaders([{ name: 'X-Orgiast-Forward', value: 'msg_123' }]))
+      : response({ id: 'sent', threadId: 'thread' }),
+  });
+  assert.equal(result.code, 0); assert.equal(inspected, 0); assert.equal(calls, 2);
+  assert.equal(JSON.parse(result.output[0]).consistency, 'skipped_forward');
+});
+test('X-Orgiast-Forward なしは従来どおり整合性チェックを呼ぶ', async () => {
+  let inspected = 0;
+  const result = await cli(['--send', 'draft', '--json'], {
+    inspectDraft: async () => { inspected++; return { ok: false, findings: [{ severity: 'block' }], llm: {} }; },
+    readState: () => { throw new Error('no cache'); },
+    getToken: async () => 't', fetchImpl: async () => response(draftHeaders([])),
+  });
+  assert.equal(result.code, 2); assert.equal(inspected, 1);
+  assert.equal(JSON.parse(result.output[0]).errorKind, 'consistency_block');
 });
 test('送信は指定アカウントの下書きを取得後 compose で送信し JSON を返す', async () => {
   const requests = [];
