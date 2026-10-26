@@ -40,6 +40,30 @@ test('fallback with reason exempts',t=>assert.equal(evaluate(t,[...failure,use('
 test('sonnet session passes',t=>assert.equal(evaluate(t,[...failure,use('Edit',{file_path:'a.js'})],{model:'claude-sonnet-5'}).decision,'pass'));
 test('doctor before failure does not exempt',t=>assert.equal(evaluate(t,[use('Bash',{command:'node tools/lane-doctor.mjs --probe'}),...failure,use('Edit',{file_path:'a.js'})]).decision,'block'));
 test('line numbers and zero exit are not failures',()=>{assert.equal(failureSignal('HTTP source.ts:429:12'), '');assert.equal(failureSignal('exit code 0','codex-do.mjs'), '');});
+test('ファイル閲覧で表示された失敗判定のソースコードは拾わない', t => {
+  const source = 'const payment = /HTTP\\s*402\\b|credits are depleted|insufficient/i.test(text);';
+  const r = evaluate(t, [use('Bash', {command:'sed -n 176,250p tools/lane-doctor.mjs'}, 'read'), result(source, 'read'), use('Edit', {file_path:'tools/a.mjs'})]);
+  assert.equal(r.decision, 'pass');
+  assert.deepEqual(r.signals, []);
+});
+test('ログの tail で表示されたテストコードは拾わない', t => {
+  const source = "assert.match(failureSignal(`${text}\\nYou've hit your usage limit`, 'node tools/codex-do.mjs'), /usage limit/);";
+  const r = evaluate(t, [use('Bash', {command:'tail -c 600 codex.log'}, 'read'), result(source, 'read'), use('Edit', {file_path:'tools/a.mjs'})]);
+  assert.equal(r.decision, 'pass');
+  assert.deepEqual(r.signals, []);
+});
+test('指定されたファイル閲覧コマンドの結果は拾わない', () => {
+  for (const command of ['cat a', 'head a', 'tail a', 'sed -n 1,2p a', 'grep usage a', 'rg usage a', 'less a', 'type a', 'Get-Content a', 'git show HEAD:a', 'git diff', 'git log -1']) {
+    assert.equal(failureSignal("You've hit your usage limit", command), '', command);
+  }
+});
+test('レーン実行を tail した結果の usage limit は従来どおり拾う', t => {
+  const command = 'node tools/codex-do.mjs task | tail -5';
+  assert.match(failureSignal("You've hit your usage limit", command), /usage limit/);
+  const r = evaluate(t, [use('Bash', {command}, 'fail'), result("You've hit your usage limit", 'fail')]);
+  assert.equal(r.decision, 'block');
+  assert.equal(r.signals.length, 1);
+});
 test('documentation edits and pre-failure edits do not count',t=>assert.equal(evaluate(t,[use('Edit',{file_path:'a.js'}),...failure,use('Edit',{file_path:'note.md'})],{text:repair}).decision,'pass'));
 test('prior turn and quoted user failures are excluded',t=>{const home=fs.mkdtempSync(path.join(os.tmpdir(),'lane-turn-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));const raw=transcript([...failure,use('Edit',{file_path:'a.js'})])+'\n'+JSON.stringify({type:'user',message:{role:'user',content:'引用: HTTP 429 / 全候補が失敗'}})+'\n'+JSON.stringify({type:'assistant',message:{model:'claude-opus-5',content:[use('Edit',{file_path:'a.js'})]}});assert.equal(evaluateLaneAbandonment({transcriptRaw:raw,assistantText:'完了'},{home}).decision,'pass');});
 

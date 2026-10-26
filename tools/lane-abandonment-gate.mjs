@@ -44,14 +44,24 @@ export function resultText(content) {
   if (Array.isArray(content)) return content.map(resultText).join('\n');
   return content?.text || (content?.content ? resultText(content.content) : '');
 }
+const LANE_EXECUTION = /(?:^|[\s/\\])(?:codex-do|cheap-code|llm-ask|gemini|qwen|lane-doctor)(?:\.mjs)?(?=[\s"']|$)/i;
+const SOURCE_CODE_LINE = /\/[^/\r\n]+\/[dgimsuvy]*\.test\s*\(|\bassert\s*\.|\bconst\s+[A-Za-z_$][\w$]*\s*=|=>/;
+const FILE_INSPECTION = /^\s*(?:(?:cat|head|tail|grep|rg|less|type|Get-Content)\b|sed\s+-n\b|git\s+(?:show|diff|log)\b)/i;
 export function failureSignal(text, command = '') {
+  const executesLane = delegated.test(command) || LANE_EXECUTION.test(command);
+  const commandKind = classifyBashCommand(command);
+  // Results from file-inspection commands quote arbitrary source and logs.  They
+  // are evidence being inspected, not the output of an AI lane invocation.
+  // A lane command remains inspectable even when its output is piped to tail.
+  if (command && !executesLane && (commandKind === 'read-only' || FILE_INSPECTION.test(command))) return '';
   for (const line of String(text).split(/\r?\n/)) {
     // Test descriptions quote failure messages; they are not provider output.
     const plain = line.replace(/\x1b\[[0-9;]*m/g, '').trimStart();
     if (/^(?:[✔✖ℹ]\s|(?:not )?ok\s+\d+\s+-\s|# Subtest:)/.test(plain)) continue;
+    if (SOURCE_CODE_LINE.test(plain)) continue;
     if (/全候補が失敗|demote中|usage limit|credits are depleted|RESOURCE_EXHAUSTED|PreToolUse:Bash hook error: このターンで Fable\/Opus 本体が直接/i.test(line)
       || /WSL ディストリが見つかりません|spawn \S+ ENOENT/.test(line)
-      || ((delegated.test(command) || /(?:^|[\s/\\])(?:codex-do|cheap-code|llm-ask|gemini|qwen)(?:\.mjs)?(?=[\s"']|$)/i.test(command)) && /is not recognized as an internal or external command|command not found/i.test(line))
+      || (executesLane && /is not recognized as an internal or external command|command not found/i.test(line))
       || /HTTP\s*4(?:02|29)\b(?!\s*:)/i.test(line)
       || (/codex-do(?:\.mjs)?/i.test(command) && /\bexit code\s*[:=]?\s*[1-9]\d*\b/i.test(line))) return safeText(line).slice(0, 180);
   }
