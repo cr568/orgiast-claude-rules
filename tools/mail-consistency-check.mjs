@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { getDriveToken } from './lib/drive-auth.mjs';
 import { isEntry } from './is-entry.mjs';
+import { staleFindingsForDraft, resolveKeyPath } from './mail-stale-draft.mjs';
 
 const API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
@@ -76,17 +77,20 @@ async function gmailJson(token, endpoint, fetchImpl) {
   if (!res.ok) throw new Error(`Gmail API ${res.status}`);
   return res.json();
 }
-export async function loadTarget({ draftId, threadId, body, user, fetchImpl = globalThis.fetch, getToken = getDriveToken }) {
+export async function loadTarget({ draftId, threadId, body, user, fetchImpl = globalThis.fetch, getToken = options => getDriveToken({ ...options, keyPath: resolveKeyPath() }) }) {
   const token = await getToken({ scope: SCOPE, impersonate: user });
-  let draft;
+  let draft, stale = [];
   if (draftId) {
     draft = await gmailJson(token, `/drafts/${encodeURIComponent(draftId)}?format=full`, fetchImpl);
     threadId = draft.message?.threadId;
     body = mimeText(draft.message?.payload).text;
+    // 送信後の用件が進んだ宛先への古い下書き（名刺交換の御礼など）は送ると事故になる（2026-10-26 三昌商事様）
+    try { stale = await staleFindingsForDraft(token, draft, { fetchImpl }); }
+    catch (error) { stale = [{ severity: 'warn', category: '古い下書き', thread_fact: `送信履歴を確認できません: ${error.message}`, thread_ref: null, draft_claim: '', suggestion: '同じ宛先へ後から送ったメールが無いか確認してください。' }]; }
   }
   if (!idOk(threadId)) throw new Error('threadId を取得できません');
   const thread = await gmailJson(token, `/threads/${encodeURIComponent(threadId)}?format=full`, fetchImpl);
-  return { threadId, body, timeline: buildTimeline((thread.messages ?? []).filter(m => !m.labelIds?.includes('DRAFT'))) };
+  return { threadId, body, stale, timeline: buildTimeline((thread.messages ?? []).filter(m => !m.labelIds?.includes('DRAFT'))) };
 }
 function parseJson(text) {
   const match = String(text).match(/\{[\s\S]*\}/u); if (!match) throw new Error('JSON ではありません');
@@ -116,7 +120,7 @@ export function promptFor(timeline, body, extras) {
 export function saveState(report, home = os.homedir()) { const file = statePath(report.target, home); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(report, null, 2) + '\n'); return file; }
 export async function checkConsistency({ target, draftId, threadId, body, user = DEFAULT_USER, extras = [], deps = {} }) {
   const loaded = deps.loaded ?? await loadTarget({ draftId, threadId, body, user, fetchImpl: deps.fetchImpl, getToken: deps.getToken });
-  const deterministic = deterministicFindings({ body: loaded.body, timeline: loaded.timeline, extras, now: deps.now?.() ?? new Date() });
+  const deterministic = [...(loaded.stale ?? []), ...deterministicFindings({ body: loaded.body, timeline: loaded.timeline, extras, now: deps.now?.() ?? new Date() })];
   let llm = { provider: null, error: null }, llmFindings = [], summary = '';
   try { const result = await (deps.llm ?? defaultLlm)(promptFor(loaded.timeline, loaded.body, extras)); llm = { provider: result.provider ?? null, error: null }; llmFindings = result.findings; summary = result.summary ?? ''; }
   catch (error) { llm.error = String(error.message || error); }
