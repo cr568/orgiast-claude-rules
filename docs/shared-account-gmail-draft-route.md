@@ -28,7 +28,7 @@ node tools/gmail-search.mjs --user seisaku-team@orgiast.jp --query "in:sent to:c
 ```
 
 返信は In-Reply-To / References と threadId を付ける。件名は元メールに合わせる。修正は新規下書きを作成して読み戻した後、旧下書きを `--delete <旧draftId>` で削除する。
-送信直前に同じスレッドの送信済み・最新受信を読み、重複と日程・金額・数量・約束・名義の矛盾を照合する。送信後も宛先・件名・日時を読み戻す。下書きリンクには「seisaku-team@orgiast.jp で開く」と併記する。社内宛は Discord。
+送信直前に同じスレッドの送信済みを読み、重複を照合する。`--send` は `mail-consistency-check.mjs` を自動実行し、最新受信だけでなくスレッド全体の合意（金額・数量・人件費／設営／撤去・納品形態・日程・名義・支払条件・約束）と下書き・見積明細を照合する。block は下書きを直す。例外は `--ack-consistency "<理由>"` に限定し、理由を台帳と完了報告へ残す。生の Gmail API 送信は `mail-consistency-gate` が拒否する。送信後も宛先・件名・日時を読み戻す。下書きリンクには「seisaku-team@orgiast.jp で開く」と併記する。社内宛は Discord。
 
 `--send` は指定アカウント（既定 seisaku-team@、既存互換用の `--user` も可）の下書きを取得し、To/Cc/Bcc を既存台帳で照合する。内部宛は exit 3 で送信しない。JSON は `sentMessageId`, `threadId`, `to`, `subject` を含む。作成時の内部宛は認証前に拒否し、送信時は下書きの読み取り後に拒否する。送信 API の自動再試行は行わない。
 
