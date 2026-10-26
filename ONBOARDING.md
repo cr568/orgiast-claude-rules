@@ -668,6 +668,8 @@ workflow・keyserve・secrets・env・fleet 指令ファイルに触る時だけ
 
 **開いて確かめるだけの項目は書かない**（2026-10-26 cr 指摘）: PR・リンク・ファイルを開いて確認/レビュー/マージする類は、開く手間そのものが user の負担。状態は Claude が照会し（済んでいれば書かない）、未了なら Claude が実行するか「この後の自動進行」に回す。この行に書けるのは人にしかできない操作（支払い・OAuth 同意・アカウント作成・物理作業・選択肢を示した判断）だけ。next-action-gate が NEXT-ACTION-OPEN で block する。
 
+**メッセージ・通知を案内するときは一発で見つかる目印を書く**（2026-10-26 kim 指摘・全プロジェクト全PC全アカウント）: 「Discord に送りました」「メールが届いています」と書くときは、①アプリと開くアカウント ②送信者（Bot 名・人・メール） ③場所（DM 相手・チャンネル・ラベル） ④日時（日付と時:分） ⑤先頭行か件名の原文＋そのメッセージへの直接リンクをそろえ、できれば要点も本文に書く（毎日1000件以上届く中から探させない）。message-locator-gate が MSG-LOCATOR で block する。
+
 **目的を1つ与えた継続運転は `/autopilot start "<目的>"` を使う（2026-09-22 追加）**。毎回セッションを開閉して施策を指示させない。各PCへは SessionStart の `onboarding-sync` で `~/.claude/skills/autopilot/` を配布する。
 
 - 1周は `tools/autopilot-tick.mjs pre`（上限・Discord指示判定）→次の1施策を決定→`tools/codex-do.mjs` に実装委譲→Claudeが検証→`post` で記録→次回起床予約。既定上限は日20周・日6時間・noop連続3・総200周。超過時は自動一時停止し、`notify-kim` 経由でhostname付きDiscord DMと毎朝のダイジェストを送る。
