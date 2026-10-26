@@ -1740,6 +1740,10 @@ test('C: investigate は Codex を使わず llm-ask(gemini)の結果を返し、
   const row = readLedger(home).at(-1);
   assert.equal(row.provider, 'llm-ask');
   assert.equal(row.kind, 'investigate');
+  const warning = '[codex-do] 注意: llm-ask 経路のためコマンドは実行していません。出力中の「実行結果」は検証されていません';
+  const lines = result.stdout.trim().split(/\r?\n/);
+  assert.equal(lines[0], warning);
+  assert.equal(lines.at(-1), warning);
 });
 
 test('C: llm-ask は gemini → deepseek の順に失敗時フォールバックする', (t) => {

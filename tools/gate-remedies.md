@@ -141,6 +141,8 @@ run_in_background を外し前景実行、ScheduleWakeup を使わず timeout �
 ## pretooluse-lane-guard
 
 GUI operator・承認済み送信スクリプトは回数制限の対象外（Codex に委譲できない PC 操作を送信途中で止めないため）。
+ゲートが本体に要求するコマンドは `gateRequired` でツール回数に関係なく常時許可する。
+ゲートとガードが衝突したら回避せず、両者の契約テストを追加・修正して直す。
 
 node tools/lane-doctor.mjs --probe で状態更新し、node tools/codex-do.mjs --prompt-file <指示> --cwd <対象>。
 

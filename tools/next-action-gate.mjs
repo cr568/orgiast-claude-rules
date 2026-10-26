@@ -5,6 +5,7 @@ import { readTranscriptContext } from './lib/assistant-text.mjs';
 import { readStdinWithTimeout } from './lib/hook-stdin.mjs';
 import { currentTurnEntries, blocks } from './state-claim-evidence.mjs';
 import { isLandingDeferral } from './permanent-fix-deferral-scan.mjs';
+import { ledgerFile, readLedger, latestOpenPromises } from './auto-progress-ledger.mjs';
 
 export const MIN_ENFORCED_LENGTH = 200;
 const FOOTER_PATTERN = /(?:^|\n)次に kim がすること:[ \t]*([^\r\n]*)\r?\n(?:[ \t]*\r?\n)?この後の自動進行:[ \t]*([^\r\n]*)\r?\n(?:[ \t]*\r?\n)?このセッション:[ \t]*([^\r\n]*)$/;
@@ -125,7 +126,7 @@ export function reportsCloseSteps(text) {
 }
 
 // auto-progress --add-check survives user turns (the ledger carries the check forward); background evidence belongs only to this turn.
-function hasSessionWakeup(raw) {
+function hasSessionWakeup(raw, input = {}) {
   let autoProgress = false;
   let background = false;
   for (const line of String(raw || '').split(/\r?\n/)) {
@@ -151,6 +152,12 @@ function hasSessionWakeup(raw) {
       if ((tool.name === 'Agent' && tool.input?.run_in_background !== false)
         || (/^(?:Bash|PowerShell)$/.test(tool.name || '') && tool.input?.run_in_background === true)) background = true;
     }
+  }
+  if (!autoProgress && input.session_id) {
+    try {
+      autoProgress = latestOpenPromises(readLedger(ledgerFile()))
+        .some(row => row.sessionId === input.session_id && row.status === 'open');
+    } catch { /* A missing or unreadable ledger is not wakeup evidence. */ }
   }
   return { autoProgress, background };
 }
@@ -212,7 +219,7 @@ export function judgeNextAction(text, transcriptRaw = '', input = {}) {
   if (footer.nextAction !== 'なし' && (DEFERRAL_PATTERN.test(footer.nextAction) || isLandingDeferral(footer.nextAction) || (IMPLEMENTATION_PATTERN.test(footer.nextAction) && DELIVERY_PATTERN.test(body)))) {
     return { decision: 'block', code: 'NEXT-ACTION-DEFERRAL', reason: DEFERRAL_REASON };
   }
-  const wakeup = hasSessionWakeup(transcriptRaw);
+  const wakeup = hasSessionWakeup(transcriptRaw, input);
   if (hasAutopilot && footer.nextAction !== 'なし' && !wakeup.autoProgress
     && process.env.CLAUDE_HEADLESS !== '1' && !/subagents/i.test(input.transcript_path || '')) {
     return { decision: 'block', code: 'NEXT-ACTION-HUMAN-WAIT-NEEDS-CHECK', reason: '人待ちの自動進行は台帳の定期チェックに載せる: node tools/auto-progress.mjs --add-check --session <id> --check "<exit0=達成/1=未達のコマンド>" --deadline +7d --label "<名前>"' };

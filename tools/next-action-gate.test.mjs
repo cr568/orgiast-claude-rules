@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { judgeNextAction, reportsCloseSteps, SESSION_PHRASES } from './next-action-gate.mjs';
 
 // 自動セッション（CLAUDE_HEADLESS=1）の中でテストを走らせても、このファイルは通常セッションの
@@ -445,6 +448,22 @@ test('auto-progress --add-check 実行があればpass、登録は次ターン�
   assert.equal(judgeNextAction(promiseText, `${addCheckBash}\n${row('user', [{ type: 'tool_result', content: 'registered' }])}`).decision, 'pass');
   assert.equal(judgeNextAction(promiseText, `${addCheckBash}\n${row('user', '新たな依頼')}`).decision, 'pass');
   assert.equal(judgeNextAction(promiseText, row('user', '新たな依頼')).code, 'AUTOPILOT-NO-SESSION-WAKEUP');
+});
+
+test('会話に実行痕跡がなくても同じ session_id の open 台帳行があれば起床手段とみなす', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'next-action-ledger-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const previous = process.env.ORGIAST_HOME;
+  process.env.ORGIAST_HOME = home;
+  t.after(() => previous === undefined ? delete process.env.ORGIAST_HOME : process.env.ORGIAST_HOME = previous);
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'auto-progress-ledger.jsonl'), `${JSON.stringify({ ts: new Date().toISOString(), sessionId: 'ledger-session', status: 'open', check: 'node x' })}\n`);
+  for (const text of [promiseText, humanWaitText]) {
+    const result = judgeNextAction(text, '', { session_id: 'ledger-session' });
+    assert.equal(result.decision, 'pass', JSON.stringify(result));
+    assert.notEqual(result.code, 'NEXT-ACTION-HUMAN-WAIT-NEEDS-CHECK');
+    assert.notEqual(result.code, 'AUTOPILOT-NO-SESSION-WAKEUP');
+  }
 });
 
 test('空・なし・なしで始まる値には起床手段は不要', () => {

@@ -1083,11 +1083,14 @@ async function runLlmAsk() {
   return { result: last || { status: 1, outputChars: 0, output: '', stderr: '' }, provider: null, chain };
 }
 if (!useCodex) {
+  const llmAskWarning = '[codex-do] 注意: llm-ask 経路のためコマンドは実行していません。出力中の「実行結果」は検証されていません';
+  console.log(llmAskWarning);
   const started2 = Date.now();
   const routed = await runLlmAsk();
   recordUsage({ ...routed.result, status: routed.provider ? 0 : (routed.result.status || 1) }, `llm-ask/${routed.provider || 'none'}`, (Date.now() - started2) / 1000, 'llm-ask', routed.chain.length, routed.chain);
   if (!routed.provider) console.error(`[codex-do] llm-ask(gemini/deepseek/groq)がすべて失敗しました。Codex が必要な作業なら --kind implement を付けて再実行してください`);
   console.log(`[codex-do] executor=llm-ask${routed.provider ? `:${routed.provider}` : ''} kind=${taskKind}`);
+  console.log(llmAskWarning);
   process.exit(routed.provider ? 0 : (routed.result.status || 1));
 }
 
