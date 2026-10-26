@@ -466,7 +466,7 @@ test('watch: 同一session・同一時刻の重複でも最後の行だけ再開
 
 
 test('digest routes each promise only to its owner', async () => {
-  const now = Date.now(), calls = [];
+  const now = Date.parse('2026-10-15T18:00:00+09:00'), calls = [];
   const rows = ['a', 'b'].map(owner => ({ owner, sessionId: `session-${owner}`, status: 'waiting_user', nextKim: '送信承認', promise: owner === 'a' ? '資料の確認' : '見積の確認', ts: new Date(now - H).toISOString() }));
   const result = await digest({ home: tmp(), now, io: {
     label: 'PC', readLedger: () => rows, readState: () => ({}), writeState() {},
@@ -479,7 +479,7 @@ test('digest routes each promise only to its owner', async () => {
 });
 
 test('digest: owner 未記録の行は自PCの持ち主へ送り、owner 空で notifyOwner を呼ばない', async () => {
-  const now = Date.now(), calls = [];
+  const now = Date.parse('2026-10-15T18:00:00+09:00'), calls = [];
   const rows = [
     { sessionId: 'legacy-1', status: 'waiting_user', nextKim: '送信承認', promise: '旧台帳の約束', ts: new Date(now - H).toISOString() },
     { owner: 'b@example.com', sessionId: 'session-b', status: 'waiting_user', nextKim: '送信承認', promise: '見積の確認', ts: new Date(now - H).toISOString() },
@@ -567,9 +567,9 @@ test('digest: 同じ判定は再送せず、判断依頼の追加と判定変化
   row = { ...row, nextKim: '予算を選んでください' };
   assert.equal((await digest({ home, now: now + 8 * H, slot: '夕', io })).sent, true);
   assert.equal((await digest({ home, now: now + 9 * H, slot: '夕', io })).sent, false);
-  // 同じ判断依頼のまま判定だけ変わっても、変化ではないので翌朝も送らない。
+  // 同じ判断依頼のまま判定だけ変わっても、変化ではないので夕枠は送らないが、朝枠は定時報告として送る。
   row = { ...row, status: 'waiting_user' };
-  assert.equal((await digest({ home, now: now + 24 * H, slot: '朝', io })).sent, false);
+  assert.equal((await digest({ home, now: now + 24 * H, slot: '朝', io })).sent, true);
 });
 
 test('digest: 長文でも件の途中で切らず、成功した宛先を失敗後に再送しない', async () => {
@@ -674,15 +674,15 @@ test('digest: checkなしも新形式で集約しdoneは一度だけ', async () 
 });
 
 test('digest: 待機理由だけでは依頼せず、具体的なkimの操作がある場合のみ通知', async () => {
-  const now = Date.parse('2026-10-15T09:00:00+09:00'), home = tmp(), messages = [];
+  const now = Date.parse('2026-10-15T18:00:00+09:00'), home = tmp(), messages = [];
   let row = { sessionId: 'waiting', status: 'waiting_user', promise: '予約', nextKim: 'なし（判断待ち）', reason: '取引先の返信待ち', ts: new Date(now - H).toISOString() };
   const io = { readLedger: () => [row], notify: async text => { messages.push(text); return { delivered: 'dm' }; } };
   assert.equal(needsDm(row, now), false);
-  assert.equal((await digest({ home, now, slot: '朝', io })).sent, false);
+  assert.equal((await digest({ home, now, slot: '夕', io })).sent, false);
   row = { ...row, nextKim: '予約日を選んでください' };
-  assert.equal((await digest({ home, now, slot: '朝', io })).sent, true);
+  assert.equal((await digest({ home, now, slot: '夕', io })).sent, true);
   assert.match(messages[0], /予約日を選んでください/);
-  assert.equal((await digest({ home, now, slot: '朝', io })).sent, false);
+  assert.equal((await digest({ home, now, slot: '夕', io })).sent, false);
 });
 
 // ---- 要件5 の明示テスト ----------------------------------------------------
@@ -787,8 +787,8 @@ test('isHumanActionRequired: 相手や承認到着を待つ文言は人の操作
 });
 
 test('digest(要件5): 変化0件なら送らない', async () => {
-  // 朝枠 09:00 で変化なし (open のまま)
-  const now = Date.parse('2026-10-15T09:00:00+09:00');
+  // 夕枠 18:00 で変化なし (open のまま)
+  const now = Date.parse('2026-10-15T18:00:00+09:00');
   const home = tmp();
   const row = { sessionId: 's1', status: 'open', promise: '進行中の作業', ts: new Date(now - H).toISOString() };
   let calls = 0;
@@ -797,9 +797,61 @@ test('digest(要件5): 変化0件なら送らない', async () => {
     readState: () => ({ lastVerdicts: { [rowKey(row)]: 'open' }, lastKim: { [rowKey(row)]: 'なし' }, lastWaiting: { [rowKey(row)]: false } }),
     notify: async () => { calls++; return { delivered: 'dm' }; },
   };
-  const result = await digest({ home, now, slot: '朝', io });
+  const result = await digest({ home, now, slot: '夕', io });
   assert.deepEqual(result, { sent: false, count: 0 });
   assert.equal(calls, 0);
+});
+
+test('digest: 朝枠の定時報告（朝枠・変化0件・進行中1件→sent、夕枠・変化0件・進行中1件→送らない、朝枠・同じ日の2回目→already-sent）', async () => {
+  const home = tmp();
+  const morning = Date.parse('2026-10-15T09:00:00+09:00');
+  const evening = Date.parse('2026-10-15T18:00:00+09:00');
+  const row = { sessionId: 'prog-hb', status: 'open', promise: '進行中の案件確認', ts: new Date(morning - H).toISOString(), lastCheckedAt: new Date(morning - H).toISOString() };
+  let morningSent = 0;
+  let state = {
+    lastVerdicts: { [rowKey(row)]: 'in_progress' },
+    lastKim: { [rowKey(row)]: 'なし' },
+    lastWaiting: { [rowKey(row)]: false },
+  };
+  const morningIo = {
+    readLedger: () => [row],
+    readState: () => state,
+    writeState: (_h, v) => { state = v; },
+    notify: async () => { morningSent++; return { delivered: 'dm' }; },
+  };
+
+  // 朝枠・変化0件・進行中1件 → dryRun の text に項目名が入る
+  const dry = await digest({ home, now: morning, slot: '朝', dryRun: true, io: morningIo });
+  assert.equal(dry.sent, false);
+  assert.match(dry.text, /進行中の案件確認/);
+  assert.match(dry.text, /進行中/);
+
+  // 朝枠・変化0件・進行中1件 → sent: true
+  const first = await digest({ home, now: morning, slot: '朝', io: morningIo });
+  assert.equal(first.sent, true);
+  assert.equal(morningSent, 1);
+
+  // 朝枠・同じ日の2回目 → already-sent
+  const second = await digest({ home, now: morning + 1000, slot: '朝', io: morningIo });
+  assert.equal(second.skipped, 'already-sent');
+  assert.equal(second.sent, false);
+  assert.equal(morningSent, 1);
+
+  // 夕枠・変化0件・進行中1件 → 送らない（従来どおり）
+  const eveningHome = tmp();
+  let eveningSent = 0;
+  const eveningIo = {
+    readLedger: () => [row],
+    readState: () => ({
+      lastVerdicts: { [rowKey(row)]: 'in_progress' },
+      lastKim: { [rowKey(row)]: 'なし' },
+      lastWaiting: { [rowKey(row)]: false },
+    }),
+    notify: async () => { eveningSent++; return { delivered: 'dm' }; },
+  };
+  const eveningResult = await digest({ home: eveningHome, now: evening, slot: '夕', io: eveningIo });
+  assert.deepEqual(eveningResult, { sent: false, count: 0 });
+  assert.equal(eveningSent, 0);
 });
 
 test('digest(要件5): 61件相当でも1通・1800字以内・「ほか N 件」にまとめる', () => {
