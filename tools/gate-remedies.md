@@ -160,6 +160,10 @@ node tools/lane-doctor.mjs --probe で状態更新し、node tools/codex-do.mjs 
 
 同じ内容を日本語で書き直す。コード・コマンド・固有名詞・URL は英字のままでよい。user が英語での返答を明示した場合だけ本文に [EN-OK] を書く。応答言語は settings.json の `"language": "japanese"`（register-hooks が全PCへ配布）でも固定している。
 
+## response-language-gate
+
+説明文・報告・質問を日本語で書き直す。コード・識別子・コマンド・URL・パスは原文のままでよい。Stop hook の差し戻しで書き直すときも日本語を保つ。
+
 ## shallow-answer-gate
 
 件名・一覧・ファイル名だけでなく、候補となるメッセージ・ファイルの中身を開いて確認（read_file_content / get_message / WebFetch 等）した上で回答する。どうしても確認不能な場合は本文に [DEPTH-OK: 理由] を書く。

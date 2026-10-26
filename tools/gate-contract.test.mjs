@@ -33,6 +33,11 @@ test('new rollout entries must declare the seven day window; legacy inventory is
       assert.equal(row.immediatePolicy, '2026-10-25 kim 指示: 全PCのメール下書きは seisaku-team@orgiast.jp に統一');
       continue; // Explicit account policy applies immediately on every PC.
     }
+    if (name === 'response-language-gate') {
+      assert.equal(row.rollout, 'deny');
+      assert.equal(row.immediatePolicy, '2026-10-26 cr 指示: Stop hook の書き直しで英語へ逸脱した実害');
+      continue; // Explicit response-language policy applies immediately on every PC.
+    }
     if (name === 'api-billing-guard') {
       assert.equal(row.rollout, 'deny');
       assert.equal(row.immediatePolicy, '2026-10-17 kim 厳命: 従量課金停止');
