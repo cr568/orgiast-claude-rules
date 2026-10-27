@@ -8,6 +8,9 @@ test('配布する実文書の索引が8000bytes以下で結論と新規約を�
   const index = makeIndex(body);
   assert(Buffer.byteLength(index) <= INDEX_BUDGET_BYTES, `${Buffer.byteLength(index)} bytes`);
   for (const line of body.split(/\r?\n/).filter(l => /^\*{0,2}\s*(?:🔴|🛑|⚙️|🔁)/u.test(l))) assert([...line].length <= 200, line);
+  const judgmentAxis = body.split(/\r?\n/).find(line => line.includes('判断軸はオージャストの長期的利益の最大化'));
+  assert.ok(judgmentAxis);
+  assert.ok(index.split('\n').includes(judgmentAxis), '判断軸の🔴行が圧縮版に全文一致で含まれる');
   for (const pattern of INDEX_PROTECTED) assert.match(index, pattern);
   assert.match(index, /1\.20 auto mode classifier/);
   assert.doesNotMatch(index, /丸1日|1-00:57|コマンド置換として実行/);

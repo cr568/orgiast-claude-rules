@@ -33,7 +33,7 @@ const rawUrl = process.env.ORGIAST_ONBOARDING_URL || 'https://raw.githubusercont
 const keyserveUrl = process.env.ORGIAST_KEYSERVE_URL || 'https://orgiast-keyserve.vercel.app/api/keys';
 const beginPrefix = '<!-- BEGIN: オージャスト共通ルール';
 const endMarker = '<!-- END: オージャスト共通ルール -->';
-const indexLead = '全文は ~/.claude/orgiast-onboarding.md（および https://raw.githubusercontent.com/kimkon1011/orgiast-claude-rules/main/ONBOARDING.md ）。このファイルは自動ロードされない。判断に迷ったら Read ツールで該当節を読むこと';
+const indexLead = '全文は ~/.claude/orgiast-onboarding.md。自動ロードされないため、判断に迷ったら Read ツールで該当節を読むこと';
 export const PRESERVE_LOCAL_KEYS = new Set(['REPORTER_LABEL', 'REPORTER_HOST']);
 export const KEYS_GUARD_MS = 20 * 60 * 60 * 1000;
 export const KEYS_ALERT_STALE_MS = 48 * 60 * 60 * 1000;
@@ -670,8 +670,9 @@ export function makeIndex(body) {
     }
     if (line.trim()) previousNonempty = line;
     if (/^#{1,3}(?:\s|$)/.test(line)) {
-      // 索引は規約の見出しを残し、日付・由来は全文へ委ねて配布上限内に収める。
-      kept.push(line.replace(/（(?:kim\s+)?\d{4}-\d{2}-\d{2}[^）]*）/g, ''));
+      // 実文書のタイトルと章見出しは全文へ委ね、参照先になる個別規約の見出しを優先する。
+      const broadOnboardingHeading = /^# オージャスト Claude Code 共通ルール/.test(line) || /^##(?:\s|$)/.test(line);
+      if (!broadOnboardingHeading) kept.push(line.replace(/（(?:kim\s+)?\d{4}-\d{2}-\d{2}[^）]*）/g, ''));
       // 大見出しは案内だけにし、個別規約（###）の結論と絶対ルールを優先する。
       for (let j = i + 1; /^###\s/.test(line) && j < lines.length && !/^#{1,3}(?:\s|$)/.test(lines[j]); j++) {
         const candidate = lines[j].trim();
@@ -691,8 +692,12 @@ export function makeIndex(body) {
     }
     // 絶対ルール・上限規定の行は全文のまま残す。原文は `**🛑 上限…` のように強調記号が先に来るので
     // 先頭の `*` を許容する(ここを `**🔴` だけにすると 🛑/⚙️/🔁 の4行が索引から落ちる)。
-    // 行末の日付付き由来（2026-10-23 cr 等）だけは全文へ委ねる。文中の由来は適用範囲を含むので残す。
-    if (/^\*{0,2}\s*(?:🔴|🛑|⚙️|🔁)/u.test(line) && kept.at(-1) !== line) kept.push(line.replace(/（(?:kim\s+)?\d{4}-\d{2}-\d{2}[^）]*）(?=。?\*\*$)/u, ''));
+    // 通常は行末の由来を全文へ委ねる。判断軸は ONBOARDING と配布先で同じ一文を参照する要件のため原文を保つ。
+    if (/^\*{0,2}\s*(?:🔴|🛑|⚙️|🔁)/u.test(line) && kept.at(-1) !== line) {
+      kept.push(line.includes('判断軸はオージャストの長期的利益の最大化')
+        ? line
+        : line.replace(/（(?:kim\s+)?\d{4}-\d{2}-\d{2}[^）]*）(?=。?\*\*$)/u, ''));
+    }
   }
   const original = kept.join('\n');
   if (Buffer.byteLength(original) <= INDEX_BUDGET_BYTES || !conclusions.size) return original;
