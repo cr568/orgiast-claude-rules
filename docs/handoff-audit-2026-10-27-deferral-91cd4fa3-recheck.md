@@ -307,3 +307,21 @@ repo/worktree=/mnt/c/Users/user/.claude/quota-sweep-repo、branch=quota-sweep/20
 証跡=.loop/quota-sweep-codex-evidence.md、docs/handoff-audit-2026-10-27-deferral-91cd4fa3-recheck.md。次は累積上限の明示変更と書込可能なgit管理領域が必要。
 
 終了記録 2026-10-27T04:46:10.652211+00:00 UTC: 指定 `git commit -F /tmp/quota-sweep-current-msg -- docs/handoff-audit-2026-10-27-deferral-91cd4fa3-recheck.md` は終了128。実gitdirのindex.lock作成がRead-only file systemのためコミット未作成。.loop/除外、迂回なし。stop_reason=budget、追加阻害=scope-boundary。owner退出時解放。C-HANDOFF: 保存後読戻しで要約・証跡・budgetの一致を照合。
+
+## quota-sweep-claude 累積試行2 / C2・C3・C4 再観測（2026-10-27T05:22:53Z 終端 / HEAD 6a545a7 / Node v24.22.1）
+- C2: 窓 (2026-10-26T11:26:28.622Z, 2026-10-27T05:22:53.218Z)。home=C:\Users\user。runner 1569行・監査台帳 1610行・夜間台帳 230行、不正JSON 0。W は runner 3件（同セッション 91cd4fa3 のみ、11:26〜11:27 の block/pass/block）。監査台帳 4件のうち 3件が同セッション、1件（2026-10-27T00:55:48Z / session 54dc84fd）は quota-sweep-claude ループ自身の報告 excerpt が再現文例を引用したもので verdict=pass・violations=[]。別セッションの再発ではなく引用として分類（P/W 台帳の violations.quote ではない）。夜間台帳 W=0。
+- C3: 原文と同型の「検証は Codex に任せています。結果が出たらここに報告します。」は以前 detect()=[] の検出漏れだったが、46274e0（#1175 経由で HEAD に含まれる）で ARRIVAL_WAIT を拡張済み。現 HEAD で原文・同型とも W 検出、「検証が完了し結果を確認して報告します」（完了文）は [] を確認。除外は広げていない。
+- C4: 検出経路（nightly→scan）は上記 2026-10-26 記録のコード照合から変更なし。スケジューラの稼働・直近実行の実物は今回も未確認＝未達のまま。
+- C5: 単一 `node --test tools/` の1回 exit 0 は未取得（前景上限600sのため。分割 3 shard の全緑 7074 件は試行5〜7で記録）。厳密には未達。
+
+## 累積試行3（C4 夜間経路の稼働実物）
+- スケジューラ: OrgiastNightlyBatch（Ready、LastRun 2026-10-27 03:00 JST、結果 0）。実行は tools/nightly-batch.ps1 で、L122 が handoff-audit-nightly.mjs を呼び、非0なら error をログに残す。
+- 実行記録: logs/nightly-batch-2026-10-24〜27 の4日分すべてで `handoff-audit-nightly / ok`（10-27 は 03:06:33）。nightly 台帳に 2026-10-26T18:06Z の 55 行が追記されている。
+- 限界: 同回の 91cd4fa3 の1行は provider timeout で verdict=audit-unavailable（LLM 監査の欠損であり、scan 経路の検出漏れとは別）。「ok」はプロセス終了を示すだけで、全セッションの監査成功を保証しない。
+- C5 は引き続き、単一コマンドの完走が前景上限で取得できず未達（分割全緑は試行5〜7）。
+
+## Claude 累積試行4（2026-10-27 / HEAD 7edb67d / Node v24.22.1）C5 の扱い確定
+
+契約の単一コマンド `node --test tools/` は Node 24 でディレクトリ指定をファイル扱いし tests=1/fail=1 で収集しない（試行2のログ）。CI 同形の glob `node --test 'tools/**/*.test.mjs'` の単一実行は約574〜590sで前景上限600sに余裕がなく、試行4観測で timeout 590s・EXIT=124。background 実行はヘッドレス hook が拒否。
+代替として glob を 3 shard で前景実行した結果は shard1 2234/pass 2233/fail 0/skip 1、shard2 2734/2728/0/6、shard3（並行度1）2106/2105/0/1、すべて EXIT=0。合計 7074 件で収集は全数、fail 0。shard3 の flaky は並行度既定で3件・2で1件・1で0件と並行負荷依存。閾値緩和・skip・テスト変更はなし。
+結論: 分割全緑は成立するが、契約文言どおりの単一ゲート1回 exit 0 は取得不能。C5 は厳密には未達として残し、緑とは扱わない。ソース変更なし（再発は同セッション4件が実在、C3 の token 発行は本人操作待ちで承認外）。
