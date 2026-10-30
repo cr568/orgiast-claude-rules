@@ -6,7 +6,12 @@ export function killTree(pid, { platform = process.platform, spawnImpl = spawnSy
   if (platform === 'win32') {
     const r = spawnImpl('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 10_000 });
     if (r.error) throw r.error;
-    if (r.status !== 0) throw new Error(`taskkill failed: ${r.status}`);
+    // taskkill は対象プロセスが既に終了していると exit 128（プロセスが見つかりません）を返す。
+    // 期限到達時は watchdog と親のタイマーが同時に taskkill するため、後勝ち側は必ず 128 になる
+    // （2026-10-26T20:17Z 実測: quota-sweep claude 13連続 failed の理由が "kill: taskkill failed: 128"
+    // に汚染され、kill 不能と誤読された）。POSIX 分岐の ESRCH と同様に 128 は無視する。
+    // 0 ・ 128 以外（例: 1 = アクセス拒否）は子が残る可能性があるため失敗として投げる。
+    if (r.status !== 0 && r.status !== 128) throw new Error(`taskkill failed: ${r.status}`);
   } else {
     try { killImpl(-pid, 'SIGKILL'); } catch (e) { if (e.code !== 'ESRCH') throw e; }
   }
