@@ -14,7 +14,7 @@ export const POLICY = Object.freeze({ stale: 7 * DAY, resend: 3 * DAY, ownerDm: 
   workLimit: 2, workAttempts: 5, workSeconds: 20 * 60, checkLimit: 20 });
 export const CATEGORY = Object.freeze({ decision: mailCategory({ why: '[判断依頼]' }),
   task: mailCategory({ why: '[作業依頼]' }) });
-export const BLOCKER = /権限がない|権限なし|できません|未オプトイン|承諾コマンド|判断待ち|BLOCKED|FAILED|exit=[1-9]|マージ権限|push.*権限/i;
+export const BLOCKER = /判定不能|未実施|権限がない|権限なし|できません|未オプトイン|承諾コマンド|判断待ち|BLOCKED|FAILED|exit=[1-9]|マージ権限|push.*権限/i;
 export const outboundTracking = item => item.kind === 'outbound'
   || item.kind === 'rollout' && item.direction === 'outbound' && item.subkind !== 'convergence';
 export const trackedMailIds = item => item.kind === 'rollout'
@@ -189,6 +189,12 @@ export async function checkLedger(ledger, { home, now, request, stderr = console
   }
   checkInbound(ledger, { home, now });
 }
+export function parseUntil(until, now) {
+  const relative = /^\+(\d+)(m|h|d)$/.exec(until || '');
+  const time = relative ? now + Number(relative[1]) * ({ m: 60000, h: HOUR, d: DAY }[relative[2]]) : Date.parse(until);
+  if (!Number.isFinite(time) || relative && Number(relative[1]) <= 0) throw new Error('invalid --until');
+  return time;
+}
 export function control(ledger, action, id, { reason, until, now }) {
   const item = ledger.items[id];
   if (!item) throw new Error('item not found');
@@ -197,8 +203,7 @@ export function control(ledger, action, id, { reason, until, now }) {
     item.status = 'cancelled';
     item.nextActionAt = null;
   } else if (action === 'defer') {
-    const relative = /^\+(\d+)d$/.exec(until || '');
-    const time = relative ? now + Number(relative[1]) * DAY : Date.parse(until);
+    const time = parseUntil(until, now);
     if (!Number.isFinite(time) || time <= now) throw new Error('--until must be in the future');
     item.deferredUntil = iso(time);
     item.deferReason = redactSecrets(reason);

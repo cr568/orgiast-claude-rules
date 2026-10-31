@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { main, notifyKim } from './notify-kim.mjs';
+import { main, notifyKim, deliverKim } from './notify-kim.mjs';
 import { parseHandoff, todoExclusionReason } from './auto-session.mjs';
 import { planRotation } from './next-session-rotate.mjs';
 
 function home() { return fs.mkdtempSync(path.join(os.tmpdir(), 'notify-kim-')); }
-function response({ ok = true, status = 200, json = {} } = {}) { return { ok, status, json: async () => json }; }
+function response({ ok = true, status = 200, json = { id: 'message' } } = {}) { return { ok, status, json: async () => json }; }
 
 test('token と userId で DM チャンネルを開いて投稿する', async () => {
   const calls = [];
@@ -17,6 +17,8 @@ test('token と userId で DM チャンネルを開いて投稿する', async ()
     return calls.length === 1 ? response({ json: { id: 'dm-channel' } }) : response();
   } });
   assert.equal(result.delivered, 'dm');
+  assert.equal(result.messageId, 'message');
+  assert.equal(result.channelId, 'dm-channel');
   assert.match(calls[0].url, /users\/@me\/channels$/);
   assert.deepEqual(JSON.parse(calls[0].init.body), { recipient_id: 'user' });
   assert.match(calls[1].url, /channels\/dm-channel\/messages$/);
@@ -186,6 +188,15 @@ test('起票済みマーカーを含む本文を再通知しても二重起票�
   assert.equal(fs.readFileSync(path.join(dir, '.claude/next-session.md'), 'utf8').match(/1\. \[ \]/g).length, 1);
 });
 
+test('修復TODOを目標文に引用した quota-sweep 報告は新キーで再起票しない', async () => {
+  const dir = home(), s = sender(dir);
+  const goal = '[ ] 通知の原因調査・修復: codex が停止しています（dead:oauth_consent）。 1. **kim@orgiast.jp** で開く: https://chatgpt.com/';
+  const result = await notifyKim(['claude/5h', '47% → 48%', 'tick: 8', goal, '変更なし', 'exhausted', '理由: 利用枠または累積試行上限に到達'].join('\n'), s.options);
+  assert.equal(result.delivered, 'dm');
+  assert.equal(fs.existsSync(path.join(dir, '.claude/next-session.md')), false);
+  assert.match(s.messages[0], /新規起票なし/);
+});
+
 test('従来どおり失敗通知は起票する（完了報告ガードで塞がない）', async () => {
   const dir = home(), s = sender(dir);
   await notifyKim('quota-sweep claude が直近 4 件すべて失敗している', s.options);
@@ -294,4 +305,11 @@ test('notify-kim CLIはblockedでexit 3、明示例外なら送信する', async
     }), 0);
     assert.equal(calls.length, 2);
   } finally { console.error = originalError; }
+});
+
+test('HTTP success without message id is not a delivered DM', async () => {
+ let calls = 0;
+ const result = await deliverKim('進捗', { userId: 'test-recipient', token: 'test-token', plainJa: false, webhookFallback: false, fetchImpl: async () => ++calls === 1 ? response({ json: { id: 'channel' } }) : response({ json: {} }) });
+ assert.equal(result.delivered, 'none');
+ assert.match(result.reason, /メッセージID/);
 });

@@ -4,7 +4,8 @@ import { isEntry } from './is-entry.mjs';
 import { readStdinWithTimeout } from './lib/hook-stdin.mjs';
 import { sessionSummary } from './stall-scan.mjs';
 import { laneHome } from './lane-doctor.mjs';
-import { laneDoctorQuick, summarize } from './lane-doctor.mjs';
+import { laneDoctorQuick, summarize, notifyLaneStops } from './lane-doctor.mjs';
+import { repairContext } from './lib/lane-repair-state.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -37,11 +38,14 @@ export function sessionLaneHealth(options) {
   const context = auditContext(home);
   (options?.auditLaunch || launchAudit)({ ...options, home, intervalHours: 6 });
   const health = laneDoctorQuick(options);
-  launchLaneAutoProbes(health, { ...options, home });
-  return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: [context, summarize(health), sessionSummary(options?.home || laneHome(), options?.now)].filter(Boolean).join(" / ") } };
+launchLaneAutoProbes(health, { ...options, home });
+  return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: [context, summarize(health), repairContext(health, home, options?.now), sessionSummary(home, options?.now)].filter(Boolean).join(" / ") } };
 }
 export async function main() {
   await readStdinWithTimeout();
-  console.log(JSON.stringify(sessionLaneHealth()));
+  const output = sessionLaneHealth();
+  const health = laneDoctorQuick({ save: false });
+  await notifyLaneStops(health);
+  console.log(JSON.stringify(output));
 }
 if (isEntry(import.meta.url)) await main();

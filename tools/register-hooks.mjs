@@ -46,6 +46,11 @@ try {
   ({ HOOK_MATCHER: MAIL_CONSISTENCY_MATCHER } = await import('./mail-consistency-gate.mjs'));
 } catch { /* 同期途中でも登録を継続する */ }
 
+let OUTBOUND_CLAIM_MATCHER = 'Bash|PowerShell';
+try {
+  ({ HOOK_MATCHER: OUTBOUND_CLAIM_MATCHER } = await import('./outbound-claim-evidence-gate.mjs'));
+} catch { /* 同期途中でも登録を継続する */ }
+
 let BIHIN_KCOL_MATCHER = 'mcp__.*Google_Sheets__(update_values|append_values|update_formulas|batch_clear_values|update_spreadsheet|batch_update)$|Bash|PowerShell';
 try {
   ({ HOOK_MATCHER: BIHIN_KCOL_MATCHER } = await import('./bihin-kcol-gate.mjs'));
@@ -217,11 +222,14 @@ try {
   let policyRepaired = 0;
   let costLoopMigrated = 0;
   if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) settings.hooks = {};
-  for (const event of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'Notification']) if (!Array.isArray(settings.hooks[event])) settings.hooks[event] = [];
+  for (const event of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'SessionEnd', 'Notification']) if (!Array.isArray(settings.hooks[event])) settings.hooks[event] = [];
   added += removeDailySessionHooks(settings);
   const command = (name, extra = '') => `node "${path.join(repo, 'tools', name)}"${extra}`;
   // 2026-09-06: 9本を別プロセスで動かすと304 Stop中198回が再Stopになったため、
   // ファイル名で旧登録を拾い、PCごとに異なるrepoパスのrunner 1本へ収束させる。
+  for (const event of ['SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd']) {
+    if (add(settings.hooks[event], 'case-handoff.mjs', { hooks: [{ type: 'command', command: command('case-handoff.mjs', ' hook'), timeout: 60 }] })) added += 1;
+  }
   const oldStopGates = [
     'handoff-quality-gate.mjs', 'stop-gate.mjs', 'manual-request-fullsteps-gate.mjs',
     'handoff-investigation-gate.mjs', 'handoff-info-guard.mjs', 'negative-claim-gate.mjs',
@@ -345,6 +353,7 @@ try {
   if (add(settings.hooks.PreToolUse, 'pretooluse-delegation-warn.mjs', { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: command('pretooluse-delegation-warn.mjs') }] })) added += 1;
   if (add(settings.hooks.PreToolUse, 'pretooluse-bash-delegation.mjs', { matcher: 'Bash|PowerShell', hooks: [{ type: 'command', command: command('pretooluse-bash-delegation.mjs'), timeout: 5 }] })) added += 1;
   if (add(settings.hooks.PreToolUse, 'pretooluse-lane-guard.mjs', { matcher: 'Bash|PowerShell|Edit|Write|MultiEdit', hooks: [{ type: 'command', command: command('pretooluse-lane-guard.mjs'), timeout: 5 }] })) added += 1;
+  if (add(settings.hooks.PreToolUse, 'lane-repair-first-gate.mjs', { matcher: 'Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit', hooks: [{ type: 'command', command: command('lane-repair-first-gate.mjs'), timeout: 5 }] })) added += 1;
   if (add(settings.hooks.PreToolUse, 'pretooluse-codex-invocation.mjs', { matcher: 'Bash|PowerShell', hooks: [{ type: 'command', command: command('pretooluse-codex-invocation.mjs'), timeout: 5 }] })) added += 1;
   if (add(settings.hooks.PreToolUse, 'model-agent-guard.mjs', { matcher: 'Agent|Task', hooks: [{ type: 'command', command: command('model-agent-guard.mjs') }] })) added += 1;
   if (add(settings.hooks.PreToolUse, 'internal-recipient-gmail-guard.mjs', { matcher: HOOK_MATCHER, hooks: [{ type: 'command', command: command('internal-recipient-gmail-guard.mjs'), timeout: 5 }] })) added += 1;
@@ -357,6 +366,8 @@ try {
   added += syncMatcherFor(settings.hooks.PreToolUse, 'recipient-domain-gate.mjs', RECIPIENT_DOMAIN_MATCHER);
   if (add(settings.hooks.PreToolUse, 'mail-consistency-gate.mjs', { matcher: MAIL_CONSISTENCY_MATCHER, hooks: [{ type: 'command', command: command('mail-consistency-gate.mjs'), timeout: 10 }] })) added += 1;
   added += syncMatcherFor(settings.hooks.PreToolUse, 'mail-consistency-gate.mjs', MAIL_CONSISTENCY_MATCHER);
+  if (add(settings.hooks.PreToolUse, 'outbound-claim-evidence-gate.mjs', { matcher: OUTBOUND_CLAIM_MATCHER, hooks: [{ type: 'command', command: command('outbound-claim-evidence-gate.mjs'), timeout: 10 }] })) added += 1;
+  added += syncMatcherFor(settings.hooks.PreToolUse, 'outbound-claim-evidence-gate.mjs', OUTBOUND_CLAIM_MATCHER);
   // 社外宛メールで説明している Google ファイルを、直近に中身として読んだかを確かめる。
   // 3.4MB の transcript で初回 18 秒かかった実測があるため 30 秒にする（5 秒だと時間切れで素通りする）。
   if (add(settings.hooks.PreToolUse, 'live-artifact-read-gate.mjs', { matcher: LIVE_ARTIFACT_MATCHER, hooks: [{ type: 'command', command: command('live-artifact-read-gate.mjs'), timeout: 30 }] })) added += 1;
@@ -402,6 +413,10 @@ try {
   // コマンドの手渡しに非エンジニア向けの開き方・入力場所・完了確認を必須化する。
   // 「この後の自動進行」宣言を台帳へ記録(fail-open・出力なし)。巡回は OrgiastAutoProgressWatch が担当。
   if (add(settings.hooks.Stop, 'auto-progress-ledger.mjs', { hooks: [{ type: 'command', command: command('auto-progress-ledger.mjs'), timeout: 8 }] })) added += 1;
+  // 「まだ閉じない（…まで待つ）」の期限をセッション一覧のタイトルの頭に【MM/DD/HH:MMまで】で付ける(2026-10-27 nishi 指示)。
+  if (add(settings.hooks.Stop, 'session-wait-title.mjs', { hooks: [{ type: 'command', command: command('session-wait-title.mjs'), timeout: 8 }] })) added += 1;
+  // 既存の全セッションにも同じ規則を当てる（1時間に1回だけ走る）。
+  if (add(settings.hooks.SessionStart, 'session-wait-title.mjs', { hooks: [{ type: 'command', command: command('session-wait-title.mjs', ' --all'), timeout: 30 }] })) added += 1;
   if (add(settings.hooks.Stop, 'handoff-detail-guard.mjs', { hooks: [{ type: 'command', command: command('handoff-detail-guard.mjs'), timeout: 10 }] })) added += 1;
   // 生URLと日本語・全角文字の直接隣接によるリンク破損を差し戻す。
   if (add(settings.hooks.Stop, 'url-format-guard.mjs', { hooks: [{ type: 'command', command: command('url-format-guard.mjs'), timeout: 8 }] })) added += 1;

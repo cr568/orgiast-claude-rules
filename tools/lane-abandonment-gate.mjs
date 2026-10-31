@@ -129,7 +129,9 @@ export function evaluateLaneAbandonment(ctx, { home = laneHome() } = {}) {
   const reportedStops = reportedLaneStops(ctx.assistantText);
   for (const lane of reportedStops) if (!repairReportedFor(ctx.assistantText, lane)) signals.push(`${lane}: 停止報告に [LANE-REPAIR] なし`);
   const exemption = exemptions(ctx, events, failedAt, { requireRepair: true });
-  const modelEligible = /fable|opus/i.test(currentModel(ctx));
+const enforcement = readJson(path.join(home, '.claude/rule-enforcement.json'));
+  const promoted = enforcement['repair-failed-lane-first']?.mode === 'block';
+  const modelEligible = promoted || /fable|opus/i.test(currentModel(ctx));
   const eligible = modelEligible && (failedAt >= 0 || reportedStops.length > 0);
   const textUnrepaired = reportedStops.some(lane => !repairReportedFor(ctx.assistantText, lane));
   const unrepaired = eligible && exemption !== 'lane-ok' && (textUnrepaired || (failedAt >= 0 && !repairReported(ctx.assistantText)));

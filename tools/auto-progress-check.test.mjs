@@ -115,6 +115,21 @@ test('executeCheck lets a row extend its timeout for network-bound checks, bound
   executeCheck({ check: 'gh run view', checkTimeoutMs: 'soon' }, { home: tmp(), shellPath: null, spawnImpl });
   assert.deepEqual(seen, [180000, MAX_CHECK_TIMEOUT_MS, CHECK_TIMEOUT_MS, CHECK_TIMEOUT_MS]);
 });
+test('executeCheck reports a timeout as the bound and how to extend it, not as a shell failure', () => {
+  const error = Object.assign(new Error('spawnSync C:\Program Files\Git\bin\bash.exe ETIMEDOUT'), { code: 'ETIMEDOUT' });
+  const result = executeCheck({ check: 'slow', checkTimeoutMs: 45000 }, { home: tmp(), shellPath: null, spawnImpl: () => ({ status: null, error, stdout: '' }) });
+  assert.equal(result.code, null);
+  assert.match(result.text, /45 秒の上限/); assert.match(result.text, /--timeout/); assert.doesNotMatch(result.text, /bash.exe/);
+});
+test('addCheck --timeout stores checkTimeoutMs, probes with it, and rejects out-of-range values', () => {
+  const home = tmp(), probed = [];
+  const row = addCheck({ home, now, session: 'slow-session', check: 'node slow.mjs', label: '遅い check', deadline: '+24h', timeout: '180',
+    probe: r => { probed.push(r.checkTimeoutMs); return { code: 1, text: '未達' }; } });
+  assert.equal(row.checkTimeoutMs, 180000); assert.deepEqual(probed, [180000]);
+  assert.equal(readLedger(ledgerFile(home)).at(-1).checkTimeoutMs, 180000);
+  assert.equal('checkTimeoutMs' in addCheck({ home, now, session: 'plain', check: 'x', label: 'x', deadline: '+24h' }), false);
+  for (const timeout of ['0', '301', 'soon']) assert.throws(() => addCheck({ home, now, session: 'bad', check: 'x', label: 'x', deadline: '+24h', timeout }), /--timeout/);
+});
 test('WeChat counts current/previous month only, inclusive since, ignores empty/invalid/unrelated data without exposing text', () => {
   const home = tmp(), dir = path.join(home, '.claude', 'line-openchat'); fs.mkdirSync(dir, { recursive: true });
   const since = '2026-09-30T12:30:00Z';
@@ -144,15 +159,19 @@ test('watch budget prioritizes checks and leaves room before hourly trigger', as
     transcriptEvidence: () => assert.fail('legacy must stop with insufficient time') } });
   assert.equal(checks, 1);
 });
-test('digest: hundreds of rows across three categories stay within one DM and 1800 chars', async () => {
+test('digest: hundreds of rows across three categories are all delivered in 1800-char chunks', async () => {
   const home = tmp(), messages = [];
   const rows = Array.from({ length: 200 }, (_, i) => ({ sessionId: `s${i}`, promise: '長い約束'.repeat(100), status: i % 3 === 0 ? 'done' : i % 3 === 1 ? 'waiting_user' : 'open',
     ts: new Date(now - 1000).toISOString(), doneAt: new Date(now).toISOString(), nextKim: i % 3 === 1 ? '判断してください'.repeat(100) : 'なし' }));
   const io = { readLedger: () => rows, notify: async text => { messages.push(text); return { delivered: 'dm' }; } };
-  // 変化分（完了67件・判断待ち67件）だけを数え、枠は1通まで。
+  // 変化分（完了67件・判断待ち67件）を数え、件数を削らず複数DMに分割して全件届ける。
   const result = await digest({ home, now, slot: '朝', io });
-  assert.equal(result.parts, 1); assert.equal(result.count, 134);
-  assert.ok(messages[0].length < 1800);
+  assert.equal(result.count, 134);
+  assert.ok(result.parts >= 2, `parts was ${result.parts}`);
+  const body = messages.join('\n');
+  assert.equal(body.split('\n').filter(line => line.startsWith('・完了:')).length, 67);
+  assert.equal(body.split('\n').filter(line => line.startsWith('・あなたの判断待ち:')).length, 67);
+  assert.ok(messages.every(message => message.length <= 1800), `lengths: ${messages.map(m => m.length)}`);
   assert.equal((await digest({ home, now: now + 3600000, slot: '朝', io })).sent, false);
 });
 
@@ -202,3 +221,13 @@ for (const { code, allowMet, accepted } of [
     }
   });
 }
+
+test('check completion accepts durable inbox delivery and does not retry', async () => {
+ const home = tmp(); register(home);
+ let calls = 0;
+ const io = { ...baseIo, executeCheck: () => ({ code: 0, text: '完了' }), notifyOwner: async () => { calls++; return { delivered: 'inbox', channel: 'inbox', ok: true }; } };
+ await watch({ home, now, io });
+ await watch({ home, now, io });
+ assert.equal(calls, 1);
+ assert.equal(readLedger(ledgerFile(home))[0].checkNotifiedResult, 'done');
+});

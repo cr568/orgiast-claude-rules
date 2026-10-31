@@ -14,6 +14,11 @@ function readRollout() { try { return JSON.parse(fs.readFileSync(path.join(tools
 const hostName = () => process.env.ORGIAST_HOSTNAME || os.hostname();
 export function rolloutMode(name, { manifest = readRollout(), home = homeDir(), hostname = hostName(), now = Date.now() } = {}) {
   const entry = manifest?.gates?.[name];
+  if (name === 'lane-repair-first-gate' && entry?.rollout === 'deny'
+    && entry.immediatePolicy === '2026-10-29 user 指示: 全PC・全アカウントで故障レーン修復を最優先') return 'deny';
+  if (name === 'lane-abandonment-gate') {
+    try { if (JSON.parse(fs.readFileSync(path.join(home, '.claude/rule-enforcement.json'), 'utf8'))['repair-failed-lane-first']?.mode === 'block') return 'deny'; } catch {}
+  }
   // データ破損防止の明示ポリシー: 初受信・非pilot PCも即時deny。
   if (name === 'recipient-domain-gate' && entry?.rollout === 'deny'
     && entry.immediatePolicy === '2026-10-23 名刺OCR誤読による不存在ドメイン送信防止') return 'deny';
@@ -21,6 +26,10 @@ export function rolloutMode(name, { manifest = readRollout(), home = homeDir(), 
     && entry.immediatePolicy === '2026-10-23 古川さん依頼: 備品管理表K列のデータ破損防止') return 'deny';
   if (name === 'mail-draft-account-gate' && entry?.rollout === 'deny'
     && entry.immediatePolicy === '2026-10-25 kim 指示: 全PCのメール下書きは seisaku-team@orgiast.jp に統一') return 'deny';
+  if (name === 'gmail-connector-url-gate' && entry?.rollout === 'deny'
+    && entry.immediatePolicy === '2026-10-30 user-PC で社外宛返信の URL が google.com/url?q= に書き換わった実害') return 'deny';
+  if (name === 'response-language-gate' && entry?.rollout === 'deny'
+    && entry.immediatePolicy === '2026-10-26 cr 指示: Stop hook の書き直しで英語へ逸脱した実害') return 'deny';
   if (entry?.legacy === true && entry.rollout === 'deny') return 'deny';
   if (entry?.pilotDeny === true && (manifest?.pilotHosts || []).some(h => h.toLowerCase() === hostname.toLowerCase())) return 'deny';
   if (entry?.rollout === 'warn') return 'warn';
