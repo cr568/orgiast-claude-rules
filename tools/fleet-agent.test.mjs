@@ -246,7 +246,7 @@ test('status は共有memoryの件数・世代・kim注記・CLAUDE.md参照を�
   const home = memoryHome({ shared: ['a.md', 'b.md', 'c.md'], indexed: true });
   const result = statusForHome(home);
   assert.equal(result.text.split('\n').find(line => line.startsWith('memory=')),
-    'memory=共有3件 / 世代=2026-10-28T10:35:45.982Z / user=kim注記=yes / CLAUDE.md参照=yes');
+    'memory=共有3件 / 世代=2026-10-28T10:35:45.982Z / user=kim注記=yes / CLAUDE.md参照=yes / knowledge=なし');
   assert.deepEqual(result.data.sharedMemory, { found: true, count: 3, generatedAt: memoryGeneration, kimOperated: true, kimNote: true, referenced: true });
 });
 
