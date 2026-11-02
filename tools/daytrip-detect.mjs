@@ -49,15 +49,48 @@ async function jsonRequest(url, options = {}, fetchImpl = fetch) {
   if (!res.ok) throw new Error(`HTTP ${res.status} (${new URL(url).hostname})`);
   return res.json();
 }
-export async function listEvents(range, token, fetchImpl = fetch) {
+export async function listEvents(range, token, fetchImpl = fetch, calendarId = 'primary') {
   const events = []; let pageToken;
   do {
     const query = new URLSearchParams({ timeMin: range.timeMin, timeMax: range.timeMax, singleEvents: 'true', orderBy: 'startTime', maxResults: '2500', timeZone: 'Asia/Tokyo' });
     if (pageToken) query.set('pageToken', pageToken);
-    const page = await jsonRequest(`https://www.googleapis.com/calendar/v3/calendars/primary/events?${query}`, { headers: { Authorization: `Bearer ${token}` } }, fetchImpl);
+    const page = await jsonRequest(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${query}`, { headers: { Authorization: `Bearer ${token}` } }, fetchImpl);
     events.push(...(page.items || [])); pageToken = page.nextPageToken;
   } while (pageToken);
   return events;
+}
+export const OVERNIGHT_CONFIG = readJson(new URL('./daytrip-overnight-config.json', import.meta.url));
+export async function listAllDayEvents(range, token, fetchImpl = fetch) {
+  const calendars = []; let pageToken;
+  do {
+    const query = new URLSearchParams({ maxResults: '250', showHidden: 'true' });
+    if (pageToken) query.set('pageToken', pageToken);
+    const page = await jsonRequest(`https://www.googleapis.com/calendar/v3/users/me/calendarList?${query}`, { headers: { Authorization: `Bearer ${token}` } }, fetchImpl);
+    calendars.push(...(page.items || [])); pageToken = page.nextPageToken;
+  } while (pageToken);
+  const events = [];
+  for (const calendar of calendars) {
+    if (calendar.deleted || /#holiday@group\.v\.calendar\.google\.com$/i.test(calendar.id) || /祝日|holidays?/i.test(calendar.summary || '')) continue;
+    events.push(...(await listEvents(range, token, fetchImpl, calendar.id)).filter(e => e.start?.date));
+  }
+  return events;
+}
+export function overnightDays(events, range, config = OVERNIGHT_CONFIG) {
+  const days = new Map();
+  const places = Object.entries(config.prefectures).filter(([prefecture]) => !config.daytripPrefectures.includes(prefecture)).flatMap(([prefecture, cities]) => [prefecture, ...cities]);
+  for (const e of events) {
+    if (!e.start?.date || !e.end?.date || e.status === 'cancelled' || e.attendees?.some(a => a.self && a.responseStatus === 'declined')) continue;
+    const start = Date.parse(e.start.date), end = Date.parse(e.end.date);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+    const text = `${e.summary || ''} ${e.location || ''}`;
+    if (end - start <= DAY && !places.some(place => text.includes(place))) continue;
+    // Google all-day end.date is exclusive; include overlapping days only.
+    for (let time = Math.max(start, Date.parse(range.from)); time < end && time <= Date.parse(range.to); time += DAY) {
+      const date = new Date(time).toISOString().slice(0, 10);
+      if (!days.has(date)) days.set(date, { date, reason: `overnight(終日予定: ${clean(e.summary) || '(無題)'})` });
+    }
+  }
+  return days;
 }
 export function haversine(a, b) {
   const rad = x => x * Math.PI / 180;
@@ -112,13 +145,18 @@ export function candidateForDay(date, events, distances) {
   return { date, titles: unique(events.map(e => e.title)), locations: unique(events.map(e => e.location)), attendees: unique(events.flatMap(e => e.attendees)), straightKm, roadKm,
     hours, departure, arrival, notes };
 }
-export async function detect(events, range, geocode, workplace = WORKPLACE) {
+export async function detect(events, range, geocode, workplace = WORKPLACE, overnight = new Map(), overnightConfig = OVERNIGHT_CONFIG) {
   const candidates = [];
   for (const [date, day] of [...groupEvents(events, range)].sort(([a],[b]) => a.localeCompare(b))) {
     const distances = [];
     for (const location of unique(day.map(e => e.location))) {
       const point = await geocode(location);
       distances.push(point ? { km: haversine(workplace, point), approximate: point.approximate } : null);
+    }
+    const roadKm = Math.max(...distances.filter(d => Number.isFinite(d?.km)).map(d => d.km * 1.3));
+    if (roadKm >= overnightConfig.minRoadKm) {
+      overnight.set(date, { date, reason: `overnight(片道約${Math.round(roadKm)}km)` });
+      continue;
     }
     const c = candidateForDay(date, day, distances); if (c) candidates.push(c);
   }
@@ -177,6 +215,7 @@ export function createGeocoder({ dir, home, config = {}, fetchImpl = fetch, infe
 }
 export function unasked(candidates, rows) {
   const dates = new Set(rows.filter(r => r.type === 'batch').flatMap(r => r.items.map(c => c.date)));
+  for (const row of rows.filter(r => r.type === 'decision')) dates.add(row.date);
   return candidates.filter(c => !dates.has(c.date));
 }
 export function candidateLine(c) {
@@ -317,12 +356,27 @@ export async function run(options = {}, deps = {}) {
     if (!Number.isFinite(workplace.lat) || Math.abs(workplace.lat)>90 || !Number.isFinite(workplace.lon) || Math.abs(workplace.lon)>180) throw new Error('invalid workplace coordinates');
     const range = dateRange({ ...options, now });
     log = journal(path.join(dir, 'ledger.jsonl'));
+    const token = deps.events ? null : await (await import('./lib/drive-auth.mjs')).getDriveToken({
+      impersonate: 'kim@orgiast.jp', scope: 'https://www.googleapis.com/auth/calendar.readonly', signal: AbortSignal.timeout(30000),
+    });
+    const events = deps.events || await listEvents(range, token, deps.fetchImpl);
+    const allDayEvents = deps.allDayEvents || (deps.events ? deps.events : await listAllDayEvents(range, token, deps.fetchImpl));
+    const overnightConfig = { ...OVERNIGHT_CONFIG, ...config.overnight };
+    if (!Number.isFinite(overnightConfig.minRoadKm) || overnightConfig.minRoadKm <= 0) throw new Error('invalid overnight minRoadKm');
+    const overnight = overnightDays(allDayEvents, range, overnightConfig);
+    const geocode = deps.geocode || createGeocoder({ dir, home, config });
+    const candidates = await detect(events.filter(e => {
+      const start = Date.parse(e.start?.dateTime);
+      return !Number.isFinite(start) || !overnight.has(jstDate(start));
+    }), range, geocode, workplace, overnight, overnightConfig);
+    const excluded = [...overnight.values()].sort((a,b) => a.date.localeCompare(b.date));
     if (!options.dryRun) {
+      for (const entry of excluded) {
+        if (!log.rows.some(r => r.type === 'decision' && r.date === entry.date && r.status === entry.reason))
+          log.save({ type: 'decision', date: entry.date, status: entry.reason });
+      }
       for (const message of await recordApproved(log, deps.sheetsFactory || defaultSheetsFactory, now)) (deps.output || console.log)(message);
     }
-    const events = deps.events || await listEvents(range, await (await import('./schedule-sync.mjs')).calendarToken());
-    const geocode = deps.geocode || createGeocoder({ dir, home, config });
-    const candidates = await detect(events, range, geocode, workplace);
     const pending = unasked(candidates, log.rows);
     if (!options.dryRun) {
       const queue = new Map(log.rows.filter(r => r.type === 'queued').map(r => [r.candidate.date, r.candidate]));
@@ -330,10 +384,10 @@ export async function run(options = {}, deps = {}) {
         if (JSON.stringify(queue.get(c.date)) !== JSON.stringify(c)) log.save({ type: 'queued', candidate: c });
         queue.set(c.date, c);
       }
-      const batch = makeBatch([...queue.values()].sort((a,b) => a.date.localeCompare(b.date)), log.rows);
+      const batch = makeBatch([...queue.values()].filter(c => !overnight.has(c.date)).sort((a,b) => a.date.localeCompare(b.date)), log.rows);
       if (batch) log.save(batch);
     }
-    return { dryRun: Boolean(options.dryRun), from: range.from, to: range.to, eventCount: events.length, candidates, unaskedDates: pending.map(c => c.date), attribution: '© OpenStreetMap contributors' };
+    return { dryRun: Boolean(options.dryRun), from: range.from, to: range.to, eventCount: events.length, candidates, excluded, unaskedDates: pending.map(c => c.date), attribution: '© OpenStreetMap contributors' };
   } finally {
     try { if (log && !options.dryRun) refreshPending(dir, log, now); } finally { release(); }
   }
