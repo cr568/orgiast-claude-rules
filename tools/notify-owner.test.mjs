@@ -302,6 +302,16 @@ test('Discord failure with a valid recipient falls back without setup warning', 
  assert.deepEqual(texts, ['進捗']);
 });
 
+test('kim 所有者は台帳配達を成功とし toast に重複通知しない', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'owner-kim-inbox-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  let calls = 0;
+  const result = await notifyOwner('kim@orgiast.jp', '報告', { home, label: 'kim-PC', pcMap: { 'kim-PC': { account: 'kim@orgiast.jp' } }, directory: [], notify: async (_text, options) => {
+    calls++; assert.equal(options.userId, KIM_DISCORD_USER_ID); return { delivered: 'session-inbox', id: '項目' };
+  }, toast: () => assert.fail('二重通知禁止') });
+  assert.equal(calls, 1); assert.equal(result.channel, 'session-inbox'); assert.equal(result.ok, true);
+});
+
 test('w018-PC は fleet-pc-map に discordId と notifyDiscordId を持つ', () => {
   const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const map = JSON.parse(fs.readFileSync(path.join(repo, 'fleet-pc-map.json'), 'utf8'));
