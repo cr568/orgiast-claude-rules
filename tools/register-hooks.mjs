@@ -375,6 +375,7 @@ try {
     if (add(settings.hooks[event], 'fleet-inbox-context.mjs', { hooks: [{ type: 'command', command: command('fleet-inbox-context.mjs'), timeout: 5 }] })) added += 1;
     if (add(settings.hooks[event], 'owner-inbox-hook.mjs', { hooks: [{ type: 'command', command: command('owner-inbox-hook.mjs'), timeout: 10 }] })) added += 1;
     if (add(settings.hooks[event], 'auto-progress-inbox-hook.mjs', { hooks: [{ type: 'command', command: command('auto-progress-inbox-hook.mjs'), timeout: 5 }] })) added += 1;
+    if (add(settings.hooks[event], 'kim-awaiting-context.mjs', { hooks: [{ type: 'command', command: command('kim-awaiting-context.mjs'), timeout: 5 }] })) added += 1;
     if (add(settings.hooks[event], 'daytrip-ask-hook.mjs', { hooks: [{ type: 'command', command: command('daytrip-ask-hook.mjs'), timeout: 5 }] })) added += 1;
     if (resolveFleetLabel(home) === 'kim-PC') {
       if (add(settings.hooks[event], 'fleet-chase-context.mjs', { hooks: [{ type: 'command', command: command('fleet-chase-context.mjs'), timeout: 5 }] })) added += 1;
