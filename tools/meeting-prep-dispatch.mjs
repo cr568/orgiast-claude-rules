@@ -119,6 +119,44 @@ export function chooseExecution(route, receivers = {}) {
 }
 const meetingKey = (e, c) => `meeting:${hash(`${c.id}|${new Date(e.start.dateTime).toISOString()}`).slice(0, 40)}`;
 export function isActiveCase(c) { return !!c.phase?.trim() && !/完了|失注|中止|キャンセル|アプローチリスト/.test(c.phase); }
+const jobStateKey = job => `${job.date}:${job.key}`;
+const claimsJob = (state, key) => Object.values(state.batches || {}).some(b => ['running', 'sending', 'sent'].includes(b.status) && (!b.error || b.status === 'sending') && b.jobs?.some(j => jobStateKey(j) === key));
+const failedBatch = batch => ['failed', 'expired'].includes(batch.status) || !!batch.error;
+export function migrateFailed(state, now = new Date().toISOString()) {
+  state.failed ||= {};
+  for (const [key, id] of Object.entries(state.sent || {})) {
+    const batch = state.batches?.[id];
+    if (!batch || !failedBatch(batch)) continue;
+    const job = batch.jobs?.find(j => jobStateKey(j) === key || (j.event && `${j.date}:${eventKey(j.event)}` === key));
+    if (!job || batch.completed?.[job.key]) continue;
+    const canonical = jobStateKey(job);
+    const at = batch.startedAt || batch.createdAt || batch.finishedAt || now;
+    state.failed[canonical] ||= { job, batchId: id, attempts: 1, day: jstDate(Date.parse(at)), lastAttemptAt: at, lastError: batch.error || batch.status };
+    delete state.sent[key];
+  }
+}
+export function retryAllowed(failure, now = new Date().toISOString()) {
+  const time = Date.parse(now);
+  if (failure.job.kind === 'meeting' && !(Date.parse(failure.job.event?.start?.dateTime) > time)) return false;
+  return (failure.day !== jstDate(time) || failure.attempts < 3) && time - Date.parse(failure.lastAttemptAt) >= 30 * 60000;
+}
+export function retryJobs(state, now = new Date().toISOString()) {
+  return Object.entries(state.failed || {}).filter(([key, f]) => !state.sent?.[key] && retryAllowed(f, now)).map(([, f]) => structuredClone(f.job));
+}
+function recordFailure(state, batch, error, now) {
+  state.failed ||= {};
+  for (const job of batch.jobs) {
+    if (batch.completed?.[job.key]) continue;
+    const key = jobStateKey(job), old = state.failed[key], day = jstDate(Date.parse(now));
+    state.failed[key] = { job, batchId: batch.id, day, attempts: old?.day === day ? old.attempts + 1 : 1, lastAttemptAt: now, lastError: error };
+    delete state.sent[key];
+  }
+}
+function recordSuccess(state, job, batch) {
+  state.sent ||= {};
+  state.sent[jobStateKey(job)] = batch.id;
+  delete state.failed?.[jobStateKey(job)];
+}
 export function planJobs({ events, cases, updates = {}, hub = {}, meetEvents = [], skipped = [], date, reviewDay = date, state = {}, config, pcMap, beacons = [] }) {
   const jobs = [], seen = new Set(), meetingCases = new Set(), meetings = new Map();
   for (const e of events) {
@@ -131,7 +169,7 @@ export function planJobs({ events, cases, updates = {}, hub = {}, meetEvents = [
     meetingCases.add(match.case.id);
     const key = meetingKey(e, match.case), route = routeCase(e, match.case, config, pcMap, beacons);
     // Check every legacy source ID, even if the other duplicate was seen first.
-    if (state.sent?.[`${date}:${key}`] || state.sent?.[`${date}:${legacyKey}`]) seen.add(key);
+    if (state.sent?.[`${date}:${key}`] || state.sent?.[`${date}:${legacyKey}`] || claimsJob(state, `${date}:${key}`)) seen.add(key);
     if (meetings.has(key)) {
       const prior = meetings.get(key);
       prior.sources.push({ calendarId: e.calendarId, eventId: e.id });
@@ -172,7 +210,7 @@ export function createGoogle({ dryRun = false, user = USER, token = getDriveToke
     const res = await fetchImpl(url, { method, headers: { Authorization: `Bearer ${tokens.get(tokenScope)}`, 'Content-Type': 'application/json', ...headers },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: requestSignal });
     if (!res.ok) throw Object.assign(new Error(`${scope}: HTTP ${res.status} ${(await res.text()).slice(0, 400)}`), { status: res.status });
-    return res.status === 204 ? {} : res.json();
+    return res.status === 204 ? {} : new URL(url).pathname.endsWith('/export') ? res.text() : res.json();
   }
   async function pages(scope, url, field = 'items') {
     const out = []; let next;
@@ -299,7 +337,7 @@ export async function upsertPreparation(g, calendarId, job, result = {}, now = n
   const links = new Map([...(job.materialLinks || []), ...(result.links || [])].map(link => [link.label, link]));
   const folder = job.case?.projectFolderId || job.case?.folderId;
   if (folder) links.set('制作フォルダ', { label: '制作フォルダ', url: `https://drive.google.com/drive/folders/${folder}` });
-  const description = [`状態: ${status}`, result.summary,
+  const description = [`状態: ${job.retryAttempt ? `再試行 ${job.retryAttempt}/3・` : ''}${status}`, result.summary,
     ...['実施計画書', '確認シート', '提出フォーマット', '制作フォルダ', 'アジェンダ'].map(label => `${label}: ${links.has(label) ? workspaceUrl(links.get(label).url)
       : label === '実施計画書' && job.case?.planId ? `https://docs.google.com/a/orgiast.jp/spreadsheets/d/${job.case.planId}/edit` : '未特定・未作成'}`),
     ...[...links.values()].filter(x => !['実施計画書', '確認シート', '提出フォーマット', '制作フォルダ', 'アジェンダ'].includes(x.label)).map(x => `${x.label}: ${workspaceUrl(x.url)}`),
@@ -442,6 +480,33 @@ export async function prepareMaterials(g, job) {
 }
 // Supply DWD snapshots to a tool-free worker. It cannot write through connectors,
 // shell commands or hooks; all proposed mutations go through applyResult below.
+// Reuse gmail-search MIME decoding and the kim-PC DWD authentication path.
+export async function loadCaseMail(job, config, { mailGoogle, signal, until = Date.now() } = {}) {
+  const since = until - 14 * 86400000, mail = [], unconfirmed = [];
+  const terms = [...caseIds(job.case), job.case.name].filter(Boolean).map(v => '"' + v.replace(/["\\]/g, ' ') + '"');
+  const query = `after:${Math.floor(since / 1000)} before:${Math.ceil(until / 1000) + 1} -in:drafts {${terms.join(' ')}}`;
+  for (const user of new Set([config.teamEmail || 'seisaku-team@orgiast.jp', config.userEmail || USER])) {
+    try {
+      const g = typeof mailGoogle === 'function' ? mailGoogle(user) : mailGoogle || createGoogle({ dryRun: true, user, signal });
+      const threads = await g.pages('gmail.readonly', `https://gmail.googleapis.com/gmail/v1/users/me/threads?${new URLSearchParams({ q: query, maxResults: '100' })}`, 'threads');
+      for (const { id } of threads) {
+        signal?.throwIfAborted();
+        const thread = await g.request('gmail.readonly', `https://gmail.googleapis.com/gmail/v1/users/me/threads/${enc(id)}?format=full`);
+        const messages = (thread.messages || []).filter(m => !m.labelIds?.includes('DRAFT'));
+        const text = messages.map(m => JSON.stringify(m.payload?.headers || []) + '\n' + extractBody(m.payload, Number.MAX_SAFE_INTEGER)).join('\n');
+        if (!caseIds(job.case).some(cid => mentionsId(text, cid)) && !(normalize(job.case.name).length >= 3 && normalize(text).includes(normalize(job.case.name)))) continue;
+        for (const m of messages) {
+          const at = Number(m.internalDate);
+          if (!(at >= since && at <= until)) continue;
+          const header = name => m.payload?.headers?.find(h => h.name.toLowerCase() === name)?.value || '';
+          mail.push({ user, threadId: id, id: m.id, at: new Date(at).toISOString(), subject: header('subject'), from: header('from'), text: extractBody(m.payload, 2000) });
+        }
+      }
+    } catch (e) { signal?.throwIfAborted(); unconfirmed.push(`${user} Gmail: ${e.message}`); }
+  }
+  mail.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  return { mail, unconfirmed };
+}
 export async function loadLocalContext(g, job, config, { signal, mailGoogle } = {}) {
   const context = { sheets: {}, documents: [], unconfirmed: [], files: [], truncated: [] };
   const attempt = async (label, fn) => {
@@ -472,9 +537,10 @@ export async function loadLocalContext(g, job, config, { signal, mailGoogle } = 
   context.truncated.push('案件フォルダ資料本文（タイトルとリンクのみ）');
   if (job.hub?.docId) docs.unshift({ id: job.hub.docId, name: '案件情報ハブ' });
   for (const file of [...new Map(docs.map(d => [d.id, d])).values()]) {
-    await attempt(file.name, async () => context.documents.push({ ...file, document: await g.request('documents', `${DOCS}/${enc(file.id)}`) }));
+    await attempt(file.name, async () => context.documents.push({ ...file, text: await g.request('drive', `${DRIVE}/files/${enc(file.id)}/export?mimeType=text%2Fplain`) }));
   }
-  context.truncated.push('Gmail本文（案件情報ハブを優先）');
+  const recent = await loadCaseMail(job, config, { signal, mailGoogle });
+  context.mail = recent.mail; context.unconfirmed.push(...recent.unconfirmed);
   context.unconfirmed.push('PDF・画像・サブフォルダ内資料・取得範囲外のセルは未確認。beforeは取得済み範囲のみを使う。');
   return context;
 }
@@ -522,6 +588,7 @@ export function buildLocalInput(batch, body, context, config = {}) {
   const job = batch.jobs[0];
   items.push(['予定情報', { event: job.event, links: job.materialLinks,
     descriptionLinks: [...new Set((job.event?.description || '').match(/https?:\/\/[^\s<>"']+/g) || [])] }]);
+  items.push(['最新Gmail本文', context.mail || []]);
   for (const doc of context.documents || []) {
     const texts = [];
     const walk = value => {
@@ -532,7 +599,7 @@ export function buildLocalInput(batch, body, context, config = {}) {
       }
     };
     walk(doc.document);
-    const text = texts.join('');
+    const text = doc.text ?? texts.join('');
     const matches = [...text.matchAll(/\[hub:[a-f0-9]{64}:([^\]\r\n]+)\]/g)];
     const entries = matches.length ? matches.map((m, i) => ({ at: m[1], text: text.slice(m.index, matches[i + 1]?.index ?? text.length) })) : [{ text }];
     entries.sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0));
@@ -630,8 +697,22 @@ export async function executeLocal(batch, body, { home, google, config, signal }
     env: localWorkerEnv(provider, key, process.env, configDir)
   });
 }
+export function filterResultUrls(result) {
+  const rejectedItems = [...(result.rejectedItems || [])];
+  const unsafe = value => /(?:javascript|data|vbscript)\s*:/i.test(JSON.stringify(value).replace(/\\[nrt]/g, ''));
+  const keep = (items, label, check) => (items || []).filter((item, i) => {
+    try { check(item); return true; }
+    catch (e) { rejectedItems.push(`${label}[${i}]: ${e.message}`); return false; }
+  });
+  const content = item => { if (unsafe(item)) throw new Error('危険なURLスキーム'); };
+  return { ...result, rejectedItems,
+    links: keep(result.links, 'links', link => { workspaceUrl(link.url); }),
+    writes: keep(result.writes, 'writes', w => { content(w.values); if (w.url) workspaceUrl(w.url); }),
+    documents: keep(result.documents, 'documents', d => { content(d.text); if (d.url) workspaceUrl(d.url); }) };
+}
 export async function applyResult(g, job, result) {
   if (!job.case) throw new Error('案件未特定のため代行書込不可');
+  result = filterResultUrls(result);
   const writes = result.writes || [], documents = result.documents || [];
   if (!writes.length && !documents.length) throw new Error('applyに書込内容がありません');
   if (documents.length > 1 || writes.length > 100) throw new Error('書込上限超過');
@@ -692,7 +773,7 @@ export async function collectAnswers({ state, answers, google, checkpoint, calen
         if (keys.has(r.key) || !batch.jobs.some(j => j.key === r.key)) throw new Error('結果の対象key重複または未知');
         keys.add(r.key);
         if (!['ready', 'apply', 'needsReview'].includes(r.status) || typeof r.summary !== 'string') throw new Error('結果status/summary不正');
-        for (const link of r.links || []) workspaceUrl(link.url);
+        Object.assign(r, filterResultUrls(r));
         if (r.status === 'ready' && (r.verified !== true || !r.links?.length)) throw new Error('readyには検証済み成果物URLが必要');
       }
       batch.completed ||= {};
@@ -710,6 +791,7 @@ export async function collectAnswers({ state, answers, google, checkpoint, calen
         }
         if (result.status !== 'ready') { batch.needsReview ||= {}; batch.needsReview[job.key] = result; checkpoint(); errors.push({ batchId: batch.id, key: job.key, error: result.summary || '要確認' }); continue; }
         batch.completed[job.key] = { at: now, result };
+        recordSuccess(state, job, batch);
         if (job.kind === 'review') { state.reviewed ||= {}; state.reviewed[job.case.id] = (job.update || job.hub).modifiedTime; }
         checkpoint();
       }
@@ -749,6 +831,18 @@ export const LOCAL_JOB_TIMEOUT_MS = 15 * 60 * 1000;
 export async function dispatchJobs({ jobs, state, config, receivers = {}, template, send, checkpoint, google, home = os.homedir(),
   runLocal = executeLocal, timeoutMs = LOCAL_JOB_TIMEOUT_MS, now = new Date().toISOString() }) {
   state.batches ||= {}; state.sent ||= {};
+  migrateFailed(state, now);
+  jobs = [...new Map([...retryJobs(state, now), ...jobs].map(j => [jobStateKey(j), j])).values()].filter(job => {
+    const key = jobStateKey(job), failure = state.failed?.[key];
+    if (state.sent[key] || (failure && !retryAllowed(failure, now))) return false;
+    // Keep uncertain remote sends and interrupted workers claimed outside sent.
+    return !claimsJob(state, key);
+  });
+  for (const job of jobs) {
+    delete job.preparationError;
+    const failure = state.failed?.[jobStateKey(job)];
+    if (failure) job.retryAttempt = failure.day === jstDate(Date.parse(now)) ? failure.attempts + 1 : 1;
+  }
   const groups = new Map(), errors = [];
   for (const job of jobs) {
     if (!job.case || job.case.ambiguousId || (job.kind === 'meeting' && privateTitle(job.event))) throw new Error('案件未特定・案件ID重複・名称非公開は配送禁止');
@@ -759,7 +853,7 @@ export async function dispatchJobs({ jobs, state, config, receivers = {}, templa
     groups.get(group).items.push(job);
   }
   const batches = [...groups.values()].map(({ pc, transport, items }) => {
-    const id = `prep-${hash(`${items[0].date}|${pc}|${items.map(j => j.key).sort().join('|')}`).slice(0, 32)}`;
+    const id = `prep-${hash(`${items[0].date}|${pc}|${items.map(j => j.key).sort().join('|')}|${items.some(j => state.failed?.[jobStateKey(j)]) ? now : ''}`).slice(0, 32)}`;
     const batch = { id, pc, jobs: items, ...transport, status: 'pending', createdAt: now };
     return batch;
   });
@@ -778,8 +872,8 @@ export async function dispatchJobs({ jobs, state, config, receivers = {}, templa
   for (const batch of batches) {
     if (state.batches[batch.id]) continue;
     state.batches[batch.id] = batch;
-    // Claim before send. An uncertain timeout must never result in an automatic duplicate send.
-    for (const j of batch.jobs) state.sent[`${j.date}:${j.key}`] = batch.id;
+    // The persisted batch claims execution; sent is reserved for success.
+    batch.startedAt = now;
     batch.status = batch.method === 'local' ? 'running' : 'sending'; checkpoint();
     const controller = new AbortController();
     const timer = batch.method === 'local' ? setTimeout(() => controller.abort(new Error('ローカルジョブの15分上限を超過')), timeoutMs) : null;
@@ -794,7 +888,7 @@ export async function dispatchJobs({ jobs, state, config, receivers = {}, templa
         if (answer.batchId !== batch.id || answer.results.length !== 1 || answer.results[0].key !== batch.jobs[0].key || !['apply', 'needsReview'].includes(answer.results[0].status)) throw new Error('ローカル結果のbatchId/key/status不正');
         // Persist the proposal before applying, so a partial write can be resumed via collect.
         batch.localAnswer = JSON.stringify(answer); checkpoint();
-        const failures = await collectAnswers({ state, answers: [{ from: 'kim-PC', local: true, body: batch.localAnswer }], google: jobGoogle, checkpoint, calendarError });
+        const failures = await collectAnswers({ state, answers: [{ from: 'kim-PC', local: true, body: batch.localAnswer }], google: jobGoogle, checkpoint, calendarError, now });
         if (failures.length) throw new Error(failures.map(e => e.error).join('; '));
         if (batch.status !== 'complete') throw new Error('ローカル結果が未完了');
         batch.finishedAt = new Date().toISOString(); checkpoint();
@@ -802,10 +896,12 @@ export async function dispatchJobs({ jobs, state, config, receivers = {}, templa
       }
       const receipt = await send(batch, body);
       if (!receipt.id) throw new Error('送信IDが返りませんでした');
-      batch.mailId = receipt.id; batch.status = 'sent'; checkpoint();
+      batch.mailId = receipt.id; batch.status = 'sent';
+      for (const job of batch.jobs) recordSuccess(state, job, batch);
+      checkpoint();
     } catch (e) {
       batch.error = e.message; batch.finishedAt = new Date().toISOString();
-      if (batch.method === 'local') batch.status = 'failed';
+      if (batch.method === 'local') { batch.status = 'failed'; recordFailure(state, batch, e.message, now); }
       checkpoint(); errors.push({ batchId: batch.id, executedOn: batch.executedOn, error: e.message });
       for (const job of batch.jobs) {
         if (calendarError) continue;
@@ -876,7 +972,7 @@ export async function fetchAnswers(home, state, fleet, checkpoint, { request } =
   const answers = fleet.inbox.filter(m => m.from && m.body && isMeetingPrepAnswer(m, state)).map(m => ({ from: m.from, replyTo: m.replyTo, body: m.body, why: m.why }));
   const log = lines(path.join(home, '.claude/fleet-mail-sent.jsonl'));
   for (const batch of Object.values(state.batches || {})) {
-    if (batch.method === 'local' && batch.localAnswer && batch.status !== 'complete') {
+    if (batch.method === 'local' && batch.localAnswer && !['complete', 'failed'].includes(batch.status)) {
       answers.push({ from: 'kim-PC', local: true, body: batch.localAnswer }); continue;
     }
     if (batch.status === 'complete' || batch.method !== 'fleet-mail') continue;
@@ -900,17 +996,23 @@ export async function fetchAnswers(home, state, fleet, checkpoint, { request } =
   }
   return answers;
 }
-export async function collectRun({ home, state, fleet, google, config, checkpoint, request }) {
+export async function collectRun({ home, state, fleet, google, config, checkpoint, request, runLocal, send, template, now = new Date().toISOString() }) {
+  migrateFailed(state, now); checkpoint();
   const answers = await fetchAnswers(home, state, fleet, checkpoint, { request });
-  const pending = Object.values(state.batches || {}).filter(b => b.status !== 'complete');
+  const pending = Object.values(state.batches || {}).filter(b => b.status !== 'complete' && b.jobs.some(j => !state.sent?.[jobStateKey(j)] || state.sent[jobStateKey(j)] === b.id));
   let calendarError;
   if (pending.some(b => b.jobs.some(j => j.kind === 'meeting'))) {
     try { await ensureCalendar(google, state, config, checkpoint); }
     catch (e) { calendarError = `準備カレンダー: ${e.message}`; }
   }
-  const errors = await collectAnswers({ state, answers, google, checkpoint, calendarError });
+  const errors = await collectAnswers({ state, answers, google, checkpoint, calendarError, now });
   if (calendarError) errors.push({ error: calendarError });
-  for (const batch of pending.filter(b => ['failed', 'expired'].includes(b.status) && !b.localAnswer)) {
+  migrateFailed(state, now); checkpoint();
+  const jobs = retryJobs(state, now);
+  if (jobs.length) errors.push(...await dispatchJobs({ jobs, state, config, receivers: fleet.receivers,
+    google, checkpoint, home, now, runLocal, send: send || sender(home, path.join(home, '.claude/meeting-prep')),
+    template: template ?? fs.readFileSync(path.join(ROOT, 'templates/meeting-prep-prompt.md'), 'utf8') }));
+  for (const batch of pending.filter(b => ['failed', 'expired'].includes(b.status) && b.jobs.some(j => state.failed?.[jobStateKey(j)]?.batchId === b.id))) {
     errors.push({ batchId: batch.id, error: batch.error || batch.status });
     for (const job of batch.jobs) {
       if (calendarError) continue;
@@ -962,6 +1064,7 @@ export async function main(argv = process.argv.slice(2)) {
     if (!dryRun) release = lock(dir);
     const state = readJson(stateFile, { version: 1, sent: {}, batches: {}, reviewed: {} });
     const checkpoint = () => { if (!dryRun) save(stateFile, state); };
+    if (!dryRun) { migrateFailed(state); checkpoint(); }
     const date = options['--date'] || jstDate(Date.now() + 86400000); dayBounds(date);
     const dateTo = options['--date-to'] || date; dayBounds(dateTo);
     if (dateTo < date || Date.parse(dateTo) - Date.parse(date) > 31 * 86400000) throw new Error('日付範囲は開始日以降31日以内');
@@ -1028,7 +1131,7 @@ export async function main(argv = process.argv.slice(2)) {
           const batch = { id: `prep-${'0'.repeat(32)}`, method: 'local', jobs: [job] };
           const context = await loadLocalContext(google, job, config);
           const input = buildLocalInput(batch, renderPrompt(template, batch), context, config);
-          Object.assign(rows[i], { inputChars: input.inputChars, truncated: input.truncated });
+          Object.assign(rows[i], { inputChars: input.inputChars, gmailMessages: context.mail.length, gmailThreads: new Set(context.mail.map(m => `${m.user}/${m.threadId}`)).size, unconfirmed: context.unconfirmed, truncated: input.truncated });
         } catch (e) { report.errors.push({ key: job.key, error: e.message }); }
       }
       return finish(report.errors.length ? 1 : 0);
