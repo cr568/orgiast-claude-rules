@@ -8,7 +8,8 @@ import assert from 'node:assert/strict';
 import { resolveOwner, resolveOwnerDiscordId, notifyOwner as realNotifyOwner, sendOwnerToast, RECIPIENT_NOTICE } from './notify-owner.mjs';
 import { KIM_DISCORD_USER_ID } from './notify-kim.mjs';
 
-const notifyOwner = (owner, text, options = {}) => realNotifyOwner(owner, text, { notifyKim: async () => ({ delivered: 'session-inbox' }), ...options });
+// 2026-11-04 仕様変更: 配達・宛先検査は即時配信対象の定時まとめで行う。未指定kindは別の回帰テストで保留を検査する。
+const notifyOwner = (owner, text, options = {}) => realNotifyOwner(owner, text, { kind: 'digest', notifyKim: async () => ({ delivered: 'session-inbox' }), ...options });
 
 test('owner 解決は fleet account を使う', () => {
   assert.equal(resolveOwner({ label: 'cr-PC', pcMap: { 'cr-PC': { account: 'cr@orgiast.jp' } }, gitEmail: 'other@example.com' }), 'cr@orgiast.jp');
@@ -262,7 +263,7 @@ for (const [label, sent] of [
     const options = localOptions(t);
     let calls = 0;
     const result = await realNotifyOwner('nishi@orgiast.jp', '進捗', {
-      ...options, userId: '123', token: 'test-token', plainJa: false, toast: () => true,
+      ...options, kind: 'digest', userId: '123', token: 'test-token', plainJa: false, toast: () => true,
       fetchImpl: async () => ++calls === 1 ? { ok: true, json: async () => ({ id: 'channel' }) } : sent,
     });
     assert.equal(calls, 2);
@@ -370,4 +371,20 @@ test('session/toast 設定は Discord と宛先設定依頼を送らない', asy
  const file = path.join(options.home, '.claude', 'auto-progress-inbox', '_owner.jsonl');
  assert.equal(fs.readFileSync(file, 'utf8').trim().split('\n').length, 1);
  assert.match(fs.readFileSync(path.join(options.home, '.claude', 'owner-inbox.md'), 'utf8'), /本人への依頼/);
+});
+
+test('DMを保留してもローカル所有者のセッション受け箱へ保存する', async t => {
+ const options = localOptions(t);
+ const text = '自動作業の状況報告';
+ const result = await realNotifyOwner('nishi@orgiast.jp', text, {
+   ...options, kind: 'automatic',
+   notify: () => assert.fail('deferred DM must not send'),
+   notifyKim: () => assert.fail('deferred DM must not alert'),
+   toast: () => assert.fail('progress deferral must not trigger fallback toast'),
+ });
+ assert.equal(result.delivered, 'deferred');
+ assert.match(fs.readFileSync(path.join(options.home, '.claude', 'owner-inbox.md'), 'utf8'), /自動作業の状況報告/);
+ const rows = fs.readFileSync(path.join(options.home, '.claude', 'auto-progress-inbox', '_owner.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+ assert.equal(rows.length, 1);
+ assert.equal(rows[0].text, text);
 });
