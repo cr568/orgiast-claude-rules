@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import test, { after } from 'node:test';
 import { addCheck } from './auto-progress.mjs';
-import { executeCheck, resolveCheckShell, CHECK_TIMEOUT_MS, MAX_CHECK_TIMEOUT_MS, pendingAction } from './auto-progress-check.mjs';
+import { executeCheck, preflightCheck, hasBashEnvExpansion, hasCheckError, CHECK_ERROR_PATTERNS, resolveCheckShell, CHECK_TIMEOUT_MS, MAX_CHECK_TIMEOUT_MS, pendingAction } from './auto-progress-check.mjs';
 import { readLedger, writeLedger, ledgerFile } from './auto-progress-ledger.mjs';
 import { run as watch } from './auto-progress-watch.mjs';
 import { run as digest } from './auto-progress-digest.mjs';
@@ -104,7 +104,7 @@ test('check errors do not mark done; repeated errors notify once', async () => {
 });
 test('executeCheck honors exit contract, first line and bounded execution', () => {
   const command = `"${process.execPath}" -e "console.log('first');console.log('second');process.exit(1)"`;
-  assert.deepEqual(executeCheck({ check: command }, { home: tmp() }), { code: 1, text: 'first' });
+  assert.deepEqual(executeCheck({ check: command }, { home: tmp() }), { code: 1, text: 'first', stderr: '' });
   const result = executeCheck({ check: 'anything' }, { home: tmp(), shellPath: null, spawnImpl: (_, options) => {
     assert.equal(options.timeout, CHECK_TIMEOUT_MS); assert.equal(options.windowsHide, true);
     return { status: null, error: new Error('timeout'), stdout: '' };
@@ -202,7 +202,7 @@ test('executeCheck invokes explicit Bash without shell and preserves execution o
     assert.equal(opts.timeout, CHECK_TIMEOUT_MS); assert.equal(opts.maxBuffer, 64 * 1024);
     assert.equal(opts.windowsHide, true); assert.equal(opts.encoding, 'utf8'); assert.equal(opts.env.ORGIAST_HOME, home);
     return { status: 1, stdout: '' };
-  } }), { code: 1, text: '未達' });
+  } }), { code: 1, text: '未達', stderr: '' });
 });
 test('executeCheck with null shell retains the shell:true invocation', () => {
   executeCheck({ check: 'check command' }, { shellPath: null, spawnImpl: (...args) => {
@@ -340,4 +340,36 @@ test('CLI --ask-file を ledger の ask に渡す（欠落ファイルでは登�
  fs.unlinkSync(askFile);
  assert.equal(spawnSync(process.execPath, args, { env, encoding: 'utf8' }).status, 2);
  assert.equal(readLedger(ledgerFile(home)).length, 1);
+});
+
+test('preflightCheck: $env: を二重引用符で使う check は静的検査で拒否される', () => {
+  const home = os.tmpdir();
+  const badCheck = 'powershell -NoProfile -Command "if ((Get-Item $env:USERPROFILE\\.claude\\logs\\x.log -ErrorAction Stop).LastWriteTime -ge [datetime]\'2026-10-28 02:00\') { exit 0 } else { exit 1 }"';
+  const pf = preflightCheck({ check: badCheck }, { home });
+  assert.equal(pf.ok, false);
+  assert.equal(pf.preflight, 'static_error');
+  assert.match(pf.text, /\$env:/);
+});
+
+test('preflightCheck: --force-check で静的検査をスキップできる', () => {
+  const home = os.tmpdir();
+  const badCheck = 'powershell -NoProfile -Command "if ((Get-Item $env:USERPROFILE\\.claude\\logs\\x.log -ErrorAction Stop).LastWriteTime -ge [datetime]\'2026-10-28 02:00\') { exit 0 } else { exit 1 }"';
+  const pf = preflightCheck({ check: badCheck }, { home, forceCheck: true });
+  assert.notEqual(pf.preflight, 'static_error');
+});
+
+test('preflightCheck: 未達 check(exit 1・stderr無し)はそのまま通る', () => {
+  const home = os.tmpdir();
+  const pf = preflightCheck({ check: 'exit 1' }, { home });
+  assert.equal(pf.ok, true);
+  assert.equal(pf.preflight, 'unmet');
+});
+
+test('hasBashEnvExpansion / hasCheckError は期待どおり判定する', () => {
+  assert.equal(hasBashEnvExpansion('powershell -Command "$env:USERPROFILE"'), true);
+  assert.equal(hasBashEnvExpansion('printf hello'), false);
+  assert.equal(hasBashEnvExpansion('echo \\$env:USERPROFILE'), false);
+  assert.equal(hasCheckError('bash: command not found: foo'), true);
+  assert.equal(hasCheckError('ok'), false);
+  assert.equal(CHECK_ERROR_PATTERNS.length >= 5, true);
 });
