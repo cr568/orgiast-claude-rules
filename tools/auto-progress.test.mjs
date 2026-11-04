@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { after } from 'node:test';
 import vm from 'node:vm';
+import { spawnSync } from 'node:child_process';
 import { main as registerTasks } from './register-auto-progress-task.mjs';
 import { isNoopPromise, extractPromise, extractNextKim, applyPromise, buildRecord, record, readLedger, writeLedger, ledgerFile, rowKey, originLine } from './auto-progress-ledger.mjs';
 import { run as watch, parseVerdict, deterministicVerdict, judge, GRACE_MS, RESUME_INTERVAL_MS, MAX_RESUMES, postSheet, resumeSession, forgiveNoExecutorResumes, main as watchMain, recentFiles, EXPIRE_UNATTENDED_MS, FALLBACK_STALL_MS, formatDoneMessage, readableReason, formatDoneBacklogMessages } from './auto-progress-watch.mjs';
@@ -1593,4 +1594,16 @@ test('watch: inbox delivery records actual channel and stops retrying completion
   const log = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'logs', 'auto-progress-done-dm.sent.jsonl'), 'utf8').trim());
   assert.equal(log.channel, 'inbox');
   assert.equal(log.toastExitCode, 1);
+});
+
+test('addCheck CLI: $env: を含む check は preflight で拒否され exit 2 になる', () => {
+  const home = tmp();
+  const reset = Object.assign({}, process.env);
+  process.env.HOME = home;
+  const badCheck = 'powershell -NoProfile -Command "if ((Get-Item $env:USERPROFILE\\.claude\\logs\\x.log -ErrorAction Stop).LastWriteTime -ge [datetime]\'2026-10-28 02:00\') { exit 0 } else { exit 1 }"';
+  const result = spawnSync(process.execPath, ['tools/auto-progress.mjs', '--add-check', '--session', 'test-preflight', '--check', badCheck, '--deadline', '+24h', '--label', 'preflight-test'], { env: { ...process.env, ORGIAST_HOME: home }, encoding: 'utf8' });
+  process.env.HOME = reset.HOME;
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /\$env:/);
+  assert.equal(readLedger(ledgerFile(home)).length, 0);
 });
