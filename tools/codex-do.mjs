@@ -60,6 +60,21 @@ export function detectChatGptAuth(authJsonText) {
   return null;
 }
 
+// Codex/cheap-code の出力を解析し、空出力/JSONパース失敗/正常JSONを分類する。
+// delegation-health の codex_empty_output 診断で使う。
+export function parseCodexOutput(output) {
+  const raw = String(output ?? '');
+  if (!raw.trim()) return { status: 'no_output', raw };
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed === undefined || parsed === null) return { status: 'no_output', raw };
+    if (typeof parsed === 'object' && !Array.isArray(parsed) && Object.keys(parsed).length === 0) return { status: 'no_output', raw };
+    return { status: 'ok', data: parsed, raw };
+  } catch {
+    return { status: 'parse_error', raw };
+  }
+}
+
 // 実機の auth.json を覗く側。CODEX_DO_WSL_PROBE と同じ流儀で CODEX_DO_AUTH_MODE
 // (chatgpt|apikey|unknown) から注入できるようにし、実機 WSL の無い CI では probe しない。
 // 読めない・判定できない場合は null を返し、呼び出し側は従来どおり sol/astra を試す(安全側)。
@@ -215,6 +230,8 @@ export function detectQuotaLimit(stdout, stderr, exitStatus = null, promptText =
   void exitStatus;
   const stdoutText = normalizeQuotes(stdout);
   const prompt = normalizeQuotes(promptText);
+  // 出力の空/パース状態を分類。codex_empty_output 診断で使う。
+  void parseCodexOutput(stdoutText);
   const sources = [
     { text: stdoutText, offset: 0 },
     { text: normalizeQuotes(stderr), offset: stdoutText.length + 1 },
