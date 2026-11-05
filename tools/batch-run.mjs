@@ -4,6 +4,7 @@
 // 終了コード3 = 別インスタンス実行中のためスキップ。
 // kind=eval-harness のジョブは LLM に渡さず「node tools/eval-harness.mjs --all」へ変換する
 // (eval自体が複数providerを叩くローカル計測なので、ここでLLM呼び出しすると二重課金になる)。
+import { gatewayConfig, gatewayParams, usageCostFields } from './provider-routing.mjs';
 import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -12,6 +13,7 @@ import { callWithFallback, classifyFailure, FALLBACK_CHAIN } from './llm-fallbac
 import { batchDeadline } from './lib/batch-deadline.mjs';
 import { runEvalHarnessJobs } from './lib/eval-harness-coalesce.mjs';
 import { acquireLock } from './lib/single-instance.mjs';
+import { geminiUsage, recordGeminiUsage } from './gemini-usage-ledger.mjs';
 
 function userHome() { const h = os.homedir(), m = process.cwd().match(/^(\/mnt\/[a-z]\/Users\/[^/]+)/i); return process.env.USERPROFILE || m?.[1] || h; }
 const home = userHome();
@@ -28,11 +30,11 @@ if (!batchLock.acquired) {
 }
 
 const PROVIDERS = {
-  deepseek: { base: 'https://api.deepseek.com/chat/completions', keyEnv: 'DEEPSEEK_API_KEY', keyFile: 'deepseek.env', model: 'deepseek-chat' },
-  gemini: { base: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', keyEnv: 'GEMINI_API_KEY', keyFile: 'gemini.env', model: 'gemini-3.7-flash' },
+  deepseek: gatewayConfig('deepseek'),
+  gemini: { base: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', keyEnv: 'GEMINI_API_KEY', keyFile: 'gemini.env', model: 'gemini-3.6-flash' },
   openrouter: { base: 'https://openrouter.ai/api/v1/chat/completions', keyEnv: 'OPENROUTER_API_KEY', keyFile: 'openrouter.env', model: 'meta-llama/llama-3.3-70b-instruct', extraHeaders: { 'HTTP-Referer': 'https://orgiast.jp', 'X-Title': 'orgiast' } },
   groq: { base: 'https://api.groq.com/openai/v1/chat/completions', keyEnv: 'GROQ_API_KEY', keyFile: 'groq.env', model: 'openai/gpt-oss-120b' },
-  kimi: { base: 'https://api.moonshot.ai/v1/chat/completions', keyEnv: 'MOONSHOT_API_KEY', keyFile: 'kimi-api.env', model: 'kimi-k3' },
+  kimi: gatewayConfig('kimi'),
   anthropic: { base: 'https://api.anthropic.com/v1/messages', keyEnv: 'ANTHROPIC_API_KEY', keyFile: 'anthropic.env', model: 'claude-haiku-4-5-20251001' },
 };
 
@@ -77,9 +79,15 @@ function messages(job) {
   return out;
 }
 function usageRecord(provider, model, usage = {}, extra = {}) {
+  if (provider === 'gemini') {
+    const measured = geminiUsage(usage.promptTokenCount !== undefined ? { usageMetadata: usage } : { usage });
+    const mode = extra.mode === 'batch' ? 'batch' : 'standard';
+    if (!usage.__attemptRecorded) recordGeminiUsage({ model, ...measured, source: 'batch-run', mode, ...extra }, { home, usageFile: ledger });
+    return { in: measured.inTokens, out: measured.outTokens };
+  }
   const input = usage.prompt_tokens ?? usage.promptTokenCount ?? usage.input_tokens ?? 0;
   const output = usage.completion_tokens ?? usage.candidatesTokenCount ?? usage.output_tokens ?? 0;
-  if (!usage.__attemptRecorded) try { fs.appendFileSync(ledger, JSON.stringify({ t: new Date().toISOString(), provider, model, in: input, out: output, status: 'ok', attempt: 0, failover: false, ...extra }) + '\n'); } catch {}
+  if (!usage.__attemptRecorded) try { fs.appendFileSync(ledger, JSON.stringify({ t: new Date().toISOString(), provider, model, ...usageCostFields(usage), in: input, out: output, status: 'ok', attempt: 0, failover: false, ...extra }) + '\n'); } catch {}
   return { in: input, out: output };
 }
 function saveResult(job, text, usage, mode = 'standard', executedBy) {
@@ -96,6 +104,7 @@ async function runStandard(job) {
       const P = PROVIDERS[candidate.provider]; const key = P && loadKey(candidate.provider);
       if (!P || !key) return null;
       const payload = { model: candidate.model || P.model, messages: messages(job), max_tokens: job.max || 4000, stream: false };
+      Object.assign(payload, gatewayParams(payload.model));
       if (candidate.provider === 'kimi') Object.assign(payload, { reasoning_effort: 'none', temperature: 0.6 });
       return { url: P.base, init: { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', ...(P.extraHeaders || {}) }, body: JSON.stringify(payload) } };
     },
@@ -203,7 +212,7 @@ for (const group of geminiGroups.values()) {
         try { const fallback = await runStandard(job); const usage = usageRecord(job.provider, job.model, fallback.usage); saveResult(job, fallback.text, usage, fallback.mode, fallback); completed.add(job.id); console.log(`OK ${job.id} standard`); }
         catch (err) { console.error(`FAIL ${job.id}: ${out.error}; fallback: ${err.message}`); }
       } else {
-        const usage = usageRecord(job.provider, job.model, out.usage); saveResult(job, out.text, usage, out.mode); completed.add(job.id); console.log(`OK ${job.id} gemini-batch`);
+        const usage = usageRecord(job.provider, job.model, out.usage, { mode: 'batch' }); saveResult(job, out.text, usage, out.mode); completed.add(job.id); console.log(`OK ${job.id} gemini-batch`);
       }
     }
   } catch (e) {
