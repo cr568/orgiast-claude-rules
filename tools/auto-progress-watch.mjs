@@ -640,6 +640,35 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
   // owner 未記録の行は自PCの持ち主へ。空のまま渡すと「宛先: 不明（DM 未解決）」だけになり出どころが分からない（2026-10-23 実測）。
   let localOwner;
   const ownerOf = row => row.owner || (localOwner ??= io.localOwner ?? (() => { try { return resolveOwner({ home }); } catch { return ''; } })());
+  const deferredNotices = new Map();
+  const queueDeferredNotice = (row, reason) => {
+    if (dryRun || notificationsStopped || isQuietHours(now) || isUnattendedRow(row, home)) return;
+    const previousAt = Date.parse(row.resumeDeferredNotifiedAt || 0) || 0;
+    if (row.resumeDeferredNotifiedReason === reason && now - previousAt < 24 * 3600000) return;
+    const owner = ownerOf(row);
+    const group = deferredNotices.get(owner) ?? [];
+    group.push({ row, reason });
+    deferredNotices.set(owner, group);
+  };
+  const sendDeferredNotices = async () => {
+    for (const [owner, items] of deferredNotices) {
+      if (notificationsStopped) break;
+      const reasons = [...new Set(items.map(item => item.reason))].join(' / ');
+      const targets = items.map(({ row }) => {
+        const purpose = row.label || row.promise || '目的未記録';
+        const next = row.nextClaude || pendingAction(row);
+        return `・対象: ${purpose}\n  次の手: ${next}`;
+      }).join('\n');
+      const message = `自動再開を見送りました。理由: ${reasons}。次回の枠回復後に自動で再試行します。\n${targets}`;
+      try {
+        const delivery = await (io.notifyOwner ?? notifyOwner)(owner, message, { home, now, kind: 'automatic', session: items[0].row });
+        if (!['dm', 'session-inbox', 'toast', 'inbox', 'deferred'].includes(delivery?.delivered)) throw new Error(delivery?.reason || 'DM not delivered');
+        for (const { row, reason } of items) patch(rowKey(row), {
+          resumeDeferredNotifiedAt: new Date(now).toISOString(), resumeDeferredNotifiedReason: reason,
+        });
+      } catch (error) { summary.errors.push(`deferred-notify: ${String(error?.message ?? error).slice(0, 120)}`); }
+    }
+  };
   const askKim = (row, reason) => (io.notifyOwner ?? notifyOwner)(ownerOf(row),
     `${originLine(row, { label: io.label ?? resolveFleetLabel(home), localOwner: ownerOf(row), home })}\n自動進行が判断待ちです: ${row.promise}\n${reason || ''}\n${pendingAction(row)}`, { home, now, kind: 'action', session: row });
   const notifyDone = async (row, reason, artifact) => {
@@ -855,7 +884,11 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
       if (summary.resumed >= MAX_RESUMES_PER_RUN || (row.resumeCount ?? 0) >= MAX_RESUMES ||
           now - (Date.parse(row.resumedAt || 0) || 0) < RESUME_INTERVAL_MS ||
           !row.cwd || !(io.cwdExists ?? fs.existsSync)(row.cwd)) continue;
-      if (executorUnavailable) { summary.resumeDeferred++; continue; }
+      if (executorUnavailable) {
+        summary.resumeDeferred++;
+        queueDeferredNotice(row, summary.resumeDeferredReason || '実行者が利用できません');
+        continue;
+      }
       const attempt = { status: 'starting', startedAt: at, resumedAt: at, resumeCount: (row.resumeCount ?? 0) + 1 };
       if (!patch(key, attempt)) continue;
       let outcome;
@@ -867,6 +900,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
         executorUnavailable = true;
         summary.resumeDeferred++;
         summary.resumeDeferredReason ??= outcome.reason;
+        queueDeferredNotice(row, outcome.reason);
         continue;
       }
       summary.resumed++;
@@ -942,7 +976,10 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
     const resumeEligible = !unattended && !dryRun && summary.resumed < MAX_RESUMES_PER_RUN && (answered || (row.resumeCount ?? 0) < MAX_RESUMES) && now - (Date.parse(row.resumedAt || 0) || 0) >= RESUME_INTERVAL_MS
       && row.cwd && (io.cwdExists ?? fs.existsSync)(row.cwd);
     const canResume = resumeEligible && !executorUnavailable;
-    if (resumeEligible && executorUnavailable) summary.resumeDeferred += 1;
+    if (resumeEligible && executorUnavailable) {
+      summary.resumeDeferred += 1;
+      queueDeferredNotice(row, summary.resumeDeferredReason || '実行者が利用できません');
+    }
     if (canResume) {
       // Persist the attempt before launching: crashes must not allow another same-day resume.
       current = { ...row, status: 'resumed', resumedAt: new Date(now).toISOString(), resumeCount: (row.resumeCount ?? 0) + 1, resumeOutcome: 'attempting' };
@@ -957,6 +994,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
         executorUnavailable = true;
         summary.resumeDeferred += 1;
         summary.resumeDeferredReason ??= outcome.reason;
+        queueDeferredNotice(row, outcome.reason);
       } else {
         const state = outcome.state || outcome.outcome;
         const nextKim = outcome.nextKim ?? row.nextKim;
@@ -997,6 +1035,7 @@ export async function run({ home = process.env.ORGIAST_HOME || os.homedir(), now
       catch (error) { summary.errors.push(`sheet: ${String(error?.message ?? error).slice(0, 120)}`); } // 次回巡回で再送する
     }
   }
+  await sendDeferredNotices();
   if (!dryRun) {
     const log = path.join(home, '.claude', 'logs', 'auto-progress-watch.summary.log');
     try {
