@@ -115,15 +115,19 @@ test('開始条件未達はlastCheckedAtだけ更新し、条件達成だけで�
 });
 test('deferredは回数を消費せず次回再試行、doneで完了通知は一度だけ', async t => {
   const { options, home } = setup(t); addCheck(options);
-  let outcome = 'deferred', calls = 0, notices = 0;
+  let outcome = 'deferred', calls = 0; const notices = [];
   const io = { ...ioBase, executeCheck: () => ({ code: 0 }), resume: async () => { calls++; return { outcome, reason: outcome }; },
-    notifyOwner: async () => { notices++; return { delivered: 'dm' }; } };
+    notifyOwner: async (_owner, text) => { notices.push(text); return { delivered: 'dm' }; } };
   await run({ home, now, io });
   let row = readLedger(ledgerFile(home))[0];
-  assert.equal(row.status, 'scheduled'); assert.equal(row.resumeCount, 0); assert.ok(row.resumeDeferredAt); assert.equal(notices, 0);
+  assert.equal(row.status, 'scheduled'); assert.equal(row.resumeCount, 0); assert.ok(row.resumeDeferredAt); assert.equal(notices.length, 1);
+  assert.match(notices[0], /自動再開を見送りました。理由: deferred。次回の枠回復後に自動で再試行します。/);
+  assert.match(notices[0], new RegExp(options.label)); assert.match(notices[0], new RegExp(options.nextClaude));
   outcome = 'done'; await run({ home, now, io }); await run({ home, now, io });
   row = readLedger(ledgerFile(home))[0];
-  assert.equal(row.status, 'done'); assert.equal(calls, 2); assert.equal(notices, 1);
+  assert.equal(row.status, 'done'); assert.equal(calls, 2); assert.equal(notices.length, 2);
+  assert.equal(notices.filter(text => /自動再開を見送りました/.test(text)).length, 1);
+  assert.equal(notices.filter(text => /完了/.test(text)).length, 1);
 });
 test('完了check併用は成果確認がexit 0のときだけdone', async t => {
   for (const code of [0, 1, 2]) {

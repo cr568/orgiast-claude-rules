@@ -1473,10 +1473,11 @@ test('resumeSession: 実行者なしは延期し、本物の失敗は詳細を�
 
 test('watch: 延期は回数と日時を復元し、巡回内の後続起動とinboxを抑止する', async () => {
   const home = tmp(), now = Date.parse('2026-10-27T03:00:00Z');
-  seed(home, ['a', 'b'].map(sessionId => ({ sessionId, status: 'open', resumeCount: 0, resumedAt: '',
-    ts: new Date(now - 3 * H).toISOString(), promise: '作業を進める', cwd: home, reportedKey: 'stalled:false:0' })));
-  let calls = 0;
+  seed(home, ['a', 'b'].map(sessionId => ({ sessionId, owner: 'owner@example.com', status: 'open', resumeCount: 0, resumedAt: '',
+    ts: new Date(now - 3 * H).toISOString(), promise: `${sessionId} の作業を進める`, nextClaude: `${sessionId} の次工程`, cwd: home, reportedKey: 'stalled:false:0' })));
+  let calls = 0; const notices = [];
   const io = noEvidenceIo({ resume: async () => { calls++; return { outcome: 'deferred', deferred: true, reason: '実行者なし: x' }; },
+    notifyOwner: async (...args) => { notices.push(args); return { delivered: 'dm' }; },
     postSheet: () => assert.fail('unchanged reportKey must not resend'),
     appendInbox: () => assert.fail('deferred must not append inbox') });
   const summary = await watch({ home, now, io });
@@ -1491,9 +1492,41 @@ test('watch: 延期は回数と日時を復元し、巡回内の後続起動とi
   assert.equal(summary.resumed, 0);
   assert.equal(summary.resumeDeferred, 2);
   assert.equal(summary.resumeDeferredReason, '実行者なし: x');
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0][0], 'owner@example.com');
+  assert.match(notices[0][1], /自動再開を見送りました。理由: 実行者なし: x。次回の枠回復後に自動で再試行します。/);
+  assert.match(notices[0][1], /a の作業を進める[\s\S]*a の次工程[\s\S]*b の作業を進める[\s\S]*b の次工程/);
+  assert.equal(rows[0].resumeDeferredNotifiedReason, '実行者なし: x');
+  assert.equal(rows[0].resumeDeferredNotifiedAt, new Date(now).toISOString());
   for (const row of rows) assert.equal(fs.existsSync(path.join(home, '.claude', 'auto-progress-inbox', `${row.sessionId}.jsonl`)), false);
   await watch({ home, now: now + H, io });
   assert.equal(calls, 2);
+  assert.equal(notices.length, 1, '同じ理由は24時間以内に再送しない');
+});
+
+test('watch: 延期通知の失敗はエラーに積んで継続し、dry-run は通知しない', async () => {
+  const now = Date.parse('2026-10-27T03:00:00Z');
+  const makeRow = home => ({ sessionId: 'deferred-notify', owner: 'owner@example.com', status: 'open', resumeCount: 0,
+    ts: new Date(now - 3 * H).toISOString(), promise: '延期対象', nextClaude: '次工程', cwd: home });
+  const home = tmp();
+  seed(home, [makeRow(home)]);
+  const failed = await watch({ home, now, io: noEvidenceIo({
+    resume: async () => ({ outcome: 'deferred', deferred: true, reason: '枠なし' }),
+    notifyOwner: async () => { throw new Error('DM offline'); },
+  }) });
+  assert.ok(failed.errors.includes('deferred-notify: DM offline'));
+  assert.equal(failed.resumeDeferred, 1);
+  assert.equal(readLedger(ledgerFile(home))[0].resumeDeferredNotifiedAt, undefined);
+
+  const dryHome = tmp();
+  seed(dryHome, [makeRow(dryHome)]);
+  let notifications = 0;
+  const dry = await watch({ home: dryHome, now, dryRun: true, io: noEvidenceIo({
+    resume: () => assert.fail('dry-run must not resume'),
+    notifyOwner: async () => { notifications++; return { delivered: 'dm' }; },
+  }) });
+  assert.equal(notifications, 0);
+  assert.equal(dry.resumeDeferred, 0);
 });
 
 test('forgiveNoExecutorResumes: 空振りだけを取消し、dry-runと再実行は台帳を変えない', async () => {
