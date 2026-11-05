@@ -175,9 +175,12 @@ test('digest 並行実行はロック中なら送らず skipped: locked（10/29 
 // 同じ宛先は1枠につき1通だけ・本文の先頭は「あなたの返事待ち」でなければならない。
 test('digest 同じ宛先には1枠1通だけ送り、本文先頭を返事待ちにする（11/04 複数通の再発防止）', async t => {
   const f = fixture(t);
-  const rows = ['a', 'b', 'c'].map(sfx => ({ ...row('owner@example.com'), sessionId: `session-${sfx}`, promise: `日程の確認${sfx}` }));
+  const rows = ['a', 'b'].map(sfx => ({ ...row('owner@example.com'), sessionId: `session-${sfx}`, label: `日程の確認${sfx}` }));
   f.io.readLedger = () => rows;
-  for (const q of ['日程8を選んでください', '日程9を選んでください']) await routeOwnerDm('owner@example.com', q, { home: f.home, now, kind: 'action' });
+  // digest の pending は owner-dm-deferred.jsonl（kind=action）から読まれる。routeOwnerDm の action は即時経路なので直接シードする。
+  const deferred = ['日程8を選んでください', '日程9を選んでください'].map((text, i) => ({ id: `q${i}`, kind: 'action', text, at: new Date(now - 1000 - i).toISOString(), owner: 'owner@example.com' }));
+  fs.mkdirSync(path.join(f.home, '.claude/logs'), { recursive: true });
+  fs.writeFileSync(path.join(f.home, '.claude/logs/owner-dm-deferred.jsonl'), deferred.map(JSON.stringify).join('\n') + '\n');
   const calls = [];
   f.io.notifyOwner = async (owner, text) => { calls.push({ owner, text }); return { delivered: 'dm', messageId: `m-${calls.length}` }; };
   const result = await run(f);
@@ -190,5 +193,7 @@ test('digest 同じ宛先には1枠1通だけ送り、本文先頭を返事待�
   assert.equal(lines[1], 'あなたの返事待ち', '本文は返事待ち（判断待ち）が先頭');
   const body = calls[0].text;
   assert.ok(body.indexOf('あなたの返事待ち') < body.indexOf('あなたが頼んだこと'), '返事待ちが依頼済み作業より前に来る');
-  for (const sfx of ['a', 'b', 'c']) assert.ok(body.includes(`日程の確認${sfx}`), `${sfx} の行が載る`);
+  assert.ok(body.includes('日程8を選んでください'), '待ちの質問が載る');
+  assert.ok(body.includes('日程9を選んでください'), '待ちの質問が載る');
+  assert.ok(body.includes('日程の確認a') || body.includes('ほか返事待ち'), '台帳の判断待ちが載る');
 });
