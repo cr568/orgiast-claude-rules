@@ -38,6 +38,7 @@ export async function reconcileConvergence({ rows, state = {}, now = Date.now(),
     if (!problems.length) { delete next.targets[id]; continue; }
     issues.push({ label: row.label || row.pcName, username: row.username || '未確認', problems });
     const entry = next.targets[id] ||= { firstSeen: now };
+    Object.assign(entry, { label: row.label || row.pcName, username: row.username, hostname: row.hostname });
     // Exact per-user addresses are intentionally separate from ordinary PC mail.
     if (row.hostname && row.username && (!entry.sentAt || now - entry.sentAt >= DAY)) {
       // Keep a stable pending ID across ambiguous HTTP failures and process restarts.
@@ -62,7 +63,7 @@ export async function reconcileConvergence({ rows, state = {}, now = Date.now(),
       `${row.label || row.pcName || row.hostname} / OSユーザー ${row.username || '未確認'}: ${problems.join('・')}${unavailable ? '（宛先未確定）' : sendFailed ? '（送付失敗）' : ''}`).join('\n')
       + '\n最小手順: 対象ユーザーで配布リポを開きClaude Codeを起動。未導入なら tools/bootstrap.ps1（Windows）/ tools/bootstrap.sh（Mac/Linux）。鍵は既存enroll.envで日次再試行。未発行・期限切れは管理側でASCII PC名のenrollを再発行。';
     const result = await notify(text);
-    if (result?.delivered === 'dm') { next.notifiedAt = now; notified = true; persist(next); }
+    if (['dm', 'session-inbox'].includes(result?.delivered)) { next.notifiedAt = now; notified = true; persist(next); }
   }
   if (!dryRun) persist(next);
   return { sent, issues, notified, state: next };

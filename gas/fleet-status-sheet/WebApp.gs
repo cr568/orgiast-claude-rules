@@ -79,21 +79,34 @@ function doPost(e) {
   } catch (error) {
     return _fleetJson_({ ok: false, status: 400, error: 'invalid_json' });
   }
+  if (payload && payload.kind === 'install-beacon') return _fleetJson_(receiveInstallBeacon(e, payload));
   const expected = PropertiesService.getScriptProperties().getProperty('FLEET_TOKEN');
   if (!expected || payload.token !== expected) return _fleetJson_({ ok: false, status: 401, error: 'unauthorized' });
-  const labelRequiredKinds = { extensions: true, 'cloud-login': true, 'cost-improve-heartbeat': true };
+  const labelRequiredKinds = { 'plan-usage': true, extensions: true, 'cloud-login': true, 'cost-improve-heartbeat': true };
   if (labelRequiredKinds[payload.kind] && (typeof payload.label !== 'string' || payload.label.trim() === '')) {
     return _fleetJson_({ ok: false, status: 400, error: 'label_required' });
   }
 
   // 未知 kind は従来どおり通常点検として扱い、既存クライアントの挙動を変えない。
+  // auto-progress / auto-progress-list は tools/auto-progress-watch.mjs（停滞判定・自動再開）と
+  // tools/auto-progress-digest.mjs（朝 08:40 の DM）が使う。実体は AutoProgress.gs。
   const handlers = {
+    'auto-progress': upsertAutoProgress,
+    'auto-progress-list': listAutoProgress,
     'mail-send': sendFleetMail,
     'mail-poll': pollFleetMail,
     'mail-reply': replyFleetMail,
     'mail-get': getFleetMail,
+    'mail-trace': traceFleetMail,
+    'mail-sent-status': getFleetMail,
+    'mail-alerts': getFleetMailAlerts,
+    'mail-seen': seenFleetMail,
+    'mail-ack': ackFleetMail,
+    'mail-fail': failFleetMail,
     'fleet-beacon': upsertFleetBeacon,
     'fleet-beacon-list': listFleetBeacons,
+    'install-beacon-list': listInstallBeacons,
+    'plan-usage': upsertPlanUsage,
     'pc-spec': upsertPcInventory,
     'extensions-describe': describeExtensionAudit,
     extensions: replaceExtensionAudit,
@@ -155,6 +168,7 @@ function doGet(e) {
         interactionLoop: value('interactionLoop'), interactionSelftest: value('interactionSelftest'),
         claudeUsd: value('claudeUsd'), mainModel: value('mainModel'), delegRatio: value('delegRatio'), delegRatioLegacy: value('delegRatioLegacy'), cheapAiUse: value('cheapAiUse'),
         planSevenDayPct: value('planSevenDayPct'), planFiveHourPct: value('planFiveHourPct'), budgetPacePct: value('budgetPacePct'), settingsModel: value('settingsModel'),
+        stuckDialogs24h: value('stuckDialogs24h'),
         codexLogin: value('codexLogin'), fable5: value('fable5'), disciplineAlert: value('disciplineAlert'), livenessState: value('livenessState'),
         costLoopRanAt: value('costLoopRanAt'), costLoopStatus: value('costLoopStatus'),
         costWeeklyRanAt: value('costWeeklyRanAt'), costWeeklyStatus: value('costWeeklyStatus'),

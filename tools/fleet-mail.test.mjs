@@ -1,3 +1,5 @@
+import { runReadOnlyTask } from './fleet-task-runner.mjs';
+import { INTERRUPTED_PROMPT_BODY, EXEC_KINDS } from './fleet-mail.mjs';
 import test from 'node:test';
 process.env.FLEET_NO_SELF_HEAL = '1';
 import assert from 'node:assert/strict';
@@ -6,11 +8,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { main, parseArgs, createClient, waitForReply, acquireLock, LOCK_MS, readInbox, findPriorReply, resolveRemoteName, parseExecMarkers, looksLikeInstallRequest, describeTargetFreshness } from './fleet-mail.mjs';
+import { main, parseArgs, createClient, waitForReply, acquireLock, LOCK_MS, updateInbox, INBOX_LOCK_STALE_MS, RECLAIM_STALE_MS, LOCK_BUSY_EXIT, readInbox, findPriorReply, resolveRemoteName, parseExecMarkers, looksLikeInstallRequest, describeTargetFreshness, mailId } from './fleet-mail.mjs';
 import { main as register } from './register-fleet-mail.mjs';
 import { consentCommand } from './fleet-agent.mjs';
 import { listDecisions, markDecisions, queuePath } from './pending-decisions.mjs';
 
+async function runPromptPoll(f) {
+  await main(['--poll'], { ...f.deps, spawnImpl: () => ({ on() {}, unref() {} }) });
+  await runReadOnlyTask({ ...f.deps, id: mail().id });
+  await main(['--poll'], f.deps);
+}
+const pcMap = JSON.parse(fs.readFileSync(new URL('../fleet-pc-map.json', import.meta.url), 'utf8'));
+const recipient = Object.keys(pcMap).find(key => !key.startsWith('_') && pcMap[key].remoteName && pcMap[key].hostname);
+// v2 sends require an exact roster label; expected identities derive from the actual roster.
 function fixture(t, configured = true) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-mail-test-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -19,7 +29,7 @@ function fixture(t, configured = true) {
   fs.writeFileSync(path.join(dir, 'cost-reporter.env'), 'REPORTER_LABEL=kim-PC\n');
   const body = path.join(home, 'body.txt'); fs.writeFileSync(body, '質問 $() `literal`');
   const calls = [], output = [], errors = [];
-  const deps = { home, identity: { hostname: 'host-kim' }, stdout: t => output.push(t), stderr: t => errors.push(t),
+  const deps = { home, pcMap, identity: { hostname: 'host-kim' }, stdout: t => output.push(t), stderr: t => errors.push(t),
     // 送信前の宛先鮮度表示は既定で「不明」を返す（実ネットワークに出ない・stderr を決定的にする）。
     fetchBeacons: async () => ({ ok: false, beacons: [], serverPolls: {}, reason: 'unconfigured' }),
     request: async (kind, payload) => { calls.push({ kind, payload }); return kind === 'mail-poll' ? { messages: [] } : { mail: payload }; } };
@@ -38,11 +48,11 @@ function spawnDouble(calls, output = 'answer token=secret-value') {
 
 test('send uses file body, reporter identity, reason, expiry and mail-send envelope', async t => {
   const f = fixture(t); const transport = [];
-  f.deps.now = () => Date.parse('2026-09-21T00:00:00Z'); f.deps.randomInt = () => 1234;
+  f.deps.now = () => Date.parse('2026-09-21T00:00:00Z'); f.deps.randomBytes = () => Buffer.from([0, 0, 4, 210]);
   delete f.deps.request;
   f.deps.fetch = async (url, opts) => { transport.push({ url, payload: JSON.parse(opts.body) }); return { ok: true, json: async () => ({ ok: true, mail: {} }) }; };
-  assert.equal(await main(['--send', '--to', 'other-PC', '--kind', 'prompt', '--body-file', f.body, '--why', '調査'], f.deps), 0);
-  assert.deepEqual(transport[0].payload, { id: 'mail-20260921000000000-1234', from: 'kim-PC', to: 'other-PC', messageKind: 'prompt', body: '質問 $() `literal`', why: '調査', expiresAt: '2026-09-22T00:00:00.000Z', kind: 'mail-send', token: 'test-token' });
+  assert.equal(await main(['--send', '--to', recipient, '--kind', 'prompt', '--body-file', f.body, '--why', '調査'], f.deps), 0);
+  assert.deepEqual(transport[0].payload, { id: mailId(f.deps.now, f.deps.randomBytes), from: 'kim-PC', to: recipient, auto: false, hop: 0, priority: 'normal', messageKind: 'prompt', body: '質問 $() `literal`', why: '調査', expiresAt: '2026-09-22T00:00:00.000Z', kind: 'mail-send', token: 'test-token' });
   assert.match(fs.readFileSync(path.join(f.dir, 'fleet-mail-sent.jsonl'), 'utf8'), /send-attempt/);
 });
 for (const to of ['作業用011', '作業用０１１', '  作業用011　']) {
@@ -51,21 +61,19 @@ for (const to of ['作業用011', '作業用０１１', '  作業用011　']) {
     f.deps.pcMap = { 'kimko-PC': { remoteName: '作業用011', hostname: 'DESKTOP-PPD5V8I' } };
     assert.equal(await main(['--send', '--to', to, '--kind', 'note', '--body-file', f.body, '--why', 'test'], f.deps), 0);
     assert.equal(f.calls[0].payload.to, 'kimko-PC');
-    assert.deepEqual(f.errors, [`${to} → kimko-PC`, '宛先 kimko-PC: 最終 poll 不明（ビーコン取得失敗: unconfigured）']);
+    assert.deepEqual(f.errors.slice(0, 2), [`${to} → kimko-PC`, '宛先 kimko-PC: 最終 poll 不明（ビーコン取得失敗: unconfigured）']);
     const logs = fs.readFileSync(path.join(f.dir, 'fleet-mail-sent.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
     assert.ok(logs.every(entry => entry.to === 'kimko-PC'));
   });
 }
-test('send preserves unmatched targets without resolution stderr output', async t => {
+// v2 removes partial/unknown targets even when --force is supplied.
+test('send rejects unmatched targets with exit 4 and candidate output', async t => {
   const f = fixture(t);
-  f.deps.pcMap = { 'kimko-PC': { remoteName: '作業用011', hostname: 'DESKTOP-PPD5V8I' } };
-  for (const to of ['other-PC', '  other-ＰＣ　', 'all', '作業用01']) {
-    assert.equal(await main(['--send', '--to', to, '--kind', 'note', '--body-file', f.body, '--why', 'test'], f.deps), 0);
-    assert.equal(f.calls.at(-1).payload.to, to);
+  for (const to of ['unknown-PC', '  other-ＰＣ　', '作業用01']) {
+    assert.equal(await main(['--send', '--to', to, '--kind', 'note', '--body-file', f.body, '--why', 'test', '--force'], f.deps), 4);
   }
-  // 宛先解決の stderr は出ない（送信ごとの鮮度表示1行のみ＝4件）
-  assert.equal(f.errors.length, 4);
-  assert.ok(f.errors.every(line => line.includes('最終 poll 不明（ビーコン取得失敗: unconfigured）')));
+  assert.equal(f.calls.length, 0);
+  assert.ok(f.errors.every(line => line.includes('候補:')));
 });
 test('resolveRemoteName normalizes roster names and falls back to the PC label', () => {
   assert.deepEqual(resolveRemoteName('作業用011', { 'kimko-PC': { remoteName: '　作業用０１１ ' } }), { to: 'kimko-PC', resolved: true });
@@ -98,7 +106,8 @@ test('prompt without opt-in never spawns and returns exact existing consent comm
   const f = fixture(t); f.deps.spawnImpl = () => assert.fail('must not spawn');
   f.deps.request = async (kind, payload) => { f.calls.push({ kind, payload }); return kind === 'mail-poll' ? { messages: [mail({ kind: 'prompt' })] } : { mail: {} }; };
   await main(['--poll'], f.deps);
-  assert.equal(f.calls[1].payload.resultBody, `未オプトイン。承諾コマンド: ${consentCommand('prompt')}`);
+  assert.ok(f.calls.find(c => c.kind === 'mail-send').payload.body.includes('未オプトイン'));
+  assert.equal(f.calls.find(c => c.kind === 'mail-fail').payload.reason, 'exit-unknown');
 });
 test('opted-in prompt uses fixed header, local executable/cwd, bounded redacted result, no side-effect tools', async t => {
   const f = fixture(t); const spawns = [];
@@ -106,12 +115,12 @@ test('opted-in prompt uses fixed header, local executable/cwd, bounded redacted 
   f.deps.spawnImpl = spawnDouble(spawns, 'x'.repeat(9000) + ' token=secret-value');
   f.deps.repo = f.home;
   f.deps.request = async (kind, payload) => { f.calls.push({ kind, payload }); return kind === 'mail-poll' ? { messages: [mail({ kind: 'prompt', cwd: '/attacker', claudeExe: '/evil' })] } : { mail: {} }; };
-  await main(['--poll'], f.deps);
+  await runPromptPoll(f);
   assert.equal(spawns.length, 1); assert.equal(spawns[0].options.cwd, f.home); assert.notEqual(spawns[0].program, '/evil');
-  assert.match(spawns[0].args[1], /^これは other-PC PC の Claude Code からのメッセージです。/);
+  assert.match(spawns[0].args.at(-1), /^これは other-PC PC の Claude Code からのメッセージです。/);
   assert.ok(spawns[0].args.includes('--strict-mcp-config')); assert.ok(spawns[0].args.includes('--tools'));
   assert.equal(spawns[0].options.shell, false);
-  assert.equal(f.calls[1].payload.resultBody.length, 8000); assert.doesNotMatch(f.calls[1].payload.resultBody, /secret-value/);
+  assert.equal(f.calls.find(c => c.kind === 'mail-reply').payload.resultBody, 'x'.repeat(6000) + '…(中略 1511 字)…' + 'x'.repeat(1489) + ' [REDACTED]'); assert.doesNotMatch(f.calls.find(c => c.kind === 'mail-reply').payload.resultBody, /secret-value/);
   assert.doesNotMatch(fs.readFileSync(path.join(f.dir, 'fleet-agent-results', `${mail().id}.json`), 'utf8'), /secret-value/);
   await main(['--poll'], f.deps); assert.equal(spawns.length, 1);
 });
@@ -119,7 +128,8 @@ test('failed reply resumes saved result without running prompt again', async t =
   const f = fixture(t); const spawns = []; let fail = true;
   fs.writeFileSync(path.join(f.dir, 'fleet-agent-optin.json'), '{"accept":["prompt"]}'); f.deps.spawnImpl = spawnDouble(spawns);
   f.deps.request = async kind => { if (kind === 'mail-poll') return { messages: fail ? [mail({ kind: 'prompt' })] : [] }; if (fail) throw new Error('offline'); return { mail: {} }; };
-  await assert.rejects(main(['--poll'], f.deps), /offline/); fail = false;
+  // v2 isolates transport failures and retries the saved result on the next poll.
+  assert.equal(await main(['--poll'], f.deps), 0); fail = false;
   await main(['--poll'], f.deps); assert.equal(spawns.length, 1);
   assert.equal(fs.existsSync(path.join(f.dir, 'fleet-mail.lock')), false);
 });
@@ -145,7 +155,7 @@ test('wait returns done body, timeout exit 2 and bounds sleep to deadline', asyn
 test('send --wait returns reply on stdout, reply CLI sends redacted body', async t => {
   const f = fixture(t);
   f.deps.request = async (kind, p) => { f.calls.push({ kind, p }); return { mail: { status: 'done', resultBody: 'answer' } }; };
-  assert.equal(await main(['--send','--to','PC','--kind','note','--body-file', f.body,'--why','test','--wait','5'], f.deps), 0);
+  assert.equal(await main(['--send','--to',recipient,'--kind','note','--body-file', f.body,'--why','test','--wait','5'], f.deps), 0);
   assert.deepEqual(f.output, ['answer']);
   fs.writeFileSync(f.body, 'secret=do-not-log');
   await main(['--reply', 'mail-1', '--body-file', f.body], f.deps);
@@ -160,7 +170,7 @@ test('lock excludes concurrent poll and reclaims only after ten minutes', t => {
 test('missing transport config is exit 0 without side effects or network', async t => {
   const f = fixture(t, false); f.deps.request = () => assert.fail('network called');
   assert.equal(await main(['--poll'], f.deps), 0); assert.equal(f.errors.length, 1); assert.equal(f.output.length, 0);
-  assert.equal(await main(['--send','--to','PC','--kind','note','--body-file',f.body,'--why','test'], f.deps), 0);
+  assert.equal(await main(['--send','--to',recipient,'--kind','note','--body-file',f.body,'--why','test'], f.deps), 0);
 });
 test('transport rejects HTML, HTTP, API failures and old GAS fallback responses', async () => {
   for (const response of [{ ok: false, status: 403 }, { ok: true, json: async () => ({ ok: false, error: 'unauthorized' }) }, { ok: true, json: async () => ({ ok: true, action: 'updated' }) }]) {
@@ -188,6 +198,7 @@ test('prompt backlog is durable while each poll handles at most one prompt', asy
   fs.writeFileSync(path.join(f.dir, 'fleet-agent-optin.json'), '{"accept":["prompt"]}');
   f.deps.spawnImpl = spawnDouble(spawns); let first = true;
   f.deps.request = async kind => { if (kind !== 'mail-poll') return { mail: {} }; const messages = first ? [mail({ kind: 'prompt' }), mail({ id: 'mail-second', kind: 'prompt' }), mail({ id: 'mail-note' })] : []; first = false; return { messages }; };
+  // v2 terminal inbox status hides completed prompts.
   await main(['--poll'], f.deps); assert.equal(spawns.length, 1); assert.equal(readInbox(f.home).length, 3);
   await main(['--poll'], f.deps); assert.equal(spawns.length, 2);
 });
@@ -211,7 +222,7 @@ test('findPriorReply: --force sends and marks forced', async t => {
   const sentFile = path.join(f.dir, 'fleet-mail-sent.jsonl');
   fs.writeFileSync(sentFile, `${JSON.stringify({ at: '2025-01-01T00:00:00Z', action: 'reply', id: 'mail-123' })}\n`);
   assert.equal(await main(['--reply', 'mail-123', '--body-file', f.body, '--force'], f.deps), 0);
-  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls.filter(c => c.kind === 'mail-reply').length, 1);
   const sentLog = fs.readFileSync(sentFile, 'utf8').trim().split('\n').map(l => JSON.parse(l));
   assert.equal(sentLog[sentLog.length - 1].forced, true);
 });
@@ -258,7 +269,7 @@ test('findPriorReply: malformed lines ignored, different id ignored', async t =>
   fs.writeFileSync(sentFile, `garbage\n${JSON.stringify({ at: '2025-01-01T00:00:00Z', action: 'reply', id: 'mail-other' })}\n`);
   // no prior for mail-123 → should proceed
   assert.equal(await main(['--reply', 'mail-123', '--body-file', f.body], f.deps), 0);
-  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls.filter(c => c.kind === 'mail-reply').length, 1);
 });
 test('parseArgs: --poll --force rejects, --reply --body-file --force accepts', t => {
   assert.throws(() => parseArgs(['--poll', '--force']), /option not applicable/);
@@ -292,11 +303,12 @@ for (const [why, body, subject] of [
     assert.equal(decisions[0].status, 'pending');
   });
 }
-test('ordinary notes and marked prompts do not create decisions', async t => {
+test('ordinary notes do not create decisions; marked prompts remain human decisions', async t => {
   const f = fixture(t);
   f.deps.request = async kind => kind === 'mail-poll' ? { messages: [mail(), mail({ id: 'mail-prompt', kind: 'prompt', why: '[判断依頼] 確認' })] } : { mail: {} };
   await main(['--poll'], f.deps);
-  assert.deepEqual(listDecisions({ home: f.home }), []);
+  // v2 protects both note and prompt decision requests from headless answers.
+  assert.equal(listDecisions({ home: f.home }).length, 1);
 });
 test('repeated decision note stays unique, including an already batched source', async t => {
   const f = fixture(t);
@@ -307,7 +319,7 @@ test('repeated decision note stays unique, including an already batched source',
   assert.equal(decisions.length, 1);
   markDecisions([decisions[0].id], { home: f.home, status: 'batched' });
   // Exercise source deduplication even when local mail receipt tracking was lost.
-  fs.unlinkSync(path.join(f.dir, '.fleet-mail-processed'));
+  // v2 has only inbox receipts; .fleet-mail-processed is no longer created.
   fs.unlinkSync(path.join(f.dir, 'fleet-inbox', `${mail().id}.json`));
   await main(['--poll'], f.deps);
   assert.deepEqual(listDecisions({ home: f.home }), [{ ...decisions[0], status: 'batched' }]);
@@ -346,6 +358,19 @@ test('--sent-status reports missing mail as exit 4', async t => {
   assert.equal(await main(['--sent-status', 'mail-1'], f.deps), 4);
   assert.ok(f.errors.some(e => e.includes('見つかりません')));
 });
+// 2026-11-04: hub 不達時に親の 30 秒制限を超えて固まらないよう、読取は 10 秒打ち切り・busy 再試行なし。
+test('--sent-status uses a bounded timeout and no busy retries', async t => {
+  const f = fixture(t);
+  f.deps.request = async (kind, p, timeoutMs, opts) => { f.calls.push({ kind, p, timeoutMs, opts }); return { mail: { id: p.id, status: 'new' } }; };
+  assert.equal(await main(['--sent-status', 'mail-1'], f.deps), 0);
+  assert.deepEqual(f.calls, [{ kind: 'mail-get', p: { id: 'mail-1' }, timeoutMs: 10_000, opts: { retries: 0 } }]);
+});
+test('--sent-status exits 3 when the hub is unreachable instead of hanging', async t => {
+  const f = fixture(t);
+  f.deps.request = async () => { throw new Error('fetch failed'); };
+  assert.equal(await main(['--sent-status', 'mail-1'], f.deps), 3);
+  assert.ok(f.errors.some(e => e.includes('状態を取得できません')));
+});
 test('--reply prints delivery guidance pointing to --sent-status', async t => {
   const f = fixture(t);
   f.deps.request = async () => ({ mail: {} });
@@ -356,11 +381,13 @@ test('decision note auto-acknowledges with decision id and original deadline', a
   const f = fixture(t);
   f.deps.request = async (kind, p) => { f.calls.push({ kind, p }); return kind === 'mail-poll' ? { messages: [mail({ why: '[判断依頼] 承認' })] } : { mail: {} }; };
   await main(['--poll'], f.deps);
-  const ack = f.calls.find(c => c.kind === 'mail-reply');
-  assert.ok(ack, '受領確認の mail-reply が送信されている');
-  assert.equal(ack.p.id, mail().id);
+  // v2 receipt is a separate auto message so the original stays pending.
+  const ack = f.calls.find(c => c.kind === 'mail-send');
+  assert.ok(ack, '受領確認の mail-send が送信されている');
+  assert.equal(ack.p.replyTo, mail().id);
+  assert.equal(ack.p.auto, true);
   assert.equal(ack.p.from, 'kim-PC');
-  assert.match(ack.p.resultBody, /^受領しました。kim の判断待ちとして登録（決定ID \d{8,}-\d{3}）。回答は kim が決めた後に別の note で送ります。期限: 2099-01-01T00:00:00Z$/);
+  assert.match(ack.p.body, /^受領しました。kim の判断待ちとして登録（決定ID \d{8,}-\d{3}）。回答は kim が決めた後に別の note で送ります。期限: 2099-01-01T00:00:00Z$/);
   const sentLog = fs.readFileSync(path.join(f.dir, 'fleet-mail-sent.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
   assert.ok(sentLog.some(entry => entry.action === 'decision-ack' && entry.id === mail().id));
   // 受領確認で inbox を既読化しない: 対話セッションが kim へ聞くまで残る
@@ -401,14 +428,15 @@ test('pollOnce with executePrompts:false receives notes and leaves prompts for t
   const result = await pollOnce({ home: f.home, identity: { hostname: 'host-kim' }, request: f.deps.request, executePrompts: false, spawnImpl: f.deps.spawnImpl, stdout: t2 => output.push(t2), stderr: t2 => errors.push(t2) });
   assert.equal(result.handled.length, 1); // note のみ処理済み
   assert.equal(readInbox(f.home).length, 2);
-  const processed = fs.readFileSync(path.join(f.dir, '.fleet-mail-processed'), 'utf8').trim().split('\n');
-  assert.ok(!processed.includes(mail().id), 'prompt は未処理のまま受信タスクに残す');
-  assert.ok(processed.includes('mail-note-2'));
+  // v2 keeps both notes and prompts pending in the single inbox state machine.
+  assert.ok(readInbox(f.home).every(m => m.status === 'delivered'));
+  assert.equal(fs.existsSync(path.join(f.dir, '.fleet-mail-processed')), false);
   const lastPoll = JSON.parse(fs.readFileSync(path.join(f.dir, '.fleet-mail-last-poll.json'), 'utf8'));
   assert.ok(lastPoll.at);
 });
-test('register --ensure skips PowerShell when both tasks probe healthy', t => {
+test('register --ensure skips registration when task results and last poll are healthy', t => {
   const f = fixture(t);
+  fs.writeFileSync(path.join(f.dir, '.fleet-mail-last-poll.json'), '{}');
   const calls = [];
   const spawnImpl = (program, args) => {
     calls.push({ program, args });
@@ -425,7 +453,7 @@ const execMail = (overrides = {}) => mail({ kind: 'prompt', body: '<!-- fleet-ex
 function detachedDouble(calls) {
   return (program, args, options) => {
     calls.push({ program, args, options });
-    return { unref: () => { calls.at(-1).unrefed = true; } };
+    return { on() {}, unref: () => { calls.at(-1).unrefed = true; } };
   };
 }
 
@@ -437,10 +465,10 @@ test('parseExecMarkers strips the exec marker and optional cwd marker', () => {
 
 test('send --exec codex inserts markers, defaults expiry to +6h and logs exec', async t => {
   const f = fixture(t); const transport = [];
-  f.deps.now = () => Date.parse('2026-09-21T00:00:00Z'); f.deps.randomInt = () => 1234;
+  f.deps.now = () => Date.parse('2026-09-21T00:00:00Z'); f.deps.randomBytes = () => Buffer.from([0, 0, 4, 210]);
   delete f.deps.request;
   f.deps.fetch = async (url, opts) => { transport.push({ url, payload: JSON.parse(opts.body) }); return { ok: true, json: async () => ({ ok: true, mail: {} }) }; };
-  assert.equal(await main(['--send', '--to', 'other-PC', '--kind', 'prompt', '--body-file', f.body, '--why', '実装', '--exec', 'codex', '--exec-cwd', '/repo'], f.deps), 0);
+  assert.equal(await main(['--send', '--to', recipient, '--kind', 'prompt', '--body-file', f.body, '--why', '実装', '--exec', 'codex', '--exec-cwd', '/repo'], f.deps), 0);
   assert.equal(transport[0].payload.body, '<!-- fleet-exec: codex -->\n<!-- fleet-exec-cwd: /repo -->\n質問 $() `literal`');
   assert.equal(transport[0].payload.expiresAt, '2026-09-21T06:00:00.000Z');
   const logs = fs.readFileSync(path.join(f.dir, 'fleet-mail-sent.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
@@ -451,16 +479,16 @@ test('send --exec codex inserts markers, defaults expiry to +6h and logs exec', 
 
 test('send --exec codex without cwd inserts only the exec marker', async t => {
   const f = fixture(t); const transport = [];
-  f.deps.now = () => Date.parse('2026-09-21T00:00:00Z'); f.deps.randomInt = () => 1234;
+  f.deps.now = () => Date.parse('2026-09-21T00:00:00Z'); f.deps.randomBytes = () => Buffer.from([0, 0, 4, 210]);
   delete f.deps.request;
   f.deps.fetch = async (url, opts) => { transport.push({ payload: JSON.parse(opts.body) }); return { ok: true, json: async () => ({ ok: true, mail: {} }) }; };
-  await main(['--send', '--to', 'other-PC', '--kind', 'prompt', '--body-file', f.body, '--why', '実装', '--exec', 'codex'], f.deps);
+  await main(['--send', '--to', recipient, '--kind', 'prompt', '--body-file', f.body, '--why', '実装', '--exec', 'codex'], f.deps);
   assert.equal(transport[0].payload.body, '<!-- fleet-exec: codex -->\n質問 $() `literal`');
 });
 
 test('parseArgs rejects --exec with note and unknown exec values', () => {
   assert.throws(() => parseArgs(['--send', '--to', 'PC', '--kind', 'note', '--body-file', 'x', '--why', 'y', '--exec', 'codex']), /--exec は --kind prompt でのみ使えます/);
-  assert.throws(() => parseArgs(['--send', '--to', 'PC', '--kind', 'prompt', '--body-file', 'x', '--why', 'y', '--exec', 'gemini']), /--exec は codex のみ対応/);
+  assert.throws(() => parseArgs(['--send', '--to', 'PC', '--kind', 'prompt', '--body-file', 'x', '--why', 'y', '--exec', 'gemini']), { message: `--exec は ${EXEC_KINDS.join(' / ')} のみ対応` });
   assert.throws(() => parseArgs(['--send', '--to', 'PC', '--kind', 'prompt', '--body-file', 'x', '--why', 'y', '--exec-cwd', '/repo']), /--exec-cwd は --exec codex と併用/);
 });
 
@@ -469,9 +497,11 @@ test('exec codex without opt-in replies with consent command and never spawns', 
   f.deps.spawnImpl = () => assert.fail('未オプトインで runner を起動してはならない');
   f.deps.request = async (kind, p) => { f.calls.push({ kind, p }); return kind === 'mail-poll' ? { messages: [execMail()] } : { mail: {} }; };
   await main(['--poll'], f.deps);
-  const reply = f.calls.find(c => c.kind === 'mail-reply');
-  assert.equal(reply.p.resultBody, `未オプトイン。承諾コマンド: ${consentCommand('codex')}`);
-  assert.equal(fs.existsSync(path.join(f.dir, 'fleet-agent-results', `${execMail().id}.json`)), false);
+  const reply = f.calls.find(c => c.kind === 'mail-send');
+  assert.ok(reply.p.body.includes('未オプトイン'));
+  assert.equal(f.calls.find(c => c.kind === 'mail-fail').p.reason, 'exit-unknown');
+  // v2 saves consent responses too, so transport retries cannot regenerate work.
+  assert.equal(fs.existsSync(path.join(f.dir, 'fleet-agent-results', `${execMail().id}.json`)), true);
 });
 
 test('exec codex first poll detaches runner, records executionStartedAt and does not reply', async t => {
@@ -487,7 +517,7 @@ test('exec codex first poll detaches runner, records executionStartedAt and does
   assert.equal(spawns[0].options.stdio, 'ignore');
   assert.equal(spawns[0].unrefed, true);
   assert.match(spawns[0].args[0], /fleet-task-runner\.mjs$/);
-  assert.deepEqual(spawns[0].args.slice(1), ['--id', execMail().id]);
+  assert.deepEqual(spawns[0].args.slice(1), ['--id', execMail().id, '--home', f.home]);
   assert.ok(!f.calls.some(c => c.kind === 'mail-reply'), '初回は返信しない');
   const inbox = JSON.parse(fs.readFileSync(path.join(f.dir, 'fleet-inbox', `${execMail().id}.json`), 'utf8'));
   assert.ok(inbox.executionStartedAt);
@@ -499,13 +529,14 @@ test('exec codex replies and marks processed once the result file exists', async
   const f = fixture(t);
   fs.writeFileSync(path.join(f.dir, 'fleet-agent-optin.json'), '{"accept":["codex"]}');
   fs.mkdirSync(path.join(f.dir, 'fleet-agent-results'), { recursive: true });
-  fs.writeFileSync(path.join(f.dir, 'fleet-agent-results', `${execMail().id}.json`), JSON.stringify({ exitCode: 0, outputTail: '[fleet-exec codex] exit=0 cwd=/repo 所要=3分' }));
+  fs.writeFileSync(path.join(f.dir, 'fleet-agent-results', `${execMail().id}.json`), JSON.stringify({ exitCode: 0, stdoutTail: '[fleet-exec codex] exit=0 cwd=/repo 所要=3分' }));
   f.deps.spawnImpl = () => assert.fail('結果ファイルがあるときは runner を起動しない');
   f.deps.request = async (kind, p) => { f.calls.push({ kind, p }); return kind === 'mail-poll' ? { messages: [execMail()] } : { mail: {} }; };
   await main(['--poll'], f.deps);
   const reply = f.calls.find(c => c.kind === 'mail-reply');
   assert.match(reply.p.resultBody, /\[fleet-exec codex\] exit=0/);
-  assert.ok(fs.readFileSync(path.join(f.dir, '.fleet-mail-processed'), 'utf8').includes(execMail().id));
+  // v2 stores completion exclusively in inbox.status.
+  assert.equal(readInbox(f.home, { unreadOnly: false }).find(m => m.id === execMail().id).status, 'done');
 });
 
 test('exec codex times out after two hours without a result file', async t => {
@@ -516,9 +547,10 @@ test('exec codex times out after two hours without a result file', async t => {
   f.deps.spawnImpl = () => assert.fail('タイムアウト時は runner を起動しない');
   f.deps.request = async (kind, p) => { f.calls.push({ kind, p }); return kind === 'mail-poll' ? { messages: [execMail({ executionStartedAt: started })] } : { mail: {} }; };
   await main(['--poll'], f.deps);
-  const reply = f.calls.find(c => c.kind === 'mail-reply');
-  assert.equal(reply.p.resultBody, 'codex 実行がタイムアウト（結果ファイル未生成）');
-  assert.ok(fs.readFileSync(path.join(f.dir, '.fleet-mail-processed'), 'utf8').includes(execMail().id));
+  const reply = f.calls.find(c => c.kind === 'mail-fail');
+  assert.equal(reply.p.reason, 'timeout');
+  // v2 stores completion exclusively in inbox.status.
+  assert.equal(readInbox(f.home, { unreadOnly: false }).find(m => m.id === execMail().id).status, 'failed');
 });
 
 test('exec codex still running within two hours neither replies nor spawns', async t => {
@@ -561,11 +593,11 @@ test('opted-in prompt spawns the executable resolved by claude-exe, not the bare
   f.deps.repo = f.home;
   f.deps.resolveClaudeExe = async () => ({ executable: 'C:/x/claude.exe', candidates: ['C:/x/claude.exe'] });
   f.deps.request = async (kind, payload) => { f.calls.push({ kind, payload }); return kind === 'mail-poll' ? { messages: [mail({ kind: 'prompt' })] } : { mail: {} }; };
-  await main(['--poll'], f.deps);
+  await runPromptPoll(f);
   assert.equal(spawns.length, 1);
   assert.equal(spawns[0].program, 'C:/x/claude.exe');
   const sent = fs.readFileSync(path.join(f.dir, 'fleet-mail-sent.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
-  assert.equal(sent.find(entry => entry.action === 'auto-reply').claudeExe, 'claude.exe');
+  assert.ok(sent.find(entry => entry.action === 'auto-reply'));
 });
 
 test('CLAUDE_CLI_PATH injected through deps.env wins over disk discovery', async t => {
@@ -575,7 +607,7 @@ test('CLAUDE_CLI_PATH injected through deps.env wins over disk discovery', async
   f.deps.repo = f.home;
   f.deps.env = { CLAUDE_CLI_PATH: 'C:/custom/claude.exe' };
   f.deps.request = async (kind, payload) => { f.calls.push({ kind, payload }); return kind === 'mail-poll' ? { messages: [mail({ kind: 'prompt' })] } : { mail: {} }; };
-  await main(['--poll'], f.deps);
+  await runPromptPoll(f);
   assert.equal(spawns.length, 1);
   assert.equal(spawns[0].program, 'C:/custom/claude.exe');
 });
@@ -593,17 +625,18 @@ test('spawn ENOENT replies with the resolver candidates and still marks the mail
   f.deps.repo = f.home;
   f.deps.resolveClaudeExe = async () => ({ executable: 'C:/missing/claude.exe', candidates: ['C:/a/claude.exe', 'C:/b/claude.exe'] });
   f.deps.request = async (kind, payload) => { f.calls.push({ kind, payload }); return kind === 'mail-poll' ? { messages: [mail({ kind: 'prompt' })] } : { mail: {} }; };
-  await main(['--poll'], f.deps);
+  await runPromptPoll(f);
   assert.equal(spawns[0].program, 'C:/missing/claude.exe');
-  const replies = f.calls.filter(c => c.kind === 'mail-reply');
+  const replies = f.calls.filter(c => c.kind === 'mail-send');
   assert.equal(replies.length, 1);
-  assert.match(replies[0].payload.resultBody, /claude CLI が見つかりません/);
-  assert.ok(replies[0].payload.resultBody.includes('C:/a/claude.exe'));
-  assert.ok(replies[0].payload.resultBody.includes('C:/b/claude.exe'));
-  assert.ok(fs.readFileSync(path.join(f.dir, '.fleet-mail-processed'), 'utf8').includes(mail().id));
+  assert.match(replies[0].payload.body, /claude CLI が見つかりません/);
+  assert.ok(replies[0].payload.body.includes('C:/a/claude.exe'));
+  assert.ok(replies[0].payload.body.includes('C:/b/claude.exe'));
+  // v2 stores completion exclusively in inbox.status.
+  assert.equal(readInbox(f.home, { unreadOnly: false }).find(m => m.id === mail().id).status, 'failed');
   // 二重実行しない: 次の poll でも再返信しない
   await main(['--poll'], f.deps);
-  assert.equal(f.calls.filter(c => c.kind === 'mail-reply').length, 1);
+  assert.equal(f.calls.filter(c => c.kind === 'mail-send').length, 1);
 });
 
 // --- 2026-10-11 事故: 全PCの設定変更を fleet-mail で配ると PC ごとに手作業が発生する ---
@@ -629,7 +662,7 @@ test('send --kind prompt with an install request exits 5 without sending', async
   fs.writeFileSync(f.body, 'settings.json を書き換えて全PCに配って');
   delete f.deps.request;
   f.deps.fetch = async (url, opts) => { transport.push(JSON.parse(opts.body)); return { ok: true, json: async () => ({ ok: true, mail: {} }) }; };
-  assert.equal(await main(['--send', '--to', 'other-PC', '--kind', 'prompt', '--body-file', f.body, '--why', '配布'], f.deps), 5);
+  assert.equal(await main(['--send', '--to', recipient, '--kind', 'prompt', '--body-file', f.body, '--why', '配布'], f.deps), 5);
   assert.equal(transport.length, 0);
   assert.ok(f.errors.some(e => e.includes('setup --converge 経由')));
 });
@@ -638,7 +671,7 @@ test('send --kind prompt with --force bypasses the install-request guard', async
   fs.writeFileSync(f.body, 'settings.json を書き換えて');
   delete f.deps.request;
   f.deps.fetch = async (url, opts) => { transport.push(JSON.parse(opts.body)); return { ok: true, json: async () => ({ ok: true, mail: {} }) }; };
-  assert.equal(await main(['--send', '--to', 'other-PC', '--kind', 'prompt', '--body-file', f.body, '--why', '再送', '--force'], f.deps), 0);
+  assert.equal(await main(['--send', '--to', recipient, '--kind', 'prompt', '--body-file', f.body, '--why', '再送', '--force'], f.deps), 0);
   assert.equal(transport.length, 1);
 });
 test('send --kind note with an install request is allowed', async t => {
@@ -646,7 +679,7 @@ test('send --kind note with an install request is allowed', async t => {
   fs.writeFileSync(f.body, 'settings.json の件で相談したい');
   delete f.deps.request;
   f.deps.fetch = async (url, opts) => { transport.push(JSON.parse(opts.body)); return { ok: true, json: async () => ({ ok: true, mail: {} }) }; };
-  assert.equal(await main(['--send', '--to', 'other-PC', '--kind', 'note', '--body-file', f.body, '--why', '相談'], f.deps), 0);
+  assert.equal(await main(['--send', '--to', recipient, '--kind', 'note', '--body-file', f.body, '--why', '相談'], f.deps), 0);
   assert.equal(transport.length, 1);
 });
 
@@ -686,10 +719,10 @@ test('send prints the target freshness line and a stale warning before sending',
   f.deps.now = () => Date.parse('2026-10-11T00:00:00Z');
   delete f.deps.request;
   f.deps.fetch = async (url, opts) => { transport.push(JSON.parse(opts.body)); return { ok: true, json: async () => ({ ok: true, mail: {} }) }; };
-  f.deps.fetchBeacons = async () => beaconResult({ beacons: [{ label: 'other-PC', reportedAt: '2026-10-09T00:00:00Z', pollAt: '2026-10-09T00:00:00Z' }] });
-  assert.equal(await main(['--send', '--to', 'other-PC', '--kind', 'note', '--body-file', f.body, '--why', 'test'], f.deps), 0);
+  f.deps.fetchBeacons = async () => beaconResult({ beacons: [{ label: recipient, reportedAt: '2026-10-09T00:00:00Z', pollAt: '2026-10-09T00:00:00Z' }] });
+  assert.equal(await main(['--send', '--to', recipient, '--kind', 'note', '--body-file', f.body, '--why', 'test'], f.deps), 0);
   assert.equal(transport.length, 1);
-  assert.ok(f.errors.some(e => /^宛先 other-PC: 最終poll 10\/09 09:00 \(2d前\)/.test(e)));
+  assert.ok(f.errors.some(e => e.startsWith(`宛先 ${recipient}: 最終poll 10/09 09:00 (2d前)`)));
   assert.ok(f.errors.some(e => e.includes('⚠ 宛先は24時間以上 poll していない可能性。返信が遅れます')));
 });
 test('send continues when the freshness lookup fails', async t => {
@@ -697,8 +730,312 @@ test('send continues when the freshness lookup fails', async t => {
   delete f.deps.request;
   f.deps.fetch = async (url, opts) => { transport.push(JSON.parse(opts.body)); return { ok: true, json: async () => ({ ok: true, mail: {} }) }; };
   f.deps.fetchBeacons = async () => { throw new Error('offline'); };
-  assert.equal(await main(['--send', '--to', 'other-PC', '--kind', 'note', '--body-file', f.body, '--why', 'test'], f.deps), 0);
+  assert.equal(await main(['--send', '--to', recipient, '--kind', 'note', '--body-file', f.body, '--why', 'test'], f.deps), 0);
   assert.equal(transport.length, 1);
   assert.ok(f.errors.some(e => e.includes('最終 poll 不明')));
 });
 
+
+// Daily compliance runs synchronously only inside its separately launched worker.
+import { dailyRuleCompliance, pollOnce } from './fleet-mail.mjs'; // acquireLock はファイル先頭で import 済み
+import { COMPLIANCE_TIMEOUT } from './fleet-rule-compliance-daily.mjs';
+import { measuredRules, COMPLIANCE_DAYS, RULE_COMPLIANCE_TAG } from './lib/rule-compliance-mail.mjs';
+function complianceFixture(t, label = recipient) {
+  const f = fixture(t), probes = [];
+  const rule = measuredRules[0];
+  const audit = { results: { [rule.id]: { applicable: 10, violation: 8, examples: ['PRIVATE'] } },
+    enforcement: { [rule.id]: { mode: 'block' } } };
+  const options = { home: f.home, dir: f.dir, label, repo: path.resolve('.'), env: {}, acquireLock,
+    now: () => Date.parse('2026-10-18T03:00:00Z'), stderr: error => f.errors.push(error),
+    request: async (kind, payload) => { f.calls.push({ kind, payload }); return { ok: true }; },
+    spawnSyncImpl: (exe, args, opts) => {
+      probes.push({ exe, args, opts });
+      return { status: 0, stdout: exe === 'git' ? 'a'.repeat(40) : JSON.stringify(audit) };
+    } };
+  return { ...f, options, probes, rule };
+}
+test('dailyRuleCompliance sends once per day, expires in 72h, exposes persisted enforcement only', async t => {
+  const f = complianceFixture(t);
+  fs.writeFileSync(path.join(f.dir, 'rule-enforcement.json'), JSON.stringify({ [f.rule.id]: { mode: 'warn' } }));
+  assert.equal((await dailyRuleCompliance(f.options)).reported, true);
+  assert.equal((await dailyRuleCompliance(f.options)).skipped, 'today');
+  assert.equal(f.calls.length, 1);
+  const { kind, payload } = f.calls[0];
+  assert.equal(kind, 'mail-send'); assert.equal(payload.to, 'kim-PC'); assert.equal(payload.auto, true);
+  assert.ok(payload.why.includes(RULE_COMPLIANCE_TAG));
+  assert.equal(Date.parse(payload.expiresAt) - f.options.now(), 72 * 3600_000);
+  assert.equal(JSON.parse(payload.body).rules[f.rule.id].mode, 'warn');
+  assert.doesNotMatch(payload.body, /PRIVATE|examples/);
+  assert.deepEqual(f.probes[0].args.slice(-3), ['--days', String(COMPLIANCE_DAYS), '--json']);
+  assert.equal(f.probes[0].opts.timeout, COMPLIANCE_TIMEOUT);
+  assert.equal(f.probes[0].opts.env.ORGIAST_HOME, f.home);
+  await dailyRuleCompliance({ ...f.options, now: () => f.options.now() + 86400_000 });
+  assert.equal(f.calls.length, 2);
+});
+test('dailyRuleCompliance self writes JSON without mail and missing enforcement is off', async t => {
+  const f = complianceFixture(t, 'kim-PC');
+  await dailyRuleCompliance(f.options);
+  const saved = JSON.parse(fs.readFileSync(path.join(f.dir, 'rule-compliance-fleet-self.json'), 'utf8'));
+  assert.equal(saved.pc, 'kim-PC'); assert.equal(saved.rules[f.rule.id].mode, 'off');
+  assert.equal(f.calls.length, 0);
+});
+test('dailyRuleCompliance child failure and timeout are one-line errors; poll still completes', async t => {
+  const f = complianceFixture(t);
+  const result = await pollOnce({ ...f.deps, now: f.options.now,
+    dailyRuleCompliance: options => dailyRuleCompliance({ ...f.options, ...options, background: false,
+      spawnSyncImpl: () => ({ status: null, error: new Error('PRIVATE timeout') }) }) });
+  assert.deepEqual(result.received, []);
+  assert.equal(f.errors.length, 1); assert.doesNotMatch(f.errors[0], /PRIVATE|\n/);
+  assert.equal((await dailyRuleCompliance(f.options)).skipped, 'today');
+  assert.equal(fs.existsSync(path.join(f.dir, 'rule-compliance-fleet-self.json')), false);
+});
+test('dailyRuleCompliance disabled and background path never scans transcripts on poll', async t => {
+  const f = complianceFixture(t);
+  assert.equal((await dailyRuleCompliance({ ...f.options, env: { FLEET_NO_SELF_HEAL: '1' } })).skipped, 'disabled');
+  const launched = [];
+  await dailyRuleCompliance({ ...f.options, background: true,
+    spawnSyncImpl: () => assert.fail('poll must not audit'),
+    spawnImpl: (exe, args, opts) => { launched.push({ exe, args, opts }); return { on() {}, unref() {} }; } });
+  assert.equal(launched.length, 1);
+  assert.ok(launched[0].args[0].endsWith('fleet-rule-compliance-worker.mjs'));
+  assert.equal(launched[0].opts.env.ORGIAST_HOME, f.home);
+});
+test('real compliance worker entrypoint completes without circular-import deadlock and self-heal disabled does not write', async t => {
+  const { execFileSync } = await import('node:child_process');
+  const f = complianceFixture(t, 'kim-PC');
+  const worker = path.resolve('tools/fleet-rule-compliance-worker.mjs');
+  const env = { ...process.env, ORGIAST_HOME: f.home, ORGIAST_REPO: path.resolve('.'), FLEET_NO_SELF_HEAL: '1' };
+  execFileSync(process.execPath, [worker], { env, encoding: 'utf8', timeout: 10000 });
+  assert.equal(fs.existsSync(path.join(f.dir, '.fleet-rule-compliance-day')), false);
+  env.FLEET_NO_SELF_HEAL = '0';
+  execFileSync(process.execPath, [worker], { env, encoding: 'utf8', timeout: 15000 });
+  const saved = JSON.parse(fs.readFileSync(path.join(f.dir, 'rule-compliance-fleet-self.json'), 'utf8'));
+  assert.equal(saved.pc, 'kim-PC');
+  assert.ok(saved.rulesHead.length >= 40);
+  assert.equal(saved.rules[f.rule.id].applicable, 0);
+});
+
+test('parseArgs rejects work requests as notes but accepts prompts', () => {
+  for (const why of ['[作業依頼] 調査', '  [作業依頼] 調査']) {
+    const args = ['--send', '--to', 'PC', '--body-file', 'x', '--why', why, '--kind'];
+    assert.throws(() => parseArgs([...args, 'note']), { message: '[作業依頼] は受信側で実行されるよう --kind prompt で送ってください（note は表示のみで実行されません）' });
+    assert.doesNotThrow(() => parseArgs([...args, 'prompt']));
+  }
+});
+
+test('createClient retries GAS busy with backoff then succeeds', async () => {
+  let calls = 0; const delays = [];
+  const request = createClient({ url: 'https://example.invalid', token: 'x',
+    fetchImpl: async () => { calls++; return { ok: true, json: async () => calls < 3 ? { ok: false, error: 'busy' } : { ok: true, messages: [] } }; },
+    sleepImpl: async ms => delays.push(ms) });
+  assert.deepEqual(await request('mail-poll', {}), { ok: true, messages: [] });
+  assert.equal(calls, 3);
+  assert.deepEqual(delays, [1000, 2000]);
+});
+test('createClient gives up after three busy responses', async () => {
+  for (const status of [200, 503]) {
+    let calls = 0; const delays = [];
+    const request = createClient({ url: 'https://example.invalid', token: 'x',
+      fetchImpl: async () => { calls++; return { ok: status === 200, status, json: async () => ({ ok: false, error: 'busy' }) }; },
+      sleepImpl: async ms => delays.push(ms) });
+    await assert.rejects(request('mail-poll', {}), { message: /^fleet-mail: busy$/, code: 'SERVER_BUSY' });
+    assert.equal(calls, 3);
+    assert.deepEqual(delays, [1000, 2000]);
+  }
+});
+test('createClient does not retry non-busy rejections', async () => {
+  let calls = 0; const delays = [];
+  const request = createClient({ url: 'https://example.invalid', token: 'x',
+    fetchImpl: async () => { calls++; return { ok: true, json: async () => ({ ok: false, error: 'unauthorized' }) }; },
+    sleepImpl: async ms => delays.push(ms) });
+  await assert.rejects(request('mail-poll', {}), /unauthorized/);
+  assert.equal(calls, 1);
+  assert.deepEqual(delays, []);
+});
+test('createClient preserves HTTP errors for non-busy 503 and other HTTP statuses', async () => {
+  for (const response of [
+    { ok: false, status: 503, json: async () => { throw new SyntaxError('HTML'); } },
+    { ok: false, status: 503, json: async () => ({ ok: false, error: 'unauthorized' }) },
+    { ok: false, status: 403, json: async () => ({ ok: false, error: 'busy' }) },
+  ]) {
+    let calls = 0;
+    const request = createClient({ url: 'https://example.invalid', token: 'x',
+      fetchImpl: async () => { calls++; return response; }, sleepImpl: () => assert.fail('must not retry') });
+    await assert.rejects(request('mail-poll', {}), { message: `fleet-mail HTTP ${response.status}` });
+    assert.equal(calls, 1);
+  }
+});
+test('poll defers on server busy and resets after success', async t => {
+  const f = fixture(t); const request = f.deps.request;
+  const file = path.join(f.dir, '.fleet-mail-last-poll.json');
+  const prior = { at: '2026-10-25T00:00:00.000Z', serverCapabilities: { version: 2 }, sentStatus: { cached: true } };
+  fs.writeFileSync(file, JSON.stringify(prior));
+  f.deps.now = () => Date.parse('2026-10-26T00:00:00Z');
+  f.deps.request = async (kind, payload) => {
+    if (kind === 'mail-poll') throw Object.assign(new Error('fleet-mail: busy'), { code: 'SERVER_BUSY' });
+    return request(kind, payload);
+  };
+  for (let busyStreak = 1; busyStreak < 5; busyStreak++) {
+    assert.equal(await main(['--poll'], f.deps), 0);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { ...prior, busyStreak, busyAt: '2026-10-26T00:00:00.000Z' });
+    assert.match(f.errors.at(-1), /延期/);
+  }
+  await assert.rejects(main(['--poll'], f.deps), { message: /5回連続（約10分）/, code: 'SERVER_BUSY' });
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).busyStreak, 5);
+  f.deps.request = request;
+  assert.equal(await main(['--poll'], f.deps), 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), {
+    ...prior, at: '2026-10-26T00:00:00.000Z', busyStreak: 0, busyAt: '2026-10-26T00:00:00.000Z',
+  });
+});
+test('poll still fails on non-busy transport errors', async t => {
+  const f = fixture(t); const request = f.deps.request;
+  f.deps.request = async (kind, payload) => {
+    if (kind === 'mail-poll') throw new Error('fleet-mail: unauthorized');
+    return request(kind, payload);
+  };
+  await assert.rejects(main(['--poll'], f.deps), /unauthorized/);
+  assert.equal(fs.existsSync(path.join(f.dir, '.fleet-mail-last-poll.json')), false);
+});
+test('poll dry-run defers on busy messages without changing state', async t => {
+  const f = fixture(t); const file = path.join(f.dir, '.fleet-mail-last-poll.json');
+  for (const message of ['busy', 'fleet-mail: busy']) {
+    const before = fs.readdirSync(f.dir);
+    const prior = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+    f.deps.request = async () => { throw new Error(message); };
+    assert.equal(await main(['--poll', '--dry-run'], f.deps), 0);
+    assert.deepEqual(fs.readdirSync(f.dir), before);
+    assert.equal(fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null, prior);
+    fs.writeFileSync(file, JSON.stringify({ busyStreak: 2, serverCapabilities: { version: 2 } }));
+  }
+});
+// 2026-10-27 kim-PC: 受信前の後処理が長引き、1回の poll が80分ロックを握って新着が届かなかった。
+test('pollOnce defers housekeeping over budget but still receives, and records phase timing', async t => {
+  const f = fixture(t);
+  const { PRE_POLL_BUDGET_MS } = await import('./fleet-mail.mjs');
+  let clock = Date.parse('2026-10-27T14:00:00Z');
+  const now = () => (clock += PRE_POLL_BUDGET_MS);
+  const kinds = [];
+  const request = async kind => { kinds.push(kind); return kind === 'mail-poll' ? { messages: [mail({ id: 'mail-1793109976589-df939d96' })] } : { ok: true }; };
+  const errors = [];
+  const result = await pollOnce({ home: f.home, identity: { hostname: 'host-kim' }, request, now, executePrompts: false,
+    dailyLaneHealth: () => assert.fail('期限超過後の付帯処理は次回へ回す'), stdout: () => {}, stderr: e => errors.push(e) });
+  assert.ok(kinds.includes('mail-poll'));
+  assert.deepEqual(result.received.map(m => m.id ?? m), ['mail-1793109976589-df939d96'].filter(() => result.received.length));
+  assert.equal(readInbox(f.home, { unreadOnly: false }).length, 1);
+  assert.ok(errors.includes('fleet-mail: 受信前処理を次回へ延期=1'));
+  assert.ok(errors.includes('fleet-mail: 付帯処理を次回へ延期=1'));
+  const lines = fs.readFileSync(path.join(f.dir, 'fleet-mail-poll-timing.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].outcome, 'ok');
+  assert.ok(lines[0].phases['mail-poll'] >= 0);
+  assert.ok(!Object.keys(lines[0].phases).some(k => k.startsWith('processMail:') && lines[0].phases[k] < 5000));
+});
+test('acquireLock stops refreshing the heartbeat after the hard cap so a hung poller can be reclaimed', t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-lock-cap-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const file = path.join(home, 'fleet-mail.lock');
+  let clock = 1_000_000;
+  const release = acquireLock(file, { now: () => clock, hardCapMs: 60_000 });
+  const mtime = () => fs.statSync(file).mtimeMs;
+  clock += 30_000; t.mock.timers.tick(30_000);
+  assert.equal(Math.round(mtime()), clock);
+  clock += 60_000; t.mock.timers.tick(30_000);
+  const frozen = mtime();
+  clock += 30_000; t.mock.timers.tick(30_000);
+  assert.equal(mtime(), frozen);
+  release();
+});
+test('--poll hard deadline stops a poll stuck in an await, releases the lock and records where it stuck', { timeout: 5000 }, async t => {
+  const f = fixture(t);
+  const { POLL_HARD_DEADLINE_EXIT } = await import('./fleet-mail.mjs');
+  const errors = [];
+  // The production deadline is unref'ed; a pending request Promise alone cannot keep this test alive.
+  const keepAlive = setInterval(() => {}, 1000);
+  t.after(() => clearInterval(keepAlive));
+  const exited = new Promise((resolve, reject) => {
+    main(['--poll', '--no-exec'], { ...f.deps, stderr: e => errors.push(e), pollHardDeadlineMs: 50, exit: resolve,
+      request: kind => kind === 'mail-poll' ? new Promise(() => {}) : Promise.resolve({ ok: true }) }).catch(reject);
+  });
+  assert.equal(await exited, POLL_HARD_DEADLINE_EXIT);
+  assert.ok(errors.some(e => /poll 上限\d+分超過で打ち切り=1/.test(e)));
+  assert.equal(fs.existsSync(path.join(f.dir, 'fleet-mail.lock')), false);
+  const line = JSON.parse(fs.readFileSync(path.join(f.dir, 'fleet-mail-poll-timing.jsonl'), 'utf8').trim().split('\n').at(-1));
+  assert.equal(line.outcome, 'hard-deadline');
+  assert.equal(line.stuckIn, 'mail-poll');
+});
+
+test('fixed selfcheck prompt passes without force; appended mutation remains blocked', async t => {
+  const { SELFCHECK_PROMPT } = await import('./lib/fleet-selfcheck-prompt.mjs');
+  const f = fixture(t);
+  for (const extra of ['', '\nsettings.json を書き換えて']) {
+    fs.writeFileSync(f.body, SELFCHECK_PROMPT + extra);
+    const before = f.calls.length;
+    assert.equal(await main(['--send', '--to', recipient, '--kind', 'prompt', '--body-file', f.body, '--why', '自己点検'], f.deps), extra ? 5 : 0);
+    assert.equal(f.calls.length - before, extra ? 0 : 1);
+  }
+  assert.ok(f.errors.some(line => line.includes('fleet-selfcheck-v2')));
+});
+
+for (const stale of [true, false]) {
+  test(`acquireLock ${stale ? 'recovers stale' : 'preserves fresh'} reclaim directory`, t => {
+    const f = fixture(t), lock = path.join(f.dir, 'fleet-mail.lock');
+    const now = Date.now();
+    fs.writeFileSync(lock, 'abandoned');
+    fs.utimesSync(lock, new Date(now - LOCK_MS - 1000), new Date(now - LOCK_MS - 1000));
+    fs.mkdirSync(`${lock}.reclaim`);
+    const at = new Date(now - (stale ? RECLAIM_STALE_MS + 1000 : 0));
+    fs.utimesSync(`${lock}.reclaim`, at, at);
+    const release = acquireLock(lock, { now: () => now });
+    if (stale) {
+      assert.equal(typeof release, 'function');
+      try { assert.equal(acquireLock(lock, { now: () => now }), null); }
+      finally { release(); }
+      assert.equal(fs.existsSync(lock), false);
+      assert.equal(fs.existsSync(`${lock}.reclaim`), false);
+    } else {
+      assert.equal(release, null);
+      assert.equal(fs.readFileSync(lock, 'utf8'), 'abandoned');
+      assert.equal(fs.existsSync(`${lock}.reclaim`), true);
+    }
+  });
+  test(`updateInbox ${stale ? 'recovers stale' : 'preserves fresh'} reclaim directory`, t => {
+    const f = fixture(t), id = mail().id;
+    const file = path.join(f.dir, 'fleet-inbox', `${id}.json`), lock = `${file}.lock`;
+    const now = Date.now();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(mail()));
+    fs.writeFileSync(lock, 'abandoned');
+    const old = new Date(now - INBOX_LOCK_STALE_MS - 1000);
+    fs.utimesSync(lock, old, old);
+    fs.mkdirSync(`${lock}.reclaim`);
+    const at = new Date(now - (stale ? RECLAIM_STALE_MS + 1000 : 0));
+    fs.utimesSync(`${lock}.reclaim`, at, at);
+    let visited = false;
+    const result = updateInbox(id, current => {
+      visited = true;
+      return { ...current, body: 'updated' };
+    }, { home: f.home, now: () => now, retries: 0 });
+    assert.equal(visited, stale);
+    assert.equal(result?.body ?? null, stale ? 'updated' : null);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).body, stale ? 'updated' : 'hello');
+    assert.equal(fs.existsSync(lock), !stale);
+    assert.equal(fs.existsSync(`${lock}.reclaim`), !stale);
+  });
+}
+for (const age of [0, 3 * LOCK_MS + 1000]) {
+  test(`poll reports blocked lock aged ${age} with the appropriate exit code`, async t => {
+    const f = fixture(t), lock = path.join(f.dir, 'fleet-mail.lock');
+    const now = Date.now(); f.deps.now = () => now;
+    fs.writeFileSync(lock, 'abandoned');
+    const at = new Date(now - age); fs.utimesSync(lock, at, at);
+    fs.mkdirSync(`${lock}.reclaim`);
+    assert.equal(await main(['--poll'], f.deps), age ? LOCK_BUSY_EXIT : 0);
+    assert.deepEqual(f.errors, [age ? `fleet-mail: ロック回収不能（${lock} / reclaim 残留）` : 'fleet-mail: 別の受信処理が実行中']);
+    assert.equal(f.calls.length, 0);
+    const timing = JSON.parse(fs.readFileSync(path.join(f.dir, 'fleet-mail-poll-timing.jsonl'), 'utf8').trim());
+    assert.equal(timing.outcome, 'locked');
+    assert.equal(fs.readFileSync(lock, 'utf8'), 'abandoned');
+  });
+}

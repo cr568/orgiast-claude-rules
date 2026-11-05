@@ -10,6 +10,17 @@ import { notifyKim } from './notify-kim.mjs';
 import { isEntry } from './is-entry.mjs';
 
 const HOUR = 3600000;
+const REAUTHORIZE_URL = 'https://discord.com/oauth2/authorize?client_id=1511684767546871818&scope=bot&permissions=8';
+const due = (ts, now, interval) => !Number.isFinite(ts) || now - ts >= interval;
+
+export function combinePermissions(guildId, member, roles) {
+  if (!Array.isArray(member?.roles) || !Array.isArray(roles)
+    || !roles.some(role => role.id === guildId)
+    || member.roles.some(id => !roles.some(role => role.id === id))) throw new Error('Discord roles response invalid');
+  const ids = new Set([guildId, ...member.roles]);
+  return roles.reduce((bits, role) => ids.has(role.id) ? bits | BigInt(role.permissions) : bits, 0n);
+}
+
 const PREFIX = '【Claude自動返信】';
 const CORRECTED = '【Claude自動返信・kimが訂正済み→下のkimの返信を参照】';
 const DISCLAIMER = '\n\n※kim本人の返答ではなく自動返信です。訂正があれば kim が追って返信します。';
@@ -65,13 +76,13 @@ const LLM_PROVIDERS = {
   ...PROVIDERS,
   glm: { url: 'https://api.z.ai/api/coding/paas/v4/chat/completions', env: 'ZAI_API_KEY', file: 'zai.env', model: 'glm-5.3' },
   genspark: { url: 'https://www.genspark.ai/api/llm_proxy/v1/chat/completions', env: 'GSK_PROXY_KEY', file: 'genspark-proxy.env', model: 'gpt-5.6-luna' },
-  mistral: { url: 'https://api.mistral.ai/v1/chat/completions', env: 'MISTRAL_API_KEY', file: 'mistral.env', model: 'mistral-large-latest' },
+  mistral: { url: 'https://api.mistral.ai/v1/chat/completions', env: 'MISTRAL_API_KEY', file: 'mistral.env', model: 'open-mistral-nemo' },
 };
 // 返信文は日本語品質が要る。routing-table の jp_reply(llama-3.3-70b)は文が崩れ・質問を鸚鵡返しした
 // (2026-10-09 実測)ので、返信だけは日本語に強いモデルの連鎖に固定する。DISCORD_AUTOREPLY_PROVIDER で先頭を差し替え可。
 export const REPLY_CHAIN = Object.freeze([
-  { provider: 'gemini', model: 'gemini-3.7-flash' },
-  { provider: 'deepseek', model: 'deepseek-chat' },
+  { provider: 'gemini', model: 'gemini-3.6-flash' },
+  { provider: 'deepseek', model: 'deepseek-flash' },
   { provider: 'kimi', model: 'kimi-k3' },
   { provider: 'genspark', model: 'gpt-5.6-luna' },
 ]);
@@ -97,6 +108,7 @@ export function createLlm({ home, fetchImpl, sleepImpl = sleep, env = process.en
         if (!key) return null;
         const body = { model: candidate.model || p.model, stream: false, max_tokens: 6000,
           messages: [{ role: 'system', content: system }, { role: 'user', content: JSON.stringify(input) }] };
+        if (candidate.provider === 'deepseek' && body.model === 'deepseek-flash') body.thinking = { type: 'disabled' };
         if (p.special === 'kimi') Object.assign(body, { reasoning_effort: 'none', temperature: 0.6 });
         return { url: p.url, init: { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', ...p.extraHeaders }, body: JSON.stringify(body), signal: AbortSignal.timeout(60000) } };
       },
@@ -187,6 +199,13 @@ export async function runOnce(options = {}) {
   const dir = path.join(home, '.claude', 'discord-autoreply'), file = name => path.join(dir, name);
   const result = { ok: true, scanned: 0, replied: 0, skipped: { kim_replied: 0, fyi: 0, excluded: 0, old: 0, bot: 0 }, learned: { corrected: 0, confirmed: 0, expired: 0 }, errors: [], ...(dryRun ? { wouldSend: [] } : {}) };
   let release, state, token = '';
+  const notifyHealth = async text => {
+    const sent = await (options.notifyKimImpl ?? notifyKim)(text, {
+      home, token, userId: read(path.join(home, '.claude', 'orgiast-discord-user-id.txt')).trim() || '715210673642012733',
+      fetchImpl: options.fetchImpl ?? fetch, plainJa: false, webhookFallback: false,
+    });
+    if (!['dm', 'session-inbox'].includes(sent?.delivered)) throw new Error('kim health notification failed');
+  };
   const errorText = e => String(e.message || e).replaceAll(token || '\0', '[redacted]').slice(0, 1000);
   try {
     if (fs.existsSync(file('PAUSE'))) return { ...result, paused: true };
@@ -226,6 +245,20 @@ export async function runOnce(options = {}) {
         if (sent?.delivered === 'none') result.errors.push('kim notification failed');
       } catch (e) { result.errors.push(`notify: ${errorText(e)}`); }
     };
+    if (due(state.lastPermCheckTs, now, HOUR)) {
+      state.lastPermCheckTs = now;
+      save();
+      try {
+        const member = await api(`/guilds/${guildId}/members/${runtime.selfId}`);
+        const roles = await api(`/guilds/${guildId}/roles`);
+        const permissions = combinePermissions(guildId, member, roles);
+        if ((permissions & 8n) === 0n && !dryRun && due(state.lastPermNotifyTs, now, 24 * HOUR)) {
+          await notifyHealth(`Discord Bot の Administrator 権限が失われています。次のリンクを開き、orgiast を選んで認証してください。\n${REAUTHORIZE_URL}`);
+          state.lastPermNotifyTs = now;
+          save();
+        }
+      } catch (e) { result.errors.push(`permissions: ${errorText(e)}`); }
+    }
     const handled = (m, reason) => { state.handled[m.id] = { reason, ts: now }; save(); };
     const emergency = async () => {
       state.hourly = state.hourly.filter(ts => millis(ts) > now - HOUR);
@@ -372,7 +405,19 @@ export async function runOnce(options = {}) {
     state.lastRunTs = now; save();
   } catch (e) { result.ok = false; result.errors.push(errorText(e)); }
   finally {
+    if (result.errors.length > 0) result.ok = false;
     if (release) {
+      if (state) {
+        try {
+          state.consecutiveErrorCycles = result.errors.length > 0 ? (state.consecutiveErrorCycles || 0) + 1 : 0;
+          if (state.consecutiveErrorCycles >= 3 && due(state.lastErrorNotifyTs, now, 24 * HOUR)) {
+            await notifyHealth(`Discord 自動返信で ${state.consecutiveErrorCycles} サイクル連続のエラーを検知しました。自動返信のログを確認してください。`);
+            state.lastErrorNotifyTs = now;
+          }
+        } catch (e) { result.ok = false; result.errors.push(`health: ${errorText(e)}`); }
+        try { atomic(file('state.json'), JSON.stringify(state, null, 2) + '\n'); }
+        catch (e) { result.ok = false; result.errors.push(`state: ${errorText(e)}`); }
+      }
       try {
         const quiet = result.replied === 0 && Object.values(result.learned).every(count => count === 0)
           && result.errors.length === 0 && !result.wouldSend?.length;

@@ -3,112 +3,177 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fleetLabels, collectUndelivered, formatUndelivered, notifiable, main, CHANNEL, STALE_MS, RENOTIFY_MS } from './fleet-mail-watchdog.mjs';
-
-const NOW = Date.parse('2026-10-10T06:00:00.000Z');
-const iso = ms => new Date(NOW - ms).toISOString();
-const message = (overrides = {}) => ({ id: 'mail-1', status: 'new', createdAt: iso(31 * 60 * 1000), from: 'cr-PC', to: 'kim-PC', why: '返信', ...overrides });
-
-function fixture(t, { configured = true } = {}) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-mail-watchdog-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const dir = path.join(home, '.claude'); fs.mkdirSync(dir);
-  if (configured) fs.writeFileSync(path.join(dir, 'fleet-sheet.env'), 'FLEET_SHEET_URL="https://example.invalid/mail"\nFLEET_SHEET_TOKEN=test-token\n');
-  return { home, dir };
+import { main, formatAlert, CHANNEL, markLaneHealthSeen } from './fleet-mail-watchdog.mjs';
+import { KIM_USER_ID, notifyArrival, postToChannel } from './lib/fleet-mail-discord.mjs';
+import { createClient, CAPABILITY_BACKOFF_MS } from './fleet-mail.mjs';
+function fixture(t, alerts = [{ id: 'mail-one', to: 'kim-PC', from: 'PC', kind: 'unseen', why: '確認', notifiedCount: 0 }]) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-watch-')); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(home, '.claude')); fs.writeFileSync(path.join(home, '.claude', 'fleet-sheet.env'), 'FLEET_SHEET_URL=https://example.invalid\nFLEET_SHEET_TOKEN=test\n');
+  const calls = [], posts = [], dms = [], outputs = [];
+  const deps = { allowlist: [{ category: 'test', pattern: '.' }], home, token: 'test', stdout: x => outputs.push(x), stderr() {}, request: async (kind, payload) => { calls.push({ kind, payload }); return { ok: true, alerts: payload.notifiedIds ? [] : alerts }; }, postChannel: async (...args) => posts.push(args), notifyKim: async (...args) => { dms.push(args); return { delivered: 'dm' }; } };
+  return { home, calls, posts, dms, outputs, deps };
 }
-const deps = (home, poll, { post, notify, out, errors, token = 'watchdog-token', request } = {}) => ({
-  home, now: () => NOW, poll, postChannel: post, notifyKim: notify, token, request,
-  stdout: out ?? (() => {}), stderr: errors ? (t => errors.push(t)) : (() => {}),
+test('watchdog keeps delivery evidence only in fleet-chase and confirms after persistence', async t => {
+  const f = fixture(t); await main([], f.deps);
+  assert.equal(f.calls.length, 2); assert.equal(f.posts.length, 0); assert.equal(f.dms.length, 0);
+  const ledger = JSON.parse(fs.readFileSync(path.join(f.home, '.claude/fleet-chase/ledger.json')));
+  assert.equal(ledger.deliveryAlerts['mail-one'].kind, 'unseen');
+});
+test('server-confirmed alerts are not duplicated', async t => {
+  const f = fixture(t, [{ id: 'mail-one', notifiedCount: 1 }]); await main([], f.deps);
+  assert.equal(f.posts.length, 0); assert.equal(f.dms.length, 0); assert.equal(f.calls.length, 1);
+});
+test('failed ledger write leaves alert pending', async t => {
+  const f = fixture(t); await main([], { ...f.deps, recordAlert: () => { throw Error('locked'); } });
+  assert.equal(f.calls.length, 1);
+});
+test('dry run reads only and logs counts without contents', async t => {
+  const f = fixture(t); await main(['--dry-run', '--json'], f.deps); assert.equal(f.calls.length, 1); assert.equal(f.posts.length, 0); assert.equal(f.dms.length, 0); assert.equal(JSON.parse(f.outputs[0]).pending, 1); assert.doesNotMatch(f.outputs[0], /mail-one|確認/);
+});
+test('unconfigured watchdog does no requests', async t => {
+  const f = fixture(t); fs.unlinkSync(path.join(f.home, '.claude', 'fleet-sheet.env')); await main([], f.deps); assert.equal(f.calls.length, 0);
+});
+test('alert formatting masks secrets and distinguishes undelivered from unseen', () => {
+  assert.match(formatAlert({ kind: 'unseen' }), /読まれていません/); assert.match(formatAlert({ kind: 'undelivered' }), /届いていません/);
+  assert.doesNotMatch(formatAlert({ why: 'token=private' }), /private/);
+});
+test('client accepts alerts shape and rejects old GAS fallback', async () => {
+  const client = result => createClient({ url: 'https://example.invalid', token: 'test', fetchImpl: async () => ({ ok: true, json: async () => result }) });
+  assert.deepEqual(await client({ ok: true, alerts: [] })('mail-alerts', {}), { ok: true, alerts: [] });
+  await assert.rejects(client({ ok: true, mail: null })('mail-alerts', {}), /not deployed/);
+});
+test('shared Discord transport disables mentions and masks content', async () => {
+  const calls = []; await postToChannel('test', CHANNEL, 'token=private @everyone', async (...args) => { calls.push(args); return { ok: true }; });
+  const body = JSON.parse(calls[0][1].body); assert.deepEqual(body.allowed_mentions, { parse: [] }); assert.doesNotMatch(body.content, /private/);
+});
+test('arrival uses one line, recipient, category, clipped reason and id', async t => {
+  const f = fixture(t); const calls = [];
+  assert.equal(await notifyArrival({ id: 'mail-one', why: '[作業依頼] '+ 'あ'.repeat(100) }, { allowlist: [{ category: 'fleet-arrival', pattern: '.' }], home: f.home, label: 'receiver', token: 'test', fetchImpl: async (...args) => { calls.push(args); return { ok: true }; } }), true);
+  const content = JSON.parse(calls[0][1].body).content;
+  assert.match(content, /^receiver 宛 \[作業依頼\] 到着:/); assert.ok(content.endsWith(' / mail-one [fleet-arrival]')); assert.ok(content.split('到着: ')[1].split(' / ')[0].length <= 60); assert.doesNotMatch(content, /\n/);
+});
+test('missing arrival route skips without a network request', async t => {
+  const f = fixture(t); const errors = [];
+  assert.equal(await notifyArrival({ id: 'mail-one', priority: 'urgent' }, { home: f.home, token: '', stderr: x => errors.push(x), fetchImpl: async () => assert.fail('network') }), false); assert.equal(errors.length, 1);
 });
 
-test('fleetLabels excludes reserved keys and falls back to the label as hostname', () => {
-  const labels = fleetLabels({ _note: { remoteName: 'x' }, 'kim-PC': { remoteName: '表示名' }, 'cr-PC': {}, broken: null });
-  assert.equal(JSON.stringify(labels), JSON.stringify([{ label: 'kim-PC', hostname: '表示名' }, { label: 'cr-PC', hostname: 'cr-PC' }]));
+test('C6 old GAS mail-alerts response is cached and suppressed during the capability backoff', async t => {
+  const f = fixture(t); let now = Date.now(), requests = 0;
+  f.deps.now = () => now;
+  f.deps.request = async () => { requests++; return { ok: true, action: 'updated', row: 2 }; };
+  assert.equal(await main([], f.deps), 0); assert.equal(await main([], f.deps), 0); assert.equal(requests, 1);
+  const state = JSON.parse(fs.readFileSync(path.join(f.home, '.claude', '.fleet-mail-last-poll.json'), 'utf8'));
+  assert.equal(state.serverCapabilities.seen, false); assert.equal(state.serverCapabilities.alerts, false);
+  now += CAPABILITY_BACKOFF_MS; assert.equal(await main([], f.deps), 0); assert.equal(requests, 2);
+  assert.equal(f.posts.length, 0); assert.equal(f.dms.length, 0);
 });
 
-test('collectUndelivered aggregates status=new older than 30 minutes and dedupes broadcast ids', async () => {
-  const polls = [];
-  const entries = await collectUndelivered(
-    [{ label: 'kim-PC', hostname: 'h1' }, { label: 'cr-PC', hostname: 'h2' }],
-    async ({ label }) => {
-      polls.push(label);
-      return label === 'kim-PC'
-        ? [message(), message({ id: 'mail-fresh', createdAt: iso(STALE_MS - 60_000) }), message({ id: 'mail-done', status: 'delivered' }), message({ id: 'mail-bad', createdAt: 'not-a-date' })]
-        : [message(), message({ id: 'mail-own', to: 'cr-PC' })];
-    },
-    { now: () => NOW });
-  assert.equal(JSON.stringify(polls), JSON.stringify(['kim-PC', 'cr-PC']));
-  assert.equal(JSON.stringify(entries.map(e => e.id).sort()), JSON.stringify(['mail-1', 'mail-own']));
-  assert.equal(entries.find(e => e.id === 'mail-1').to, 'kim-PC', 'all 宛の重複は最初のラベルに一意化');
+test('C6 capability probes do not refresh Task B last-successful-poll health timestamps', async t => {
+  const f = fixture(t), file = path.join(f.home, '.claude', '.fleet-mail-last-poll.json');
+  const old = new Date(Date.now() - 2 * CAPABILITY_BACKOFF_MS);
+  fs.writeFileSync(file, JSON.stringify({ at: old.toISOString() })); fs.utimesSync(file, old, old);
+  const mtime = fs.statSync(file).mtimeMs;
+  f.deps.request = async () => ({ ok: true, action: 'updated', row: 2 });
+  await main([], f.deps); assert.ok(Math.abs(fs.statSync(file).mtimeMs - mtime) < 1);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).at, old.toISOString());
 });
 
-test('formatUndelivered truncates why to 30 chars and shows elapsed minutes', () => {
-  const text = formatUndelivered([{ id: 'mail-9', to: 'kim-PC', from: 'cr-PC', why: 'あ'.repeat(40), createdAt: iso(90 * 60 * 1000) }], NOW);
-  assert.match(text, /未配達 1件/);
-  assert.match(text, /kim-PC 宛 cr-PC から「あ{30}」\(90分経過\) id=mail-9/);
+for (const mode of ['throw', 'negative']) test(`D7 watchdog isolates ${mode} acknowledgement failure and continues`, async t => {
+  const f = fixture(t, ['mail-one', 'mail-two'].map(id => ({ id, kind: 'unseen' })));
+  const errors = [], request = f.deps.request;
+  f.deps.stderr = text => errors.push(text);
+  f.deps.request = async (kind, payload) => {
+    const result = await request(kind, payload);
+    if (payload.notifiedIds?.[0] === 'mail-one') {
+      if (mode === 'throw') throw new Error('token=private');
+      return { ok: false };
+    }
+    return result;
+  };
+  await main(['--json'], f.deps);
+  assert.equal(f.posts.length, 0); assert.equal(f.dms.length, 0);
+  assert.deepEqual(f.calls.at(-1).payload.notifiedIds, ['mail-two']);
+  assert.deepEqual(JSON.parse(f.outputs[0]), { total: 2, pending: 2, notified: 1, failed: 1 });
+  assert.deepEqual(errors, ['fleet-mail-watchdog: 通知確認失敗=1']);
 });
 
-test('notifiable suppresses the same id within 6 hours only', () => {
-  const entries = [{ id: 'mail-a' }, { id: 'mail-b' }];
-  const state = { notified: { 'mail-a': iso(6 * 60 * 60 * 1000) } }; // ちょうど6時間前 = 抑止対象外
-  assert.equal(JSON.stringify(notifiable(entries, state, NOW).map(e => e.id)), JSON.stringify(['mail-a', 'mail-b']));
-  const within = { notified: { 'mail-a': new Date(NOW - RENOTIFY_MS + 60_000).toISOString() } };
-  assert.equal(JSON.stringify(notifiable(entries, within, NOW).map(e => e.id)), JSON.stringify(['mail-b']));
-});
-
-test('main skips silently when transport is unconfigured', async t => {
-  const f = fixture(t, { configured: false });
-  const errors = [];
-  assert.equal(await main([], deps(f.home, async () => assert.fail('poll called'), { errors })), 0);
-  assert.equal(errors.length, 1);
-});
-
-test('main notifies Discord channel and kim DM, records state, and suppresses repeats', async t => {
+test('D6 arrival forwards the bounded abort signal to both Discord transports', async t => {
   const f = fixture(t);
-  const posted = [], dms = [], out = [];
-  const run = () => main([], deps(f.home, 
-    async () => [message({ why: '[判断依頼] 進行方針' })],
-    {
-      post: async (token, channelId, content) => { posted.push({ token, channelId, content }); },
-      notify: async text => { dms.push(text); return { delivered: 'dm' }; },
-      out: t2 => out.push(t2),
-    }));
-  assert.equal(await run(), 0);
-  assert.equal(posted.length, 1);
-  assert.equal(posted[0].channelId, CHANNEL);
-  assert.equal(posted[0].token, 'watchdog-token');
-  assert.match(posted[0].content, /未配達 1件/);
-  assert.match(posted[0].content, /「\[判断依頼\] 進行方針」/);
-  assert.equal(dms.length, 1);
-  const state = JSON.parse(fs.readFileSync(path.join(f.dir, 'fleet-mail-watchdog.json'), 'utf8'));
-  assert.ok(state.notified['mail-1']);
-  // 同じ id は再通知しない（6時間抑止）
-  assert.equal(await run(), 0);
-  assert.equal(posted.length, 1);
-  assert.equal(dms.length, 1);
-  assert.match(out.at(-1), /未配達なし/);
+  fs.writeFileSync(path.join(f.home, '.claude', 'orgiast-discord-webhook.txt'), 'https://example.invalid/webhook');
+  for (const token of ['test', '']) {
+    const controller = new AbortController(), calls = [];
+    await notifyArrival({ id: 'mail-signal' }, { allowlist: [{ category: 'fleet-arrival', pattern: '.' }], home: f.home, token, signal: controller.signal, fetchImpl: async (...args) => { calls.push(args); return { ok: true }; } });
+    assert.equal(calls[0][1].signal, controller.signal);
+    controller.abort(); assert.equal(calls[0][1].signal.aborted, true);
+  }
+});
+test('lane-health notes are marked seen once; other and already-seen mail are left alone', async () => {
+  const body = JSON.stringify({ kind: 'lane-health', pc: 'PC', dead: [] });
+  const inbox = [
+    { id: 'mail-lh', status: 'delivered', why: '[lane-health] PC glm dead', body },
+    { id: 'mail-lh-seen', status: 'seen', seenAt: 'x', why: '[lane-health] PC', body },
+    { id: 'mail-human', status: 'delivered', why: '確認お願いします', body: 'hi' },
+  ];
+  const synced = [];
+  const marked = await markLaneHealthSeen({ home: 'h', request: async () => ({}), readInboxImpl: () => inbox, sync: async args => { synced.push([args.id, args.action, args.seenBy]); return true; }, stderr() {} });
+  assert.equal(marked, 1); assert.deepEqual(synced, [['mail-lh', 'seen', 'lane-health-watch']]);
+});
+test('dry run never marks lane-health notes seen', async t => {
+  const f = fixture(t); let called = 0; await main(['--dry-run'], { ...f.deps, markLaneHealthSeen: async () => { called++; } }); assert.equal(called, 0);
+  await main([], { ...f.deps, markLaneHealthSeen: async () => { called++; } }); assert.equal(called, 1);
 });
 
-test('main does not record state when every delivery path fails', async t => {
-  const f = fixture(t);
-  const run = () => main([], deps(f.home, async () => [message()],
-    { post: async () => { throw new Error('discord down'); }, notify: async () => { throw new Error('dm down'); } }));
-  assert.equal(await run(), 0);
-  assert.equal(fs.existsSync(path.join(f.dir, 'fleet-mail-watchdog.json')), false, '全経路失敗時は次の毎時実行で再通知する');
+test('空の許可リストでは到着投稿せず台帳への配達を成功とする', async t => {
+  const f = fixture(t), errors = [];
+  assert.equal(await notifyArrival({ id: 'mail-test' }, { home: f.home, token: 'test', stderr: s => errors.push(s), fetchImpl: async () => assert.fail('投稿禁止') }), false);
+  assert.deepEqual(errors, ['fleet-mail: 到着通知は kim-inbox 方針で停止']);
+  await main([], { ...f.deps, allowlist: [], notifyKim: async () => ({ delivered: 'session-inbox' }) });
+  assert.equal(f.posts.length, 0); assert.equal(f.calls.length, 2);
 });
 
-test('main --dry-run prints without sending or writing state', async t => {
+test('watchdog drains spool even without fleet configuration and dry-run leaves it intact', async t => {
+  const { spoolItem, listItems } = await import('./kim-inbox.mjs');
   const f = fixture(t);
-  const out = [];
-  assert.equal(await main(['--dry-run'], deps(f.home, async () => [message()], { out: t2 => out.push(t2) })), 0);
-  assert.match(out[0], /^\[DRY\] /);
-  assert.match(out[0], /未配達 1件/);
-  assert.equal(fs.existsSync(path.join(f.dir, 'fleet-mail-watchdog.json')), false);
+  fs.unlinkSync(path.join(f.home, '.claude/fleet-sheet.env'));
+  fs.writeFileSync(path.join(f.home, '.claude/cost-reporter.env'), 'REPORTER_LABEL=kim-PC');
+  spoolItem(f.home, { text: 'watchdog で回収する進捗' });
+  await main(['--dry-run'], f.deps);
+  assert.equal(listItems(f.home).length, 0);
+  await main([], f.deps);
+  assert.equal(listItems(f.home).length, 1);
 });
 
-test('main passes dryRun:true polls so nothing is marked delivered', async t => {
+test('overlapping watchdog runs skip work and release their instance lock', async t => {
   const f = fixture(t);
-  const payloads = [];
-  await main([], deps(f.home, async () => []), { request: async (kind, payload) => { payloads.push({ kind, payload }); return { messages: [] }; } });
-  assert.ok(payloads.every(p => p.kind === undefined || p.payload.dryRun === true));
+  let finish, entered;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const first = main([], { ...f.deps, laneHealthWatch: async () => {
+    entered(); await new Promise(resolve => { finish = resolve; }); return { rows: [], notified: [] };
+  } });
+  await ready;
+  let ran = false;
+  assert.equal(await main([], { ...f.deps, laneHealthWatch: async () => { ran = true; return { rows: [], notified: [] }; } }), 0);
+  assert.equal(ran, false);
+  finish(); await first;
+  assert.equal(fs.existsSync(path.join(f.home, '.claude/fleet-mail-watchdog.lock')), false);
+});
+
+test('watchdog CLI deadline also terminates handles left alive after main completes', async t => {
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath, pathToFileURL } = await import('node:url');
+  const f = fixture(t);
+  fs.unlinkSync(path.join(f.home, '.claude/fleet-sheet.env'));
+  const preload = path.join(f.home, 'deadline-preload.mjs');
+  fs.writeFileSync(preload, `
+    const original = globalThis.setTimeout;
+    globalThis.setTimeout = (fn, ms, ...args) => original(fn, ms === 15 * 60_000 ? 100 : ms, ...args);
+    setInterval(() => {}, 1000);
+  `);
+  const result = spawnSync(process.execPath, ['--import', pathToFileURL(preload).href, fileURLToPath(new URL('./fleet-mail-watchdog.mjs', import.meta.url))], {
+    env: { ...process.env, ORGIAST_HOME: f.home }, encoding: 'utf8', timeout: 10000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /未設定=1/);
+  assert.match(result.stderr, /deadline exceeded=1/);
+  assert.equal(fs.existsSync(path.join(f.home, '.claude/fleet-mail-watchdog.lock')), false);
 });

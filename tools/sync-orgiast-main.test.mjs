@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { syncTree } from './sync-orgiast-main.mjs';
+import { syncTree, appendLogLine } from './sync-orgiast-main.mjs';
 import { dirtyStatus, rescueTree } from './rescue-policy.mjs';
 
 function fixture(t) {
@@ -57,9 +57,24 @@ test('same dirty status creates one remote branch, preserving HEAD, index and wo
   assert.equal(branches(f).length, 2);
 });
 
+test('rescue still works when hundreds of rescue refs have accumulated (no ENAMETOOLONG)', async t => {
+  const f = fixture(t);
+  // 2026-10-16 real incident: 700 rescue/* refs (104 local + 596 remote) made the
+  // rev-parse `<sha>^{tree}` fan-out exceed the Windows command-line length limit,
+  // so every rescue failed with `RESCUE_FAILED rev-parse: spawnSync git ENAMETOOLONG`.
+  const head = f.git('rev-parse', 'HEAD').trim();
+  const script = Array.from({ length: 700 }, (_, i) => `update refs/heads/rescue/bulk-${i} ${head}\n`).join('');
+  execFileSync('git', ['-C', f.repo, 'update-ref', '--stdin'], { input: script, encoding: 'utf8' });
+  f.git('push', 'origin', 'refs/heads/rescue/*:refs/heads/rescue/*');
+  fs.writeFileSync(path.join(f.repo, 'tracked'), 'changed');
+  const result = await syncTree(f.repo, f.home, f);
+  assert.ok(result.events.some(e => e.step === 'RESCUE_LOCAL_OK'), JSON.stringify(result));
+  assert.ok(!result.events.some(e => e.step === 'RESCUE_FAILED'), JSON.stringify(result));
+});
+
 test('shared exclusions alone are clean, retained during sync and absent from rescue', async t => {
   const f = fixture(t);
-  for (const name of ['scratch', '.work-eval', '.fleet-mail-work']) {
+  for (const name of ['scratch', '.work', '.work-eval', '.fleet-mail-work']) {
     fs.mkdirSync(path.join(f.repo, name)); fs.writeFileSync(path.join(f.repo, name, 'keep'), 'precious');
   }
   f.git('init', path.join(f.repo, 'nested clone'));
@@ -68,7 +83,7 @@ test('shared exclusions alone are clean, retained during sync and absent from re
   assert.equal((await rescueTree(f.repo, f.home, f)).clean, true);
   assert.equal((await syncTree(f.repo, f.home, f)).clean, true);
   assert.equal(branches(f).length, 0);
-  for (const name of ['scratch', '.work-eval', '.fleet-mail-work', 'nested clone']) {
+  for (const name of ['scratch', '.work', '.work-eval', '.fleet-mail-work', 'nested clone']) {
     assert.equal(fs.readFileSync(path.join(f.repo, name, 'keep'), 'utf8'), 'precious');
   }
   fs.writeFileSync(path.join(f.repo, 'tracked'), 'changed');
@@ -124,4 +139,60 @@ for (const staged of [false, true]) test(`snapshot handles deletions and renames
   assert.ok(result.events.some(e => e.step === 'RESCUE_LOCAL_OK'), JSON.stringify(result));
   assert.equal(f.git('ls-tree', '--name-only', branches(f)[0]), 'renamed file\n');
   assert.equal(f.git('status', '--porcelain'), before);
+});
+
+const lockError = () => Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' });
+
+test('appendLogLine retries a transient EBUSY and then succeeds on the primary log', async () => {
+  const written = [];
+  let calls = 0;
+  const sleeps = [];
+  const result = await appendLogLine('C:/logs/sync-orgiast-main.log', 'line', {
+    retries: 3,
+    delayMs: 100,
+    appendImpl: (file, text) => { calls++; if (calls <= 2) throw lockError(); written.push([file, text]); },
+    sleepImpl: async ms => { sleeps.push(ms); },
+  });
+  assert.deepEqual(result, { ok: true, file: 'C:/logs/sync-orgiast-main.log' });
+  assert.equal(calls, 3);
+  assert.deepEqual(sleeps, [100, 100]);
+  assert.deepEqual(written, [['C:/logs/sync-orgiast-main.log', 'line\n']]);
+});
+
+test('appendLogLine falls back to the events log when the primary stays locked, without throwing', async () => {
+  const written = [];
+  const result = await appendLogLine('C:/logs/sync-orgiast-main.log', 'line', {
+    retries: 3,
+    delayMs: 100,
+    appendImpl: (file, text) => { if (file.endsWith('sync-orgiast-main.log')) throw lockError(); written.push([file, text]); },
+    sleepImpl: async () => {},
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.fallback, true);
+  assert.equal(result.file, path.join('C:/logs', 'sync-orgiast-main.events.log'));
+  assert.deepEqual(written, [[path.join('C:/logs', 'sync-orgiast-main.events.log'), 'line\n']]);
+});
+
+test('appendLogLine reports failure without throwing when both logs are unwritable', async () => {
+  const result = await appendLogLine('C:/logs/sync-orgiast-main.log', 'line', {
+    retries: 1,
+    delayMs: 0,
+    appendImpl: () => { throw lockError(); },
+    sleepImpl: async () => {},
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'EBUSY');
+});
+
+test('appendLogLine does not retry or fall back on a non-lock error', async () => {
+  let calls = 0;
+  const result = await appendLogLine('C:/logs/sync-orgiast-main.log', 'line', {
+    retries: 3,
+    delayMs: 0,
+    appendImpl: () => { calls++; throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' }); },
+    sleepImpl: async () => {},
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'ENOSPC');
+  assert.equal(calls, 1);
 });

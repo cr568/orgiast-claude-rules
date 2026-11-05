@@ -3,7 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runNightlyHealth, defaultRunTests, formatDate, extractFailCount, isFailureLine, extractHookToolPaths, nativePath, getPlatform, evaluateScheduledTaskHealth } from './nightly-health.mjs';
+import { runNightlyHealth as realRunNightlyHealth, defaultRunTests, formatDate, extractFailCount, isFailureLine, extractHookToolPaths, nativePath, getPlatform, evaluateScheduledTaskHealth } from './nightly-health.mjs';
+
+const runNightlyHealth = options => realRunNightlyHealth({ staleTaskHealth: async () => ({ anomalies: [] }), unattendedAudit: async () => ({ unresolved: [] }), stallScan: async () => ({ rows: [] }), ...options });
 
 function createTempHome() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'nightly-health-test-'));
@@ -335,6 +337,22 @@ test('Windows 形式パスは win32 では維持し linux で WSL パスへ変�
 
 test('/ サマリ / 行は失敗を含んでも除外する', () => {
   assert.equal(isFailureLine('2026-09-05 / サマリ / step1 NG: failed'), false);
+});
+
+test('robocopy の列挙行はファイル名に error を含んでも失敗扱いしない', () => {
+  // 2026-10-13 実測: Drive バックアップの robocopy /MIR 出力に含まれる *EXTRA File 行を
+  // ファイル名の "error" で誤検知し、正常終了したバックアップが夜間ジョブ異常として通知された。
+  const robocopyLines = [
+    '\t  *EXTRA File \t\t    1532\tC:\\Users\\uers\\AppData\\Local\\claude-backup-staging\\.claude\\repo-backups\\tools.bak-2026-10-09\\nightly-batch-error-detail.test.mjs',
+    '\t  *EXTRA File \t\t     790\tC:\\Users\\uers\\AppData\\Local\\claude-backup-staging\\.claude\\repo-backups\\lib\\redact.test.mjs',
+    '\t  *EXTRA Dir        -1\tC:\\Users\\uers\\AppData\\Local\\claude-backup-staging\\.claude\\repo-backups\\tools.bak-2026-10-09\\lib\\internal-audit\\',
+    '\t   New File  \t\t     257\tC:\\Users\\uers\\AppData\\Local\\claude-backup-staging\\.claude\\lib\\error-detail.mjs',
+    '\t   Newer     \t\t    4910\tC:\\Users\\uers\\AppData\\Local\\claude-backup-staging\\.claude\\lib\\leak-search.mjs',
+    '\t   Same      \t\t     189\tC:\\Users\\uers\\AppData\\Local\\claude-backup-staging\\.claude\\session-purpose\\error.json'
+  ];
+  for (const line of robocopyLines) assert.equal(isFailureLine(line), false, line);
+  // 実際の失敗行（バックアップ script の ERROR 行）は引き続き検知する。
+  assert.equal(isFailureLine('2026-10-13T03:40:00+09:00 ERROR failed reason=read-back 不合格'), true);
 });
 
 test('前回オフセット以降に追記された行だけを検知する', async () => {
@@ -824,4 +842,57 @@ test('GAS 監査エラーを異常として残し、他の夜間チェックは�
     streakWatch: async () => ({ detected: [] }), gasDrift: async () => { throw new Error('pull failed'); },
   });
   assert.equal(tested, true); assert.equal(result.anomalies[0].type, 'gas_master_drift_error');
+});
+
+test('daily stall scan findings reach remediation input and suppress normal cooldowns', async () => {
+  const home = createTempHome();
+  try {
+    let scanned = false;
+    const result = await runNightlyHealth({ home, expectations: [], prime: true,
+      runTests: async () => ({ status: 0, stdout: '# fail 0' }), gasDrift: async () => {}, convergenceWatch: async () => {}, streakWatch: async () => ({ detected: [] }),
+      stallScan: async options => { scanned = options.save; return { rows: [
+        { kind: 'watcher_dead', symptom: '監視停止', evidence: 'heartbeat=未作成', cause: '未登録', nextAction: '再登録' },
+        { kind: 'cooldown', symptom: '利用待ち', remediate: false }
+      ] }; }
+    });
+    assert.equal(scanned, true);
+    assert.ok(result.anomalies.some(a => a.type === 'watcher_dead'));
+    const input = JSON.parse(fs.readFileSync(path.join(home, '.claude', '.nightly-health-last.json'), 'utf8'));
+    assert.ok(input.anomalies.some(a => a.type === 'watcher_dead'));
+    assert.ok(!input.anomalies.some(a => a.type === 'cooldown'));
+  } finally { removeDir(home); }
+});
+
+test('nightly audit passes prime/dry-run and saves unresolved in existing report', async t => {
+  const home = createTempHome(); t.after(() => removeDir(home)); let seen;
+  const result = await runNightlyHealth({ home, prime: true, expectations: [], runTests: async () => healthyTests(),
+    unattendedAudit: async options => { seen = options; return { unresolved: [{ name: 'OrgiastTest', reason: 'missed' }] }; },
+    stallScan: async () => ({ rows: [] }), gasDrift: async () => {}, convergenceWatch: async () => {}, streakWatch: async () => ({ detected: [] })
+  });
+  assert.equal(seen.dryRun, true); assert.equal(seen.home, home);
+  assert.ok(result.anomalies.some(a => a.type === 'unattended_unresolved'));
+  assert.match(fs.readFileSync(path.join(home, '.claude/.nightly-health-last.json'), 'utf8'), /OrgiastTest/);
+});
+
+
+test('stale task repair results use the existing nightly notification', async () => {
+  const home = createTempHome();
+  let sent;
+  try {
+    const result = await runNightlyHealth({ home, expectations: [], runTests: async () => healthyTests(),
+      gasDrift: async () => {}, convergenceWatch: async () => {},
+      streakWatch: async () => ({ detected: [] }),
+      staleTaskHealth: async options => {
+        assert.equal(options.dryRun, false);
+        return { anomalies: [{ type: 'stale_task_paths', label: 'task paths', message: 'detected 1 repaired 1' }] };
+      }, notify: async text => { sent = text; } });
+    assert.equal(result.exitCode, 0);
+    assert.match(sent, /detected 1 repaired 1/);
+  } finally { removeDir(home); }
+});
+
+test('期限ジョブはログが新しくてもLastRunTimeが36時間超なら検出する', () => {
+  const now = new Date('2026-11-05T12:00:00Z');
+  const result = evaluateScheduledTaskHealth({ label:'期限追跡', maxRunHours:1, maxLastRunHours:36 }, { state:'Ready', lastTaskResult:0, lastRunTime:'2026-11-03T12:00:00Z' }, { now, logMtimeMs:now.getTime() });
+  assert.ok(result.some(x => x.type === 'task_stale'));
 });

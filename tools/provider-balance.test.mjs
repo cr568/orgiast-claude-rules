@@ -62,7 +62,7 @@ test('Groq の課金台帳が無料枠表示まで伝わり、異常判定は維
 const { alertProviderBalances, main } = await import('./provider-balance.mjs');
 const { readFileSync, existsSync } = await import('node:fs');
 const NOW = new Date('2026-10-09T13:00:00Z');
-const lowRow = { provider: 'kimi', balanceUsd: 0, autoTopUp: false, status: 'low', todaySpendUsd: 0, avg7dSpendUsd: 0 };
+const lowRow = { provider: 'openrouter', balanceUsd: 0, autoTopUp: false, status: 'low', todaySpendUsd: 0, avg7dSpendUsd: 0 };
 function alertFixture(t) {
   const home = mkdtempSync(join(tmpdir(), 'balance-alert-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -76,7 +76,7 @@ test('low→1通、同日再実行は抑止、翌日再通知、ok復旧は1回'
   const io = alertFixture(t);
   await alertProviderBalances([lowRow], io);
   assert.equal(io.messages.length, 1);
-  assert.match(io.messages[0], /残高注意: kimi \$0.00（オートチャージ OFF）。チャージ画面: https:\/\/platform.kimi.ai\/console\/pay/);
+  assert.match(io.messages[0], /残高注意: openrouter \$0.00（オートチャージ OFF）。チャージ画面: https:\/\/openrouter.ai\/credits/);
   await alertProviderBalances([{ ...lowRow, balanceUsd: 1 }], io);
   assert.equal(io.messages.length, 1);
   const next = { ...io, now: new Date('2026-10-10T13:00:00Z') };
@@ -88,14 +88,14 @@ test('low→1通、同日再実行は抑止、翌日再通知、ok復旧は1回'
   await alertProviderBalances([recovered], next);
   await alertProviderBalances([recovered], next);
   assert.equal(io.messages.length, 3);
-  assert.equal(io.messages[2], '復旧: kimi $20.00');
+  assert.equal(io.messages[2], '復旧: openrouter $20.00');
 });
 test('十分な残高でもOFFは7日に1通、既知でない課金URLを作らない', async t => {
   const io = alertFixture(t);
-  const rows = [{ ...lowRow, provider: 'deepseek', balanceUsd: 50, status: 'ok' }];
+  const rows = [{ ...lowRow, provider: 'genspark', balanceUsd: 50, status: 'ok' }];
   await alertProviderBalances(rows, io);
   await alertProviderBalances(rows, { ...io, now: new Date(NOW.getTime() + 6 * 86400000) });
-  assert.deepEqual(io.messages, ['オートチャージが OFF: deepseek（方針は全プロバイダ ON）']);
+  assert.deepEqual(io.messages, ['オートチャージが OFF: genspark（方針は全プロバイダ ON）']);
   await alertProviderBalances(rows, { ...io, now: new Date(NOW.getTime() + 7 * 86400000) });
   assert.equal(io.messages.length, 2);
   await alertProviderBalances([{ ...lowRow, provider: 'genspark', credits: 10, balanceUsd: null, autoTopUp: 'unknown' }], io);
@@ -109,7 +109,7 @@ test('異常支出でも$5未満OFFは通知、lowは自動チャージONでも�
     { ...lowRow, provider: 'openrouter', autoTopUp: true },
   ], io);
   assert.equal(io.messages.length, 1);
-  assert.match(io.messages[0], /kimi \$4.99/);
+  assert.match(io.messages[0], /openrouter \$4.99/);
   assert.match(io.messages[0], /openrouter.*ON.*https:\/\/openrouter.ai\/credits/);
   assert.equal(classifyBalance({ ...lowRow, balanceUsd: 4.99 }), 'low');
   assert.equal(classifyBalance({ ...lowRow, balanceUsd: 5 }), 'ok');
@@ -134,7 +134,7 @@ test('dry-runはfetchで残高取得して通知・履歴・状態ファイル�
     fetches++; return new Response(JSON.stringify({ data: { available_balance: 0 } }));
   } }), 0);
   assert.ok(fetches > 0);
-  assert.match(lines.join('\n'), /残高注意: kimi \$0.00/);
+  assert.doesNotMatch(lines.join('\n'), /残高注意: (kimi|deepseek)/);
   assert.equal(io.messages.length, 0);
   assert.equal(existsSync(join(io.home, '.claude')), false);
   await alertProviderBalances([lowRow], io);
@@ -157,3 +157,16 @@ test('APIのnull残高は$0として誤通知しない', async () => {
   const row = await fetchProviderBalance({ provider: 'kimi', key: 'mock', url: 'x', fetchImpl: async () => new Response('{"data":{"available_balance":null}}') });
   assert.equal(row.balanceUsd, null);
 });
+
+test('自動補充ONの1ドル未満は故障、account と画像能力を保持',async t=>{
+  const row={provider:'openrouter',balanceUsd:0.03,autoTopUp:true,account:'seisaku-team@orgiast.jp'};
+  assert.equal(classifyBalance(row),'autotopup_broken');assert.equal(classifyBalance({...row,balanceUsd:1}),'ok');assert.equal(classifyBalance({...row,balanceUsd:null}),'unmeasurable');
+  row.status=classifyBalance(row);assert.match(formatBalanceLine([row]),/openrouter \$0.03\(オートチャージ故障・seisaku-team@orgiast.jp で確認\)/);
+  const io=alertFixture(t);await alertProviderBalances([row],io);await alertProviderBalances([row],{...io,now:new Date(NOW.getTime()+DAY_MS-1)});assert.equal(io.messages.length,1);
+  await alertProviderBalances([row],{...io,now:new Date(NOW.getTime()+DAY_MS)});assert.equal(io.messages.length,2);assert.match(io.messages[0],/seisaku-team@orgiast.jp/);assert.ok(existsSync(join(io.home,'.claude/provider-balance-notified.json')));
+  const c=JSON.parse(readFileSync(new URL('./ai-subscription-catalog.json',import.meta.url),'utf8'));
+  for(const r of c.services)assert.ok(Object.hasOwn(r,'account'));
+  for(const id of ['grok','openrouter','genspark'])assert.ok(c.services.find(r=>r.id===id).capabilities.includes('image'));
+  assert.deepEqual(c.services.find(r=>r.id==='codex').capabilities,['code']);
+});
+const DAY_MS=86400000;

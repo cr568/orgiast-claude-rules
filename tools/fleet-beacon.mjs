@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { safeDialogMetrics as dialogMetrics } from './lib/stuck-dialog-state.mjs';
 // fleet ビーコン: converge の結果（ステップの ok/skip/fail）と最終 poll を GAS の fleet-beacon シートへ送る。
 // 送信は fail-open（例外を投げない）。fleet-status.mjs と fleet-mail.mjs が fetchBeacons を import する。
 import fs from 'node:fs';
@@ -7,11 +8,31 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isEntry } from './is-entry.mjs';
 import { parseEnvText } from './env-kv.mjs';
-import { machineIdentity } from './machine-identity.mjs';
+import { machineIdentity, reportExtras, getClaudeAccountEmail } from './machine-identity.mjs';
 import { redactSecrets } from './fleet-agent.mjs';
 import { resolveFleetLabel } from './lib/fleet-label.mjs';
 
 const ownRepo = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+export const INSTALL_BEACON_URL = 'https://script.google.com/macros/s/AKfycbwyZXLJsVngZQy17i8ZqsQUCRx66AIs9p3wQbW55vMq6GObJes5R5WyJrSBhyknN3ibPg/exec';
+
+export function buildInstallBeacon({ home = process.env.ORGIAST_HOME || os.homedir(), installer } = {}) {
+  const extras = reportExtras(home);
+  return { kind: 'install-beacon', hostname: extras.hostname, os: extras.os,
+    claudeAccount: extras.claudeAccount, ...(extras.serial ? { serial: extras.serial } : {}), installer };
+}
+
+export async function sendInstallBeacon(beacon, { fetchImpl = fetch, timeoutMs = 15000, url } = {}) {
+  try {
+    const response = await fetchImpl(url || process.env.FLEET_INSTALL_BEACON_URL || INSTALL_BEACON_URL, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, redirect: 'follow',
+      body: JSON.stringify(beacon), signal: AbortSignal.timeout(Math.max(1, Math.ceil(timeoutMs)))
+    });
+    if (!response.ok) return { ok: false, reason: `HTTP ${response.status}` };
+    const result = await response.json();
+    if (result?.ok !== true || !['created', 'updated'].includes(result.action)) return { ok: false, reason: String(result?.error || 'invalid response') };
+    return { ok: true, action: result.action };
+  } catch (error) { return { ok: false, reason: sanitizeReason(error?.message || error) }; }
+}
 const STATUS_MAP = { OK: 'ok', NOTICE: 'skip', NG: 'fail' };
 const REASON_LIMIT = 120;
 const ABSOLUTE_PATH = /(?:[A-Za-z]:\\[^\s"']+|\/(?:Users|home|mnt)\/[^\s"']+)/g;
@@ -26,17 +47,6 @@ function envFile(file) {
 export function sanitizeReason(value) {
   const text = redactSecrets(String(value ?? '')).replace(ABSOLUTE_PATH, '[path]').replace(/\s+/g, ' ').trim();
   return text.slice(0, REASON_LIMIT);
-}
-function domainOf(email) {
-  const match = String(email ?? '').match(/@([^\s@]+)$/);
-  return match ? match[1] : '';
-}
-// account はドメインのみ。メールのローカル部・パスは絶対に入れない。
-export function beaconAccount({ label, pcMap, identity }) {
-  const entry = pcMap && typeof pcMap === 'object' ? pcMap[label] : null;
-  const fromMap = domainOf(entry?.account);
-  if (fromMap) return fromMap;
-  return domainOf(identity?.gitEmail);
 }
 // mobile-standby ステップの reason に「待機数/目標」を追記する。待機数が取れなければ「待機数不明」。
 export function mobileStandbySuffix(home, now = Date.now()) {
@@ -53,7 +63,7 @@ export function mobileStandbySuffix(home, now = Date.now()) {
   } catch { /* 既定 3 */ }
   return `${waiting === null ? '待機数不明' : waiting}/${target}`;
 }
-export function buildBeacon({ home, label, results = [], now = Date.now(), pcMap, identity } = {}) {
+export function buildBeacon({ home = process.env.ORGIAST_HOME || os.homedir(), label, results = [], now = Date.now(), pcMap, identity } = {}) {
   const resolvedLabel = label || resolveFleetLabel(home, identity ?? machineIdentity());
   const steps = results.map((result) => {
     const id = String(result?.item?.id ?? result?.id ?? '');
@@ -65,15 +75,23 @@ export function buildBeacon({ home, label, results = [], now = Date.now(), pcMap
     }
     return { id, status, reason };
   });
+  const metrics = dialogMetrics(home, now);
+  let knowledgeBytes=0;
+  try { knowledgeBytes=fs.statSync(path.join(home,'.claude','knowledge','production-sales','00_INDEX.md')).size; } catch {}
+  steps.push({ id:'production-sales-knowledge', status:knowledgeBytes>0?'ok':'fail', reason:knowledgeBytes>0?`00_INDEX.md ${knowledgeBytes} bytes`:'00_INDEX.md missing or empty' });
+  if (process.platform === 'win32' || metrics.stuckDialogWatcherAt) steps.push({ id: 'stuck-dialog-watch', status: metrics.stuckDialogWatcherOk && !metrics.stuckDialogs24h ? 'ok' : 'fail', reason: `stuckDialogs24h=${metrics.stuckDialogs24h}; heartbeat=${metrics.stuckDialogWatcherAt || 'missing'}` });
   const failing = steps.filter((step) => step.status === 'fail').map((step) => step.id);
   const pollAt = String(readJson(path.join(home, '.claude', '.fleet-mail-last-poll.json'), {})?.at || '');
   return {
     label: resolvedLabel,
-    account: beaconAccount({ label: resolvedLabel, pcMap, identity: identity ?? machineIdentity() }),
+    account: getClaudeAccountEmail(home) || '',
+    reporterLabel: String(envFile(path.join(home, '.claude', 'cost-reporter.env')).REPORTER_LABEL || '').slice(0, 128),
+    hostname: String(identity?.hostname || os.hostname()).slice(0, 128),
     reportedAt: new Date(now).toISOString(),
     steps,
     failing,
-    pollAt
+    pollAt,
+    ...metrics
   };
 }
 // 送信は絶対に例外を投げない。env 未設定は skip、応答に beacon が無ければ「GAS 未デプロイ」。
@@ -116,13 +134,16 @@ export async function fetchBeacons({ home, fetchImpl = fetch, timeoutMs = 15000 
       if (!Array.isArray(steps)) steps = [];
       const failing = Array.isArray(beacon?.failing) ? beacon.failing
         : String(beacon?.failing ?? '').split(',').map((id) => id.trim()).filter(Boolean);
+      const dialogCount = steps.find(s => s.id === 'stuck-dialog-watch')?.reason?.match(/stuckDialogs24h=(\d+)/)?.[1];
       return {
+        reporterLabel: String(beacon?.reporterLabel || ''), hostname: String(beacon?.hostname || ''),
         label: String(beacon?.label ?? ''), account: String(beacon?.account ?? ''), reportedAt: String(beacon?.reportedAt ?? ''),
+        stuckDialogs24h: dialogCount === undefined ? null : Number(dialogCount),
         steps, failing, pollAt: String(beacon?.pollAt ?? ''), serverPollAt: String(beacon?.serverPollAt ?? '')
       };
     });
     const serverPolls = result.serverPolls && typeof result.serverPolls === 'object' && !Array.isArray(result.serverPolls) ? result.serverPolls : {};
-    return { ok: true, beacons, serverPolls };
+    return { ok: true, beacons, serverPolls, capabilities: Array.isArray(result.capabilities) ? result.capabilities : [] };
   } catch (error) {
     return { ...empty, reason: sanitizeReason(error?.message || error) };
   }
@@ -131,6 +152,18 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const home = deps.home ?? process.env.ORGIAST_HOME ?? os.homedir();
   const out = deps.stdout ?? console.log;
   const err = deps.stderr ?? console.error;
+  if (argv.includes('--install-beacon')) {
+    let result;
+    try {
+      const index = argv.indexOf('--installer');
+      const installer = index >= 0 ? argv[index + 1] : '';
+      result = /^(sh|ps1)-[A-Za-z0-9._-]{1,32}$/.test(installer || '')
+        ? await sendInstallBeacon(buildInstallBeacon({ home, installer }), { fetchImpl: deps.fetch })
+        : { ok: false, reason: 'invalid_installer' };
+    } catch (error) { result = { ok: false, reason: sanitizeReason(error?.message || error) }; }
+    out(JSON.stringify(result));
+    return result.ok ? 0 : 1;
+  }
   const mode = argv.includes('--send') ? 'send' : argv.includes('--print') ? 'print' : null;
   if (!mode) { err('fleet-beacon: --send または --print を指定してください'); return 1; }
   const pcMap = deps.pcMap ?? readJson(path.join(ownRepo, 'fleet-pc-map.json'), {});

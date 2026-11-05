@@ -402,7 +402,7 @@ export async function runWeekly({ home, provider = 'deepseek', dryRun = false, n
     const dmText = `**📈 週次コスト改善**\n\n${sections.join('\n\n')}`;
     try {
       const notifyResult = await (io.notifyKim || notifyKim)(dmText, { home, webhookFallback: false });
-      if (!notifyResult || notifyResult.delivered !== 'dm') throw new Error(notifyResult?.reason || 'kim の DM に配信されませんでした');
+      if (!notifyResult || !['dm', 'session-inbox'].includes(notifyResult.delivered)) throw new Error(notifyResult?.reason || 'kim の DM に配信されませんでした');
     } catch (error) {
       status = 'NG';
       console.error(`週次提案 DM 送信失敗: ${String(error?.message ?? error)}`);
@@ -473,19 +473,8 @@ export async function main(argv = process.argv.slice(2), io = {}) {
   }
 }
 
-// 偵察は独立した1ステップ。承認の再実行では送らず、通知抑止も引き継ぐ。
-export function runModelScoutStep(argv, spawnImpl = spawnSync) {
-  if (argv.includes('--approve')) return;
-  try {
-    const scoutArgs = [path.join(HERE, 'model-scout.mjs'), '--once'];
-    if (argv.includes('--dry-run') || argv.includes('--no-notify')) scoutArgs.push('--dry-run');
-    const result = spawnImpl(process.execPath, scoutArgs, { cwd: REPO_ROOT, encoding: 'utf8', timeout: 60000, windowsHide: true });
-    // --json の stdout は本体の JSON だけに保つ。
-    if (result.stdout) console.error(String(result.stdout).trim());
-    if (result.error || result.status !== 0) console.error('model-scout: 失敗。本体の週次改善を継続します。');
-  } catch { console.error('model-scout: 起動失敗。本体の週次改善を継続します。'); }
-}
+// 日次の nightly-batch へ移管。公開関数は互換性のため残すが週次から二重起動しない。
+export function runModelScoutStep(argv, spawnImpl = spawnSync) { return { skipped: 'daily-scout' }; }
 if (isEntry(import.meta.url)) {
-  runModelScoutStep(process.argv.slice(2));
   process.exitCode = await main(process.argv.slice(2));
 }

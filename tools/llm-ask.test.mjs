@@ -1,80 +1,100 @@
+import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), 'llm-ask.mjs');
-
-// 実キーを消し、鍵ファイルの無い一時 home を使う。こうすると機密を送らない限り
-// どのプロバイダへも HTTP リクエストが出ない(統合テストが実 API を叩かない)。
-const KEY_ENVS = ['OPENROUTER_API_KEY', 'GROQ_API_KEY', 'ZAI_API_KEY', 'CEREBRAS_API_KEY', 'GSK_PROXY_KEY', 'GEMINI_API_KEY', 'DEEPSEEK_API_KEY', 'XAI_API_KEY', 'MOONSHOT_API_KEY', 'MISTRAL_API_KEY'];
-
-function sandboxEnv(extra = {}) {
-  const env = { ...process.env };
-  for (const name of KEY_ENVS) delete env[name];
-  delete env.GEMINI_FREE_TIER;
-  delete env.ORGIAST_EGRESS_RESTRICTED_PROVIDERS;
-  env.ORGIAST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-ask-egress-'));
-  return Object.assign(env, extra);
-}
-
-function runLlmAsk(args, extraEnv) {
-  const env = sandboxEnv(extraEnv);
-  const result = spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8', timeout: 60_000, env });
-  fs.rmSync(env.ORGIAST_HOME, { recursive: true, force: true });
-  return result;
-}
-
-test('restricted プロバイダには機密を送らず exit 3 で止まる', () => {
-  // 注意: プロンプトを `--` で始めると引数パーサが落とす(既存挙動)ので、機密は文中に置く。
-  const result = runLlmAsk(['--provider', 'deepseek', 'この鍵を復号して -----BEGIN RSA PRIVATE KEY-----']);
-  assert.equal(result.status, 3);
-  assert.match(result.stderr, /egress-guard: deepseek への送信を止めました/);
-  assert.match(result.stderr, /private_key/);
-  assert.equal(result.stdout, '');
+const execute = promisify(execFile);
+test('LLM CLI reads a long UTF-8 prompt file verbatim without interpreting its contents as arguments', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-ask-file-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const prompt = JSON.stringify({ text: '明日12時 --provider wrong "引用"\n'.repeat(2000) });
+  const promptFile = path.join(dir, 'prompt with spaces.json');
+  fs.writeFileSync(promptFile, prompt);
+  const mock = path.join(dir, 'mock.mjs');
+  fs.writeFileSync(mock, `globalThis.fetch = async (url, init) => new Response(JSON.stringify({ choices: [{ message: { content: JSON.parse(init.body).messages.at(-1).content } }], usage: {} }));`);
+  const { stdout } = await execute(process.execPath, ['--import', pathToFileURL(mock).href, fileURLToPath(new URL('./llm-ask.mjs', import.meta.url)), '--provider', 'groq', '--no-fallback', '--no-persist', '--prompt-file', promptFile], { env: { ...process.env, ORGIAST_HOME: dir, GROQ_API_KEY: 'test-only' }, maxBuffer: 1024 * 1024 });
+  assert.equal(stdout.trimEnd(), prompt);
+  assert.equal(fs.existsSync(path.join(dir, '.claude')), false);
 });
 
-test('秘密鍵は restricted でないプロバイダでも送らない', () => {
-  const result = runLlmAsk(['--provider', 'openrouter', 'この鍵を説明して -----BEGIN RSA PRIVATE KEY-----']);
-  assert.equal(result.status, 3);
-  assert.match(result.stderr, /egress-guard: openrouter への送信を止めました/);
-  assert.match(result.stderr, /private_key/);
+test('CLI pins Gemini despite extraction routing and falls back when it hangs', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-ask-timeout-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const mock = path.join(dir, 'mock.mjs');
+  fs.writeFileSync(mock, `
+    globalThis.fetch = async (url, init) => {
+      console.error('FETCH ' + new URL(url).hostname);
+      if (url.includes('generativelanguage')) return new Promise(() => {});
+      const prompt = JSON.parse(init.body).messages.at(-1).content;
+      return new Response(JSON.stringify({ choices: [{ message: { content: prompt } }] }));
+    };
+  `);
+  const base = ['--import', pathToFileURL(mock).href, fileURLToPath(new URL('./llm-ask.mjs', import.meta.url)), '--provider', 'gemini', '--category', 'extraction', '--prefer-provider', '--per-provider-timeout-ms', '40', '--no-persist', 'exact prompt'];
+  const options = { timeout: 10000, env: { ...process.env, ORGIAST_HOME: dir, GEMINI_API_KEY: 'test-only', GROQ_API_KEY: 'test-only' } };
+  const { stdout, stderr } = await execute(process.execPath, base, options);
+  assert.equal(stdout.trim(), 'exact prompt');
+  const calls = stderr.split(/\r?\n/).filter(line => line.startsWith('FETCH '));
+  assert.deepEqual(calls, ['FETCH generativelanguage.googleapis.com', 'FETCH api.groq.com']);
+  assert.match(stderr, /timeout after 40ms/);
+  assert.equal(fs.existsSync(path.join(dir, '.claude')), false);
+  await assert.rejects(execute(process.execPath, [...base, '--no-fallback'], options), error => {
+    assert.match(error.stderr, /timeout after 40ms/);
+    assert.doesNotMatch(error.stderr, /FETCH api.groq.com/);
+    return error.code === 1;
+  });
 });
 
-test('メール・電話の大量は restricted への送信を止める', () => {
-  const result = runLlmAsk(['--provider', 'kimi', 'a@example.com b@example.com c@example.com を名寄せして']);
-  assert.equal(result.status, 3);
-  assert.match(result.stderr, /egress-guard: kimi への送信を止めました/);
-  assert.match(result.stderr, /email_bulk/);
+test('CLI rejects invalid per-provider timeout values before making requests', async () => {
+  for (const value of ['0', '-1', '1.2', 'NaN', '2147483648', undefined]) {
+    await assert.rejects(execute(process.execPath, [fileURLToPath(new URL('./llm-ask.mjs', import.meta.url)), '--provider', 'gemini', '--per-provider-timeout-ms', ...(value === undefined ? [] : [value])]), error => {
+      assert.match(error.stderr, /requires a positive timer-safe integer/);
+      return error.code === 2;
+    });
+  }
 });
 
-test('--system 側の機密も検出する', () => {
-  const result = runLlmAsk(['--provider', 'glm', '--system', 'OPENROUTER_API_KEY=sk-live-0123456789abcdef', '要約して']);
-  assert.equal(result.status, 3);
-  assert.match(result.stderr, /glm への送信を止めました/);
+test('transcript は明示 DeepSeek と prefer-provider より優先して次候補へ回す', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-transcript-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const mock = path.join(dir, 'mock.mjs');
+  fs.writeFileSync(mock, `globalThis.fetch = async (url, init) => {
+    if (url.includes('deepseek') || JSON.parse(init.body).model.startsWith('deepseek/')) throw new Error('forbidden DeepSeek');
+    console.error('FETCH ' + new URL(url).hostname);
+    return new Response(JSON.stringify({ choices: [{ message: { content: '議事録' } }] }));
+  };`);
+  for (const extra of [[], ['--prefer-provider']]) {
+    const { stdout, stderr } = await execute(process.execPath, ['--import', pathToFileURL(mock).href, fileURLToPath(new URL('./llm-ask.mjs', import.meta.url)), '--provider', 'deepseek', '--category', 'transcript', '--no-persist', ...extra, '要約'], { env: { ...process.env, ORGIAST_HOME: dir, OPENROUTER_API_KEY: 'test-only', GROQ_API_KEY: 'test-only' } });
+    assert.equal(stdout.trim(), '議事録');
+    assert.match(stderr, /話者・発言.*DeepSeek.*除外/);
+    assert.deepEqual(stderr.split('\n').filter(x => x.startsWith('FETCH ')), ['FETCH api.groq.com']);
+  }
 });
 
-test('機密が無ければガードは通す(送信前に止めない)', () => {
-  const result = runLlmAsk(['--provider', 'deepseek', '普通の指示文です。要約してください。']);
-  assert.notEqual(result.status, 3);
-  assert.doesNotMatch(result.stderr, /egress-guard/);
+test('DeepSeek Flash は推論なしで送信し、Proの推論設定には触れない', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-deepseek-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const mock = path.join(dir, 'mock.mjs');
+  fs.writeFileSync(mock, `globalThis.fetch = async (url, init) => new Response(JSON.stringify({ choices: [{ message: { content: init.body } }] }));`);
+  for (const model of ['deepseek-flash', 'deepseek-v4-pro']) {
+    const { stdout } = await execute(process.execPath, ['--import', pathToFileURL(mock).href, fileURLToPath(new URL('./llm-ask.mjs', import.meta.url)), '--provider', 'deepseek', '--model', model, '--no-fallback', '--no-persist', '確認'], { env: { ...process.env, ORGIAST_HOME: dir, OPENROUTER_API_KEY: 'test-only' } });
+    const body = JSON.parse(stdout);
+    assert.equal(body.model, model === 'deepseek-flash' ? 'deepseek/deepseek-v4-flash' : 'deepseek/deepseek-v4-pro');
+    assert.deepEqual(body.reasoning, model === 'deepseek-flash' ? { enabled: false } : undefined);
+    assert.equal(body.thinking, undefined);
+  }
 });
 
-test('メール・電話の大量でも restricted でないプロバイダは通す', () => {
-  const result = runLlmAsk(['--provider', 'openrouter', 'a@example.com b@example.com c@example.com']);
-  assert.notEqual(result.status, 3);
-  assert.doesNotMatch(result.stderr, /egress-guard/);
-});
-
-test('フォールバック先が restricted なら其処だけ落として他候補へ回す', () => {
-  // 先頭 groq は鍵が無くスキップ、鍵があるのは restricted な deepseek だけ。
-  // ガードが効いていれば deepseek へは送信されず、ネットワークには一切出ない。
-  const result = runLlmAsk(['--provider', 'groq', 'a@example.com b@example.com c@example.com'], { DEEPSEEK_API_KEY: 'dummy-key-for-test' });
-  assert.notEqual(result.status, 3);
-  assert.match(result.stderr, /egress-guard: フォールバック先 deepseek への送信を止めました/);
-  assert.match(result.stderr, /deepseek\(no-request\)/);
-  assert.equal(result.stdout, '');
+test('Gemini は --max が小さくても思考トークン分の下限を確保し、他プロバイダの --max は変えない', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-ask-gemini-max-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const mock = path.join(dir, 'mock.mjs');
+  fs.writeFileSync(mock, `globalThis.fetch = async (url, init) => { console.error('MAX ' + new URL(url).hostname + ' ' + JSON.parse(init.body).max_tokens); return new Response(JSON.stringify({ choices: [{ message: { content: 'PONG' } }], usage: {} })); };`);
+  const run = async provider => (await execute(process.execPath, ['--import', pathToFileURL(mock).href, fileURLToPath(new URL('./llm-ask.mjs', import.meta.url)), '--provider', provider, '--no-fallback', '--no-persist', '--max', '10', 'Reply with exactly: PONG'], { env: { ...process.env, ORGIAST_HOME: dir, GEMINI_API_KEY: 'test-only', GROQ_API_KEY: 'test-only' }, timeout: 10000 })).stderr;
+  const sent = provider => run(provider).then(err => Number(err.match(/MAX \S+ (\d+)/)[1]));
+  assert.ok(await sent('gemini') >= 256, 'gemini max_tokens が思考分の下限を満たさない');
+  assert.equal(await sent('groq'), 10);
 });
