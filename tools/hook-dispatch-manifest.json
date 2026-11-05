@@ -58,6 +58,12 @@
       {
         "matcher": "*",
         "type": "command",
+        "command": "node \"${repo}/tools/sessionstart-owner-recipient.mjs\"",
+        "timeout": 5
+      },
+      {
+        "matcher": "*",
+        "type": "command",
         "command": "node \"${repo}/tools/hook-selfcheck.mjs\"",
         "timeout": 10
       },
