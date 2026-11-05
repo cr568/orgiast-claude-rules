@@ -430,3 +430,19 @@ test('outbound gate verifier accepts the actual registered wrapper and still rej
   write(path.join(home, '.claude/settings.json'), '{}');
   assert.equal(run(['--verify', '--home', home, '--manifest', mf]).status, 1);
 });
+
+test('owner recipient verifier accepts the actual SessionStart dispatch command', t => {
+  const home = temp('setup-owner-recipient-');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const parsed = JSON.parse(fs.readFileSync(path.join(toolsDir, 'setup-manifest.json'), 'utf8'));
+  const ownerRecipient = parsed.items.find(entry => entry.id === 'settings:owner-recipient-SessionStart');
+  assert.equal(ownerRecipient.severity, 'required');
+  const mf = path.join(home, 'manifest.json');
+  write(mf, JSON.stringify(manifest([ownerRecipient])));
+  const registered = spawnSync(process.execPath, [path.join(toolsDir, 'register-hooks.mjs'), '--hooks-only'], {
+    encoding: 'utf8', env: { ...process.env, ORGIAST_HOME: home, ORGIAST_REPO: path.dirname(toolsDir) },
+  });
+  assert.equal(registered.status, 0, registered.stderr);
+  const verified = run(['--verify', '--home', home, '--manifest', mf]);
+  assert.equal(verified.status, 0, verified.stdout + verified.stderr);
+});
