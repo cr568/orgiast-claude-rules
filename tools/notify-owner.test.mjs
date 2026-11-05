@@ -132,6 +132,8 @@ test('sendOwnerToast accepts exe override for pwsh.exe', () => {
 });
 
 test('daily setup notice is suppressed on the same day and resets next day', async t => {
+ assert.match(RECIPIENT_NOTICE, /次回 Claude を開くと自動で登録を試みます/);
+ assert.match(RECIPIENT_NOTICE, /登録されない場合はチャットに『Discordユーザー名: xxx』/);
  const options = localOptions(t);
  const calls = [];
  Object.assign(options, { now: new Date(2026, 9, 28, 9).getTime(), toast: text => { calls.push(text); return true; } });

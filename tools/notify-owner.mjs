@@ -106,7 +106,7 @@ function resolvePowerShellExe() {
   return 'powershell.exe';
 }
 
-export const RECIPIENT_NOTICE = 'Discord の宛先が未設定です。Claude のチャットに『Discordユーザー名: xxx』と送れば設定されます';
+export const RECIPIENT_NOTICE = 'Discord の宛先が未設定です。次回 Claude を開くと自動で登録を試みます。登録されない場合はチャットに『Discordユーザー名: xxx』と送ってください';
 
 async function prependInbox(home, text, at) {
   const file = path.join(home, '.claude', 'owner-inbox.md');
