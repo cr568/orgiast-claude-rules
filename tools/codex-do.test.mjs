@@ -255,7 +255,7 @@ test('冷却なしの3 backend は末尾指定にかかわらず通常上限に�
     env: {},
     isLastBackend: index === backends.length - 1,
   }));
-  assert.deepEqual(budgets, [720, 250, 500]);
+  assert.deepEqual(budgets, [720, 200, 500]);
 });
 
 test('全冷却で1 backend だけなら通常上限・環境変数・残り予算を適用する', () => {
@@ -267,7 +267,7 @@ test('全冷却で1 backend だけなら通常上限・環境変数・残り予�
     env: {},
     isLastBackend: index === backends.length - 1,
   }));
-  assert.deepEqual(budgets, [250]);
+  assert.deepEqual(budgets, [200]);
   assert.equal(effectiveBackendTimeoutSecs('gemini-cli', {
     chainBudget: 720, cooling: true, env: { CODEX_DO_GEMINI_TIMEOUT_SECS: '450' }, isLastBackend: true,
   }), 450);
