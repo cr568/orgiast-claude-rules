@@ -284,7 +284,15 @@ const CODEX_USAGE_LIMIT = /You(?:[’']ve| have) hit your usage limit|your usage
 const CODEX_MODEL_CAPACITY = /Selected model is at capacity\. Please try a different model\./i;
 
 export function emptyOutputReason(row) {
-  if (row?.timedOut === true) return 'timeout';
+  if (row?.timedOut === true) {
+    // ChatGPT 認証レーンの timeout で stderr が無い行は、同一クレジット枯渇(usage_limit)
+    // に起因するタイムアウト（API応答待ち中に制限時間到達）。これを timeout のまま残すと
+    // usage_limit 行と混ざって lane_outage_unrepaired(high/fixTask)になり、同じ原因から
+    // 毎晩修理タスクが積まれる（2026-11-06 実測: 時限到達の secs=84 / stderrTail="" の1件が
+    // usage_limit 5件と混ざって lane_outage_unrepaired を発生させた）。
+    if (row?.provider === 'codex' && String(row?.lane ?? '').includes('chatgpt_auth') && !String(row?.stderrTail ?? '').trim()) return 'usage_limit';
+    return 'timeout';
+  }
   // 旧行(timedOut 未記録)は経過秒数から推定する。codex の正常終了は実測で中央値~100秒、
   // 打ち切りは --timeout 到達時にのみ現れ、実測値は 300 秒以上だった。
   if (row?.timedOut == null && Number(row?.secs) >= 300) return 'timeout';
