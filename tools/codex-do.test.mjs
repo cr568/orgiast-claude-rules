@@ -433,6 +433,20 @@ test('detectQuotaLimit: 実機の usage limit 行(U+2019/URL/AM PM)を検出す�
   assert.equal(detectQuotaLimit('', `M. ${real}`, 1, '').matched, false);
 });
 
+// 2026-11-06〜07 に実測した ChatGPT Plus(cr@orgiast.jp) の月次上限到達メッセージ。
+// 月次リセット日(Nov 11)が明示されている。この検出により codex の全滅判定が混在
+// (timeout + usage_limit → lane_outage_unrepaired)になるのを防ぐ。
+test('detectQuotaLimit: 2026-11-06 実測の月次上限メッセージ（Nov 11 リセット）を検出する', () => {
+  const actualStderr = "ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 11th, 2026 5:00 PM.";
+  assert.equal(detectQuotaLimit('', actualStderr, 1, 'do something').matched, true);
+  // stderrTail（末尾200字）でも検出できることを確認（台帳の記録形式）
+  const tail200 = actualStderr.slice(-200);
+  assert.equal(detectQuotaLimit('', tail200, 1, '').matched, true);
+  // 行頭欠落した断片（M. が付く）は先頭のプレフィックス一致が必要なパターンには一致しない
+  //（既存 line 433 と同様の挙動: 末尾200字の先頭"mit."からは pattern が起動しない）
+  assert.equal(detectQuotaLimit('', `M. ${tail200}`, 1, '').matched, false);
+});
+
 // 2026-10-20 19:15Z の実測メッセージ全文。この検出自体は正しく（同セッションの rate_limits は
 // "primary":null / credits 0）、偽陽性だったのは再開時刻のパースと delegation-health の突き合わせ。
 test('detectQuotaLimit: 2026-10-20 実測の日付なし再開時刻を含む全文を検出する', () => {

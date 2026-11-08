@@ -147,6 +147,15 @@ test('emptyOutputReason は timeout・終了コード・原因不明を分類す
   // 起動失敗は「出力ゼロ」ではなく「そもそも走っていない」。exit_3 に埋もれさせない。
   assert.equal(emptyOutputReason({ launched: false, status: 3, secs: 0 }), 'launch_failed');
   assert.equal(emptyOutputReason({ launched: true, status: 3, secs: 0 }), 'exit_3');
+  // ChatGPT 認証レーンの codex timeout で stderr が無い行は usage_limit として分類する
+  // （2026-11-06 実測: chatgpt_auth_default の timeout／secs=84／stderrTail="" が usage_limit 5件と混ざり lane_outage_unrepaired を発生）。
+  assert.equal(emptyOutputReason({ provider: 'codex', lane: 'chatgpt_auth_default:default_sol', timedOut: true, secs: 84, stderrTail: '' }), 'usage_limit');
+  // codex 以外の provider は従来どおり timeout として分類
+  assert.equal(emptyOutputReason({ provider: 'gemini', timedOut: true }), 'timeout');
+  // chatgpt_auth 以外の lane は従来どおり timeout として分類
+  assert.equal(emptyOutputReason({ provider: 'codex', lane: 'default_sol', timedOut: true, stderrTail: '' }), 'timeout');
+  // stderrTail がある場合は従来どおり timeout として分類
+  assert.equal(emptyOutputReason({ provider: 'codex', lane: 'chatgpt_auth_default:default_sol', timedOut: true, stderrTail: 'some error' }), 'timeout');
 });
 
 test('emptyOutputReason は spawn 自体の失敗を spawn_failed に分類する', () => {
