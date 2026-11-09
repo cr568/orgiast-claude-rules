@@ -455,7 +455,7 @@ export function backendSpecificTimeoutSecs(backendName, env = process.env) {
 // gemini-cli 300秒 + cheap-code:deepseek 600秒 が両方 timeout（900秒を丸ごと廃棄）。
 // 末尾以外は短い探り予算で次へ進む。末尾には通常予算を与え、短すぎる試行が
 // timeout を再記録し続けて冷却から復帰できなくなる循環を防ぐ。
-export const COOLING_PROBE_TIMEOUT_SECS = 120;
+export const COOLING_PROBE_TIMEOUT_SECS = 60;
 
 // 1試行に実際に与える秒数。冷却中でなければ従来どおり
 // min(連鎖の残り予算, backend 固有の上限)。冷却中でも末尾の試行は通常予算を使う。
