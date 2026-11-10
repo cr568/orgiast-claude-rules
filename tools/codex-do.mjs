@@ -433,8 +433,9 @@ export function fallbackBackendTimeoutSecs(timeoutSeconds, env = process.env) {
 // 2026-11-09 再調整: executor-usage.jsonl 実測（3623件の成功）で gemini-cli の
 // p99 は 241 秒、99% の成功が 200 秒以内に完了する。200 秒に引き下げても
 // 成功の 0.9%（34/3623件）しか切らず、timeout 1回あたりの廃棄を 50 秒削減する。
-// cheap-code:deepseek は 464.5 秒（2026-10-30 実測）のまま 500 秒を維持。
-// 両方が timeout しても最大廃棄を従来の 900 秒から 700 秒に収める。
+// 2026-11-11 再調整: chain 実測（223件の chain 試行中成功46件/p95=524秒）より
+// cheap-code:deepseek を 500→400 秒に引き下げ。100秒/件の廃棄削減。
+// chain 上限を 700 秒から 600 秒に収める。
 export function backendSpecificTimeoutSecs(backendName, env = process.env) {
   if (backendName === 'gemini-cli') {
     const raw = Number(env.CODEX_DO_GEMINI_TIMEOUT_SECS);
@@ -443,7 +444,7 @@ export function backendSpecificTimeoutSecs(backendName, env = process.env) {
   // cheap-code:deepseek と qwen 直結の deepseek は同じ upstream（OpenRouter の deepseek model）なので同一扱い。
   if (backendName === 'cheap-code:deepseek' || backendName === 'deepseek') {
     const raw = Number(env.CODEX_DO_DEEPSEEK_TIMEOUT_SECS);
-    return Number.isFinite(raw) && raw > 0 ? raw : 500;
+    return Number.isFinite(raw) && raw > 0 ? raw : 400;
   }
   return null;
 }
