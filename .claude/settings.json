@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR}/tools/session-bootstrap.mjs\"",
+            "async": true,
+            "timeout": 360
+          }
+        ]
+      }
+    ]
+  },
+  "idleCompaction": false,
+  "memory": {
+    "enabled": true,
+    "path": ".claude/memory"
+  }
+}

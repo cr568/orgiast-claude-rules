@@ -1,7 +1,10 @@
 ---
 name: session-close
-description: セッションを綺麗に閉じて次に引き継ぐ。「終わりにする」「一旦区切る」「今日はここまで」「セッション閉じる」「次に引き継いで」「クリアする前に」「まとめて終わって」などセッション終了・区切りの合図が来たら必ずこのスキルを使う。1セッション=1目的を守るため、タスクが1件完了した時点でも Claude 側から自発的に提案してよい。
+description: セッションを綺麗に閉じて次に引き継ぐ。「終わりにする」「一旦区切る」「今日はここまで」「セッション閉じる」「次に引き継いで」「クリアする前に」「まとめて終わって」などセッション終了・区切りの合図が来たら必ずこのスキルを使う。目的が完了した最終の応答では、user の合図を待たず・提案も確認もせず、Claude が自分でこのスキルを実行する（2026-11-04 kim 厳命・全PC全アカウント全プロジェクト）。
 ---
+
+> **自動実行が既定（2026-08-30・2026-11-04 kim 厳命）**: 「/session-close しますか？」という確認や「/session-close をして」という依頼文で終えるのは禁止。目的が完了したら、そのターンのうちに Claude がこの手順を最後まで実行し、「このセッション: /session-close は終わっているので、このセッションを閉じてよい」で終える。Stop hook `next-action-gate` が「/session-close をして…」の終わり方を `SESSION-CLOSE-HANDOFF` で差し戻す。実行して失敗した時だけ、コマンドと終了コードを本文に書き `[SESSION-CLOSE-PENDING-OK: <理由>]` を付ける。
+> 自動で閉じないのは、バックグラウンド処理・人の返事・期限待ちが残る時だけ（その時は「まだ閉じない（作業中・YYYY-MM-DD HH:MM まで待つ）」）。
 
 # セッションを綺麗に閉じて次へ引き継ぐ
 
@@ -14,6 +17,12 @@ description: セッションを綺麗に閉じて次に引き継ぐ。「終わ�
 
 - `git status --short` を実行する。
 - 差分があれば commit → push → PR → **マージ**まで自分で行い、差分を放置して閉じない（2026-08-19 以降は自作PRのマージも Claude が行う。`gh pr checks` が全green・スコープ内・非破壊 を確認してから `gh pr merge --squash --delete-branch`）。
+
+## 2.5 着手印の解放
+
+- `node ~/orgiast-claude-rules/tools/session-claims.mjs --release --self <このセッションのid> --reason closed` を実行する。
+- これを忘れると、この目的は最大8時間ほか のセッションから「着手中」に見え続ける（拾えない目的が生まれる）。
+- 出力は無い。失敗しても exit 0 なので、成果報告には書かなくてよい。
 
 ## 3. memory へ永続化
 
@@ -32,6 +41,14 @@ description: セッションを綺麗に閉じて次に引き継ぐ。「終わ�
 
 - 後から前提が変わり得る判断（方式選定・外部サービス採用・やらないと決めたこと）をしたら、`protocols/DECISION-TEMPLATE.md`から`decisions/DEC-XXXX.md`を作り、`decisions/README.md`の一覧へ1行足す。
 - 単なる実装手順の選択は記録しない。
+
+## 3.5 成功した手作業手順を playbook へ追記
+
+- このセッションで user が実際に操作して成功した手作業手順（アプリの画面操作・設定値・ハマった点）があれば、`~/.claude/playbooks/<アプリ名>.md` に追記する（無ければ作る。ファイル名はアプリの正式名、別名は先頭の `aliases:` 行）。
+- 書くのは実測だけ: 成功した手順（番号付き）、画面に出た文言、既定値と変えた値、失敗した手順とその原因、日付と出典セッションID。一般知識で補わない。
+- トークン・パスワード等の秘密値は書かない（どの .env のどのキーを参照するかだけ書く）。
+- 全PCで共有すべき内容なら、リポジトリの `playbooks/<アプリ名>.md` にも同じ追記をして PR に含める。
+- 次回は UserPromptSubmit の playbook-inject hook がアプリ名を見て自動で差し込む。
 
 ## 4. マキモノへ出品（再利用できる知見だけ・全自動）
 
@@ -61,17 +78,24 @@ description: セッションを綺麗に閉じて次に引き継ぐ。「終わ�
 - 結果は `出品: <title> → pending (sub_xxx) / 未公開の滞留 M件` の形で滞留件数まで報告する。`--stale-days`（既定3日）超過があれば、その件数も kim への報告に1行入れる。
 - 出品しなかった場合は「出品対象なし」と1行書く（黙って飛ばさない）。
 
+## 4.5 kim-inbox 未回収の引き継ぎ
+
+`node <repo>/tools/kim-inbox.mjs --status` を実行し、open の ask があれば成果報告と next-session.md の「未決」に `kim-inbox 未回収 N件（先頭: <id> <1行目>）` を1行入れる。**クローズは止めない**。台帳が残り、次セッションの SessionStart hook が再提示する。
+
 ## 5. 残TODO を列挙
 
 - 「次セッションで最初にやる1件」を先頭にして残TODOを列挙する。
 - ブロッカーがあれば理由も添える。
+
+紐付いた案件があれば `node tools/case-handoff.mjs flush <sessionId>` を実行し、全文保存と STATE.md 更新の完了を確認してから閉じる。失敗時はキューを保持し、完了扱いにしない。
 
 ## 6. 引き継ぎを `~/.claude/next-session.md` に書き出す
 
 - **画面に出すだけで終わらせない。** kim にコピペさせるのは手作業なので、必ずファイルへ書く。
   次セッションは `/session-start` がこのファイルを読んで再開する（[[session-start]] とペア）。
 - 既存の `next-session.md` を先に読み、**まだ着手していない残TODO を消さずに引き継ぐ**（上書きで失わない）。
-- `next-session.md` を書き直すときは、本文中の `[FB:` を含む行を**必ず残す**。消してよいのは対応済みでシート側が `done` になったものだけ。不具合要望の自動注入はこの行を「積んだ証跡」にしており、消すと再注入が無限に繰り返される（2026-08-28 実害: `reinjectedCount` が5回まで増加）。
+- `next-session.md` を書き直すときは、本文中の `[FB:` を含む行を**必ず残す**（正規ローテーションによる退避は可。`archive/next-session-feedback.json` が再注入防止の証跡を引き継ぐ）。消してよいのは対応済みでシート側が `done` になったものだけ。不具合要望の自動注入はこの行を「積んだ証跡」にしており、消すと再注入が無限に繰り返される（2026-08-28 実害: `reinjectedCount` が5回まで増加）。
+- 過去セッション全文を積み重ねない。書き出し後に `node tools/next-session-rotate.mjs` を実行し、24,000B 以下と退避の read-back を確認する。完了・重複・30日超の項目と元の全文は `~/.claude/archive/next-session-YYYYMM.md` に保全される。容量を超える未完了項目は「継続キュー」リンクから辿れる。残TODOには原因と再開条件を1行で書き、詳細は退避先を参照する。
 - 書式（この見出し構成を変えない。`/session-start` が読む）:
 
 ```markdown
@@ -117,6 +141,28 @@ node "$HOME/orgiast-claude-rules/tools/close-session.mjs" --session <このセ�
 - 実体は削除せず move するため復元できる。
 - 積み残しは `/session-triage` で後から拾える。
 
+### 7.1 終わり方は「誰が・何を・どの順で」を3行で出す（絶対ルール）
+
+「閉じてよい」「完了です」のような**主語のない状態語で終わらせない**。許可は手順ではない。
+user には `/session-close` と `/clear` の違いも、タブを閉じる操作が要ることも見えていない。
+退避コマンドを**実行する前**に、必ず次の3行を出す（実行後では user はもう次の行動を始めている）。
+
+```
+1. 私（Claude）が close-session.mjs --session <id> を実行します（これがこのタブへの最後の送信です）
+2. <user 名>さんは、自動で開いた新しいタブで Enter を1回押してください（/session-start が入っています）
+3. 続けて、この古いタブを ✕ で閉じてください。**/clear は使わないでください**
+```
+
+- 退避前の最後の送信の末尾は「このセッション: /session-close は終わっているので、このセッションを閉じてよい」で終える。「閉じてよい」単独や「このセッション: 閉じてよい」は禁止（2026-10-01 kim 指示: /session-close をこれからするのか、済んで消してよいのか分からない）。
+
+- 最終応答の「この後の自動進行: <内容>」は台帳（`~/.claude/auto-progress-ledger.jsonl`）に記録され、1日2回の巡回で止まっていれば自動再開＋kim-inbox に記録する（ONBOARDING §1.15）。実際に自動で進まないことは書かず「なし」にする。
+- **理由を1行添える**: タブが開いている限りプロセスが会話ログを書き戻し、退避したはずのセッションが一覧に復活する（633KB 復活を実測）。だから 1→2→3 の順で、3 の後にこのタブへ話しかけない。
+- **`--no-launch`・headless・起動スキップ時は2行目を差し替える**（新タブは開かないので「開きました」と書かない）:
+  「新しいタブを開いて `/session-start` と入力してください」。起動結果は `[next-session] …` の行を読んで判定する。
+- 退避後は「完了しました」の1行以上を書かない（書き戻しで 7.1 の 3 が無効になる）。
+- 判定: **user が次の1アクションで迷ったら、この説明は失敗**とみなす
+  （正本 ONBOARDING.md §1.5「次の一手は『誰が・何を・どの順で』書く — 状態語で終わらせない」）。
+
 ## 8. 次のセッションは自動で立ち上がる（user に「新しいセッションを開いて」と言わない）
 
 - 手順7 の `close-session.mjs` が、退避したあとに `tools/next-session-launch.mjs` を呼び、
@@ -150,11 +196,24 @@ node "$HOME/orgiast-claude-rules/tools/close-session.mjs" --session <このセ�
   - 恒久的に止めるなら `~/.claude/next-session-launch.json` に `{"enabled": false}`
 - target の変更・確認は `next-session-launch.mjs --set-target <vscode|vscode-ext|terminal|inline|headless>` / `--show-target`。
   旧手順との互換用に `--set-mode` / `--show-mode` も受けるが、新しい文書では使わない。
-- 起動結果は `[next-session] VSCode に新しいタブを開きました…`（ターミナル経路なら `新しいセッションを起動しました: <cwd>`） / `[next-session] スキップ: <理由>` の1行で出る。
-  スキップされた時だけ「新しいセッションを手で開いてください」と伝える。
+- 起動結果は `[next-session] VSCode に新しいタブを開きました…`（ターミナル経路なら `新しいセッションを起動しました: <cwd>`） / `[next-session] スキップ: <理由>` で出る。
+- **`spawn cmd.exe ENOENT` は cmd.exe の問題ではない（2026-09-25 実測で確定）**。Node は
+  `options.cwd` が存在しない時も同じ ENOENT（`error.path='cmd.exe'`）を返す。素の `cmd.exe` は
+  実在 cwd で exit 0 になる。だから **まず cwd を疑い、`--cwd` が不在なら
+  `[next-session] スキップ: --cwd が指すフォルダが存在しません: <path>` が出る**（PR #553 で対応済み）。
+- 退避（下記）を実行してよいのは **cwd が実在するのに spawn が ENOENT/spawn で落ちた時だけ**。
+  cwd 不在の時に code.cmd を直叩きすると **cwd を失ったまま別フォルダでセッションが開く**二次被害になる。
+  その場合は user に手作業を頼まず、`--cwd` を正しい実在パスにして1回やり直す（`--force-launch`）。
+- cwd 実在時の退避: `[next-session] PowerShell 退避: & "…" --open-url "vscode://…"` のコマンド部分を
+  **Claude が PowerShell tool でそのまま実行**する（2026-09-17 実測 exit 0。入力欄に `/session-start` が入る）。
+  成功後は「タブが開いたので Enter 1回で始まります」とだけ伝える。
+  PowerShell tool でも失敗した時だけ、user に「新しいタブで `/session-start`」と伝える。ターミナル経路や headless では、対話セッションの Bash tool 固有制約を受けないためこの退避は不要。
 
 ## 注意
 
 - セッションファイル・Drive のファイルは絶対に削除しない（過去版が必要 / kim 厳命）。
 - memory 書き込み前に必ず既存を検索し、重複を防ぐ。
 - コスト実績を見たい時は `node ~/orgiast-claude-rules/tools/cost-work-loop.mjs`。
+
+公開鍵配布後は next-session.md.lock が併置される。
+平文が無い場合は `node tools/knowledge-lock.mjs open ~/.claude/next-session.md.lock` で読む（契約アカウントは自動、契約外は kim 承認）。

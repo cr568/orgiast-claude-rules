@@ -6,7 +6,7 @@ ONBOARDING.compressed.md §2.10 の詳細。
 
 kim@orgiast.jp / seisaku-team@orgiast.jp / 他アカウントの Claude Code で得たノウハウ・ルールを全アカウント共通で適用するための仕組み。やり取りはすべて Google Drive 上で行い、各マシンのローカルファイルはキャッシュ、GitHub repo はミラー（履歴・plugin 配布用）と位置付ける。
 
-ハブ（正本）: Drive `claude-common-rules`（作業ファイル配下、folder `1RLYbK6CKyPWRJsG6LY0WB9OzlbFYSFvw`、owner kim@orgiast.jp）
+ハブ（正本）: Drive `claude-common-rules`（kim マイドライブ直下、folder `1RLYbK6CKyPWRJsG6LY0WB9OzlbFYSFvw`、owner kim@orgiast.jp。2026-11-09 に「作業ファイル」配下から移動: 上位フォルダから継承していた個人 Gmail の編集権限を切るため。権限は orgiast.jp ドメイン共有＋owner のみ）
 
 ```
 claude-common-rules/
@@ -24,6 +24,7 @@ claude-common-rules/
 1. 下り（配布）: 各自の Claude Code で `/rules-sync`（pull）→ manifest の version をローカル版と比較 → 差分を `~/.claude/rules/`・`~/.claude/skills/`・ONBOARDING ローカルマスターに反映（反映前に `~/.claude/backups/` へバックアップ）。
 2. 上り（収集）: どのアカウントでも、全社適用すべき学び（feedback / 失敗パターン / 新ルール）が出たら `/share-knowledge` → knowledge-inbox に md 投稿（date / account / type / target の frontmatter 付き、命名 `YYYYMMDD-<account>-<slug>.md`）。
 3. 統合: kim 環境の `/rules-sync`（merge）が inbox の未処理分を列挙 → kim 承認後に正本へ反映 → manifest version+1 → GitHub `kimkon1011/orgiast-claude-rules` にミラー push。
+4. 自動同期（ミラー）: GitHub main ブランチへの変更（kim 環境の merge 反映等）は、夜間ジョブ `tools/drive-hub-mirror.mjs` が毎日自動で Drive ハブへ差分検知・衝突防止ガード付きでミラー同期します。これにより、Drive 側の更新漏れによるルール退行を防ぎます。
 
 Drive MCP の制約と、それを吸収する規約（update / delete / move ツールが存在しない）:
 

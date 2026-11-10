@@ -64,3 +64,33 @@ test('403 は例外にせず null を返す', async (t) => {
   assert.equal(result, null);
   assert.deepEqual(errors, ['discord-member-directory: メンバー検索が 403 で失敗（Bot の権限を確認）']);
 });
+
+test('persistCache=false は検索してもキャッシュを書き込まない', async (t) => {
+  const home = tempHome(t);
+  const result = await getDiscordMembers({ query: 'taro', home, persistCache: false, fetchImpl: async () => response(200, [{ user: { id: '1', username: 'taro' } }]) });
+  assert.equal(result[0].id, '1');
+  assert.equal(fs.existsSync(path.join(home, '.claude', 'orgiast-discord-members.json')), false);
+});
+
+test('カレンダーのメールと氏名からDiscordの完全一致を解決、メール断片を推測しない', async (t) => {
+  const home = tempHome(t);
+  fs.mkdirSync(path.join(home, '.claude', 'secretary-state'));
+  const file = path.join(home, '.claude', 'secretary-state', 'calendar-cache.json');
+  fs.writeFileSync(file, JSON.stringify({ calendars: { person: { id: 'different.mail@example.com', label: '山田 太郎' } } }));
+  const options = { query: 'different.mail@example.com', home, persistCache: false,
+    fetchImpl: async () => response(200, [{ user: { id: '42', username: 'unrelated' }, nick: '山田太郎' }]) };
+  assert.deepEqual(matchMember(options.query, await getDiscordMembers(options)), { id: '42', label: '山田太郎' });
+  assert.deepEqual(await getDiscordMembers({ ...options,
+    fetchImpl: async () => response(200, [{ user: { id: '42' }, nick: '山田太郎' }, { user: { id: '43' }, nick: '山田 太郎' }]) }), []);
+  assert.deepEqual(await getDiscordMembers({ ...options,
+    fetchImpl: async () => response(200, [{ user: { id: '42' }, nick: '山田太郎別人' }]) }), []);
+});
+
+test('百瀬の確認済みメール対応は氏名表記差を解決し別IDには送らない', async (t) => {
+  const options = { query: 'm.kanau@orgiast.jp', home: tempHome(t), persistCache: false };
+  const row = { user: { id: '1382566741464449124', username: 'kanaumomose', global_name: '百瀬' } };
+  assert.deepEqual(matchMember(options.query, await getDiscordMembers({ ...options,
+    fetchImpl: async () => response(200, [row]) })), { id: row.user.id, label: '百瀬' });
+  assert.deepEqual(await getDiscordMembers({ ...options,
+    fetchImpl: async () => response(200, [{ user: { ...row.user, id: '999' } }]) }), []);
+});

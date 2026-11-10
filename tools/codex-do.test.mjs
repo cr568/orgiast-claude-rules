@@ -1,26 +1,59 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { skipCoolingBackends } from './fallback-backend-health.mjs';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, shouldFlagEmptyFallbackDiff, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, isBackendExhausted, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, detectCodexAuthFailure, isCodexAuthFailure, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, backendSpecificTimeoutSecs, effectiveBackendTimeoutSecs, COOLING_PROBE_TIMEOUT_SECS, countPolicyDenials, shouldAbortPolicyStall, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, findExecutable, isBackendCliMissing, shouldAdvanceToNextBackend, isBackendExhausted, isBackendBillingFailure, isProviderBillingBlocked, validateCwd, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS, wantsEdit, buildUsageRow, remainingPrimaryBudgetSecs, parseCodexOutput } = await import('./codex-do.mjs');
+
+const runDirs = [];
+function workDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-run-'));
+  runDirs.push(dir);
+  return dir;
+}
+after(() => { for (const dir of runDirs) fs.rmSync(dir, { recursive: true, force: true }); });
+
+test('remainingPrimaryBudgetSecs は起動前経過を主経路予算から差し引き、最低 1 秒を残す', () => {
+  assert.equal(remainingPrimaryBudgetSecs(210, 16), 194);
+  assert.equal(remainingPrimaryBudgetSecs(210, 209.5), 1);
+  assert.equal(remainingPrimaryBudgetSecs(210, 240), 1);
+});
 
 function run(args, options = {}) {
+  const home = options.home ?? workDir();
   return spawnSync(process.execPath, [tool, ...args], {
     encoding: 'utf8',
-    // /mnt/c の大きい worktree では終了時の git read-back が30秒境界に触れる。
-    // 子プロセス自体のタイムアウト検証とは独立なので、test harness側には余裕を持たせる。
+    // CLI tests own their working tree; do not scan the checkout or other tests' fixtures.
+    cwd: home,
     timeout: 45000,
     env: {
       ...process.env,
-      ORGIAST_HOME: options.home ?? fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-home-')),
+      ORGIAST_HOME: home,
+      // 既存のテストは全て sol/astra 前提。probeChatGptAuth が実機の WSL/auth.json を
+      // 読みに行くと、テストを回すマシンの実際の認証状態に依存して非決定的に壊れる
+      // (2026-09-21 実測: 開発機で ChatGPT 認証が実在し auto テストが軒並み落ちた)。
+      // ChatGPT 認証時の挙動そのものを見るテストだけ options.env で明示的に上書きする。
+      CODEX_DO_AUTH_MODE: 'apikey',
+      CODEX_DO_WSL_PROBE: 'absent',
+      CODEX_DO_NATIVE_PROBE: 'present',
       ...options.env
     },
   });
+}
+
+// resolveFallbackBackends は実行ファイルの実在を PATH で確認する。gemini-cli を連鎖に
+// 残したいテストは、先頭に空の gemini を置いた PATH を渡す（実機に gemini がある/ないで
+// 期待値が変わらないようにする）。
+function geminiOnPathEnv() {
+  const dir = workDir();
+  fs.writeFileSync(path.join(dir, process.platform === 'win32' ? 'gemini.CMD' : 'gemini'), '', 'utf8');
+  const pathKey = Object.keys(process.env).find((key) => key.toUpperCase() === 'PATH') || 'PATH';
+  return { PATH: `${dir}${path.delimiter}${process.env[pathKey] || ''}` };
 }
 
 function writePrompt(body) {
@@ -28,6 +61,31 @@ function writePrompt(body) {
   fs.writeFileSync(file, body, 'utf8');
   return file;
 }
+
+test('validateCwd は存在・不存在・壊れた Windows パス・省略を判定する', () => {
+  const existing = validateCwd('/work', { resolveImpl: (value) => value, existsImpl: () => true, statImpl: () => ({ isDirectory: () => true }), platform: 'linux' });
+  assert.deepEqual(existing, { cwd: '/work', ok: true });
+
+  const missing = validateCwd('/missing', { resolveImpl: (value) => value, existsImpl: () => false, platform: 'linux' });
+  assert.deepEqual(missing, { cwd: '/missing', ok: false, reason: 'cwd_not_found' });
+
+  const mangled = validateCwd(String.raw`C:Userskimko.claudeauto-session-repo`, { resolveImpl: (value) => `resolved/${value}`, existsImpl: () => false, platform: 'win32' });
+  assert.deepEqual(mangled, { cwd: 'resolved/C:Userskimko.claudeauto-session-repo', ok: false, reason: 'cwd_mangled' });
+
+  const omitted = validateCwd(undefined, { processCwd: '/current', resolveImpl: (value) => value, existsImpl: () => true, statImpl: () => ({ isDirectory: () => true }) });
+  assert.deepEqual(omitted, { cwd: '/current', ok: true });
+});
+
+test('存在しない --cwd は起動せず status 2 で具体的な案内を出す', () => {
+  const home = workDir();
+  const missing = path.join(home, 'missing');
+  const result = run(['--dry-run', '--cwd', missing, '実装する'], { home });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /cwd_not_found/);
+  assert.match(result.stderr, /--cwd のディレクトリが存在しません/);
+  assert.doesNotMatch(result.stdout, /executor=codex/);
+  assert.equal(fs.existsSync(path.join(home, '.claude', 'executor-usage.jsonl')), false);
+});
 
 test('即時の出力ゼロ失敗を1回だけ再試行し、成功と試行回数を台帳に記録する', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-fastfail-'));
@@ -44,7 +102,8 @@ test('即時の出力ゼロ失敗を1回だけ再試行し、成功と試行回�
   const rows = fs.readFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].attempts, 2);
-  assert.equal(rows[0].status, 0);
+  assert.equal(rows[0].status, 'ok');
+  assert.equal(rows[0].exitCode, 0);
 });
 
 test('--prompt-file の中身をそのまま指示として使う', () => {
@@ -58,6 +117,14 @@ test('--prompt-file に完了条件が無ければ警告するがブロックし
   const result = run(['--dry-run', '--prompt-file', writePrompt('# 指示\n新規ファイルを作る\n')]);
   assert.equal(result.status, 0);
   assert.match(result.stderr, /\[codex-do\] 警告: 指示ファイルに完了条件がありません/);
+});
+
+test('Codex/cheap-code に渡す prompt の先頭に全プロジェクト共通の禁止事項が常に入る', () => {
+  const result = run(['--dry-run', 'ツールを実装する']);
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /## 全プロジェクト共通の禁止事項/);
+  assert.match(result.stdout, /claude-\* モデル/);
+  assert.ok(result.stdout.indexOf('## 全プロジェクト共通の禁止事項') < result.stdout.indexOf('ツールを実装する'));
 });
 
 test('バッククォート・$()・改行を含む指示が欠落せず原文のまま届く', () => {
@@ -90,18 +157,220 @@ test('--timeout が数値でなければ実行しない', () => {
 });
 
 test('--timeout と --cwd を付けても指示文が引数として食われない', () => {
-  const result = run(['--dry-run', '--timeout', '60', '--cwd', os.tmpdir(), 'これは指示文です']);
+  const result = run(['--dry-run', '--timeout', '60', '--cwd', workDir(), 'これは指示文です']);
   assert.equal(result.status, 0);
   assert.match(result.stdout, /これは指示文です/);
   assert.doesNotMatch(result.stdout, /--timeout|--cwd|60/);
 });
 
 test('fallbackBackendTimeoutSecs は全体枠・既定値・環境変数・下限を反映する', () => {
-  assert.equal(fallbackBackendTimeoutSecs(1800, {}), 600);
+  // 既定は 900 秒（2026-10-15: 600 では全体枠に余裕があっても打ち切って時間を捨てていた）
+  assert.equal(fallbackBackendTimeoutSecs(1800, {}), 900);
+  // 全体枠が既定より小さいときは全体枠が上限になる（総予算は超えない）
+  assert.equal(fallbackBackendTimeoutSecs(600, {}), 600);
   assert.equal(fallbackBackendTimeoutSecs(300, {}), 300);
   assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 900);
-  assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: 'garbage' }), 600);
+  assert.equal(fallbackBackendTimeoutSecs(1800, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: 'garbage' }), 900);
   assert.equal(fallbackBackendTimeoutSecs(10, {}), 60);
+});
+
+test('chainBackendBudgetSecs は連鎖の残り予算を超えない（全体枠を使い切ったら0で打ち切る）', () => {
+  // 1本目が未消費: これまでどおり1バックエンド上限(既定900)が効く
+  assert.equal(chainBackendBudgetSecs(1800, 0, {}), 900);
+  // 全体枠600を1本目で使い切った: 2本目に渡す予算は無い（従来は最大1200秒を消費していた）
+  assert.equal(chainBackendBudgetSecs(600, 600.047, {}), 0);
+  assert.equal(chainBackendBudgetSecs(600, 601, {}), 0);
+  // 全体枠1800のうち600秒消費: 残り1200だが1バックエンド上限900が効く
+  assert.equal(chainBackendBudgetSecs(1800, 600, {}), 900);
+  // 残りが上限より小さいときは残りが上限になる
+  assert.equal(chainBackendBudgetSecs(1800, 1650, {}), 150);
+  // 残りが下限(60)未満でも残りを返し、0 以下は 0（呼び出し側が打ち切る）
+  assert.equal(chainBackendBudgetSecs(1800, 1790, {}), 10);
+  assert.equal(chainBackendBudgetSecs(1800, 1800, {}), 0);
+  assert.equal(chainBackendBudgetSecs(1800, 1801, {}), 0);
+  // 環境変数の上限は残り予算にも反映される
+  assert.equal(chainBackendBudgetSecs(1800, 0, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 900);
+  assert.equal(chainBackendBudgetSecs(1800, 1500, { CODEX_DO_FALLBACK_BACKEND_TIMEOUT_SECS: '900' }), 300);
+});
+
+test('backendSpecificTimeoutSecs は gemini-cli に既定200秒・cheap-code:deepseek に既定400秒と正の上書きを適用する', () => {
+  // 2026-11-09 実測: 3623件の成功の p99=241秒。200秒に設定して廃棄を削減。
+  assert.equal(backendSpecificTimeoutSecs('gemini-cli', {}), 200);
+  assert.equal(backendSpecificTimeoutSecs('gemini-cli', { CODEX_DO_GEMINI_TIMEOUT_SECS: '450' }), 450);
+  assert.equal(backendSpecificTimeoutSecs('gemini-cli', { CODEX_DO_GEMINI_TIMEOUT_SECS: 'garbage' }), 200);
+  assert.equal(backendSpecificTimeoutSecs('gemini-cli', { CODEX_DO_GEMINI_TIMEOUT_SECS: '0' }), 200);
+  // 2026-11-11 再調整: chain 実測（223試行中成功46/p95=524秒）で 400 秒に引き下げ
+  assert.equal(backendSpecificTimeoutSecs('cheap-code:deepseek', {}), 400);
+  assert.equal(backendSpecificTimeoutSecs('cheap-code:deepseek', { CODEX_DO_DEEPSEEK_TIMEOUT_SECS: '450' }), 450);
+  assert.equal(backendSpecificTimeoutSecs('cheap-code:deepseek', { CODEX_DO_DEEPSEEK_TIMEOUT_SECS: 'garbage' }), 400);
+  assert.equal(backendSpecificTimeoutSecs('cheap-code:deepseek', { CODEX_DO_DEEPSEEK_TIMEOUT_SECS: '0' }), 400);
+  // qwen 直結の deepseek は同じ upstream なので同一扱い
+  assert.equal(backendSpecificTimeoutSecs('deepseek', {}), 400);
+  // 対象外のバックエンドは「バックエンド固有の頭打ちなし」＝null のまま
+  assert.equal(backendSpecificTimeoutSecs('cheap-code:glm', {}), null);
+  assert.equal(backendSpecificTimeoutSecs('qwen', {}), null);
+  assert.equal(backendSpecificTimeoutSecs('openrouter-free', {}), null);
+});
+
+// 2026-11-02 実測（delegation-health:fallback_chain_timeout 6件 / 捨てた秒数 合計3607秒）:
+// 全バックエンドが冷却中だと keepAtLeastOne で元の配列が丸ごと戻り、gemini-cli 300秒 +
+// cheap-code:deepseek 600秒 を同じだけ再試行して 900 秒を毎回捨てていた（10:00/10:03/10:05 の
+// 3連続 timeout と 12:23 の 900 秒全捨て）。末尾以外は探り予算で復帰を確認する。
+test('effectiveBackendTimeoutSecs は冷却中の backend を探り予算まで縮め、通常時は従来どおりの上限を返す', () => {
+  // 通常時: backend 固有の上限がそのまま効く
+  assert.equal(effectiveBackendTimeoutSecs('gemini-cli', { chainBudget: 720, cooling: false }), 200);
+  assert.equal(effectiveBackendTimeoutSecs('cheap-code:deepseek', { chainBudget: 720, cooling: false }), 400);
+  // 冷却中: 探り予算(120秒)まで縮む＝同じ停滞を繰り返しても捨てる秒数が 3〜5 分の1になる
+  assert.equal(effectiveBackendTimeoutSecs('gemini-cli', { chainBudget: 720, cooling: true }), COOLING_PROBE_TIMEOUT_SECS);
+  assert.equal(effectiveBackendTimeoutSecs('cheap-code:deepseek', { chainBudget: 720, cooling: true }), COOLING_PROBE_TIMEOUT_SECS);
+  // 固有上限を持たない backend も冷却中は探り予算、通常時は連鎖の残り予算
+  assert.equal(effectiveBackendTimeoutSecs('openrouter-free', { chainBudget: 720, cooling: false }), 720);
+  assert.equal(effectiveBackendTimeoutSecs('openrouter-free', { chainBudget: 40, cooling: false }), 40);
+  // 連鎖の残り予算が探り予算より小さいときは残り予算が優先（総予算を超えない）
+  assert.equal(effectiveBackendTimeoutSecs('gemini-cli', { chainBudget: 90, cooling: true }), 90);
+  // 環境変数の上書きも通常時は効く
+  assert.equal(effectiveBackendTimeoutSecs('gemini-cli', { chainBudget: 720, cooling: false, env: { CODEX_DO_GEMINI_TIMEOUT_SECS: '450' } }), 450);
+});
+
+test('全冷却の3 backend は先頭2件が120秒、末尾は通常上限になる', () => {
+  const candidates = ['openrouter-free', 'gemini-cli', 'cheap-code:deepseek'].map((name) => ({ name }));
+  const cooling = new Set(candidates.map(({ name }) => name));
+  const backends = skipCoolingBackends(candidates, cooling);
+  const budgets = backends.map((backend, index) => effectiveBackendTimeoutSecs(backend.name, {
+    chainBudget: chainBackendBudgetSecs(1800, index * 120, {}),
+    cooling: cooling.has(backend.name),
+    env: {},
+    isLastBackend: index === backends.length - 1,
+  }));
+  assert.deepEqual(budgets, [120, 120, 400]);
+});
+
+test('冷却なしの3 backend は末尾指定にかかわらず通常上限になる', () => {
+  const candidates = ['openrouter-free', 'gemini-cli', 'cheap-code:deepseek'].map((name) => ({ name }));
+  const cooling = new Set();
+  const backends = skipCoolingBackends(candidates, cooling);
+  const budgets = backends.map((backend, index) => effectiveBackendTimeoutSecs(backend.name, {
+    chainBudget: 720,
+    cooling: cooling.has(backend.name),
+    env: {},
+    isLastBackend: index === backends.length - 1,
+  }));
+  assert.deepEqual(budgets, [720, 200, 400]);
+});
+
+test('全冷却で1 backend だけなら通常上限・環境変数・残り予算を適用する', () => {
+  const cooling = new Set(['gemini-cli']);
+  const backends = skipCoolingBackends([{ name: 'gemini-cli' }], cooling);
+  const budgets = backends.map((backend, index) => effectiveBackendTimeoutSecs(backend.name, {
+    chainBudget: 720,
+    cooling: cooling.has(backend.name),
+    env: {},
+    isLastBackend: index === backends.length - 1,
+  }));
+  assert.deepEqual(budgets, [200]);
+  assert.equal(effectiveBackendTimeoutSecs('gemini-cli', {
+    chainBudget: 720, cooling: true, env: { CODEX_DO_GEMINI_TIMEOUT_SECS: '450' }, isLastBackend: true,
+  }), 450);
+  for (const chainBudget of [200, 40, 0]) {
+    assert.equal(effectiveBackendTimeoutSecs('gemini-cli', {
+      chainBudget, cooling: true, env: {}, isLastBackend: true,
+    }), chainBudget);
+  }
+  assert.equal(effectiveBackendTimeoutSecs('openrouter-free', {
+    chainBudget: 720, cooling: true, env: {}, isLastBackend: true,
+  }), 720);
+});
+
+// 実測シナリオ（2026-11-04）: cheap-code:deepseek と gemini-cli の chain-timeout が3件発生。
+// 2026-11-09 実測の gemini p99=241s に基づき、既定を200秒に短縮して廃棄を削減。
+test('実測シナリオ: cheap-code:deepseek と gemini-cli の連鎖を400秒・200秒で頭打ちにする', () => {
+  const chainBudget = () => chainBackendBudgetSecs(1800, 0, {});
+  const geminiTimeout = Math.min(chainBudget(), backendSpecificTimeoutSecs('gemini-cli', {}));
+  const deepseekTimeout = Math.min(chainBudget(), backendSpecificTimeoutSecs('cheap-code:deepseek', {}));
+  assert.equal(geminiTimeout, 200);
+  assert.equal(deepseekTimeout, 400);
+  // 従来（deepseek が null → 既定900秒）と比べて頭打ちが短くなっていることを示す
+  assert.ok(backendSpecificTimeoutSecs('cheap-code:deepseek', {}) < fallbackBackendTimeoutSecs(1800, {}));
+  // 環境変数で 450 秒へ短縮もできる（0 出力停滞は待たずに切る運用例）
+  assert.equal(backendSpecificTimeoutSecs('cheap-code:deepseek', { CODEX_DO_DEEPSEEK_TIMEOUT_SECS: '450' }), 450);
+});
+
+test('countPolicyDenials は大文字小文字を区別せず拒否回数を数える', () => {
+  assert.equal(countPolicyDenials('通常のエラー'), 0);
+  assert.equal(countPolicyDenials('Tool execution denied by policy.\ntool execution denied by policy'), 2);
+  assert.equal(countPolicyDenials('TOOL EXECUTION DENIED BY POLICY'), 1);
+});
+
+// 実測（2026-10-27T14:11Z / 10-28T03:11Z / 10-28T10:12Z）: gemini-cli が 600 秒 out0 で timeout したが、
+// stderr は別文言の読み取り拒否で policyDenials=0 のため停滞打ち切りが働かなかった。
+test('countPolicyDenials は gemini-cli のワークスペース外・ignore 拒否も数え、停滞打ち切りに繋がる', () => {
+  const outside = 'Path "C:\\x\\a.json" resolves outside the allowed workspace directories: C:\\repo or the project temp directory: C:\\t\n';
+  const ignored = 'File path is ignored by configured ignore patterns.\n';
+  assert.equal(countPolicyDenials(outside + ignored + outside), 3);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 600, outputChars: 0, stderr: outside + ignored + outside }), true);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 600, outputChars: 1726, stderr: outside + ignored + outside }), false, '出力が出ている run は切らない');
+});
+
+test('shouldAbortPolicyStall は長時間・低出力・拒否3回が揃ったときだけ中断する', () => {
+  const denied3 = 'tool execution denied by policy\n'.repeat(3);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 900, outputChars: 164, stderr: denied3 }), true);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 452, outputChars: 4048, stderr: denied3 }), false);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 299, outputChars: 164, stderr: denied3 }), false);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 900, outputChars: 400, stderr: denied3 }), false);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 900, outputChars: 164, stderr: denied3.replace(/[^\n]+\n$/, '') }), false);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: '900', outputChars: 164, stderr: denied3 }), false);
+  assert.equal(shouldAbortPolicyStall({ elapsedSecs: 900, outputChars: NaN, stderr: denied3 }), false);
+});
+
+// 実測（2026-10-12〜10-14 の executor-usage.jsonl）: fallback 行が毎回 secs≈600.05 で
+// cheap-code:deepseek を打ち切っていた（chain の1本目が必ず600秒）。同時期の成功runは
+// 507/517/524/576 秒に分布＝600 の直下で切られていた。--timeout 900 のセッションが最も多く
+// （transcripts 実測 18回）、そこで既定600が上限になっていたのが時間を捨てていた原因。
+test('実測シナリオ: --timeout 900 の連鎖は1本600秒で打ち切られない', () => {
+  assert.equal(fallbackBackendTimeoutSecs(900, {}), 900);
+  // 1本目が全体枠を使い切ったら2本目は実行しない（600+600=1200 を捨てない）
+  assert.equal(chainBackendBudgetSecs(900, 900.05, {}), 0);
+  // 1本目が短く終われば残り(900-120=780)が2本目に渡る
+  assert.equal(chainBackendBudgetSecs(900, 120, {}), 780);
+});
+
+// delegation-health:fallback_chain_timeout 再発防止（2026-10-28起票、10-29 reorder・10-30/11-06/11-09 timeout短縮）
+// gemini-cli が既定順の最後にあっても到達時は backendSpecificTimeoutSecs(200) で廃棄を制限される。
+test('gemini-cli が連鎖の最後でタイムアウトしても廃棄は backendSpecificTimeoutSecs(200) に制限される', () => {
+  // gemini-cli が単独で全予算を使えるときも 200 秒で頭打ち
+  const chainBudgetFull = chainBackendBudgetSecs(1800, 0, {});
+  assert.equal(Math.min(chainBudgetFull, backendSpecificTimeoutSecs('gemini-cli', {}) ?? Infinity), 200);
+  // 残り予算が 200 未満ならそちらを優先（予算超過しない）
+  assert.equal(Math.min(chainBackendBudgetSecs(1800, 1600, {}), 200), 200);
+  // 残り0なら打ち切り（gemini-cli は試行されない）
+  assert.equal(Math.min(chainBackendBudgetSecs(1800, 1800, {}), 200), 0);
+  // 環境変数で gemini タイムアウトを個別短縮できる
+  const short = backendSpecificTimeoutSecs('gemini-cli', { CODEX_DO_GEMINI_TIMEOUT_SECS: '180' });
+  assert.equal(short, 180);
+  // 既定 200 秒が既定 chainBudget 内で効くことの確認
+  assert.equal(effectiveBackendTimeoutSecs('gemini-cli', { chainBudget: 1800, cooling: false }), 200);
+  // 既定順（cheap-code:deepseek → cheap-code:glm → gemini-cli）の確認
+  // gemini-cli は最終手段なので遅延を生むとしても被害が最小
+});
+
+test('deepseek と gemini-cli が両方 timeout しても既定の最大廃棄は600秒に収まる', () => {
+  const chainBudget = chainBackendBudgetSecs(1800, 0, {});
+  const wastedSecs = ['cheap-code:deepseek', 'gemini-cli']
+    .map((backend) => Math.min(chainBudget, backendSpecificTimeoutSecs(backend, {}) ?? Infinity))
+    .reduce((sum, seconds) => sum + seconds, 0);
+  assert.equal(wastedSecs, 600);
+  assert.ok(wastedSecs < 900);
+});
+
+// delegation-health:fallback_chain_timeout の再発防止（2026-11-07 起票）。
+// 実測 3件/621秒 の廃棄が、gemini 200s + deepseek 400s の上限で
+// 3件の timeout でも 3 × min(200, chainBudget) に抑えられることを確認する。
+test('3件の chain timeout でも gemini の timeout 廃棄は 200 秒/件に制限される', () => {
+  const chainBudget = chainBackendBudgetSecs(1800, 0, {});
+  const geminiPerTimeout = Math.min(chainBudget, backendSpecificTimeoutSecs('gemini-cli', {}) ?? Infinity);
+  assert.equal(geminiPerTimeout, 200);
+  // 3件の gemini timeout で 600 秒、旧 250 秒時代の 750 秒より 150 秒少ない
+  assert.ok(geminiPerTimeout * 3 < 750);
 });
 
 test('指示が空なら使い方を出して終了する', () => {
@@ -149,6 +418,42 @@ test('detectQuotaLimit: 通常のエラー出力やテスト失敗では検出�
 test('detectQuotaLimit: exit 0 の stdout でも Codex の上限エラー行を検出する', () => {
   const stdout = "work completed\nERROR: You've hit your usage limit. Try again at Sep 9th 10:08 AM";
   assert.equal(detectQuotaLimit(stdout, '', 0).matched, true);
+});
+
+// 2026-10-10 18:23 JST に実際に出た行(U+2019・Upgrade to Pro のURL2本・AM/PM 付き再開時刻)。
+// この検出は本物だった(同じ秒の codex rollout に "codex_error_info":"usage_limit_exceeded")ので、
+// 「偽陽性」として緩めない。誤っていたのは実測値の側(delegation-health-check の primary 読み)。
+test('detectQuotaLimit: 実機の usage limit 行(U+2019/URL/AM PM)を検出する', () => {
+  const real = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Oct 14th, 2026 9:53 PM.';
+  const check = detectQuotaLimit('', real, 1, 'do something');
+  assert.equal(check.matched, true);
+  assert.equal(check.pattern, "You've hit your usage limit");
+  // executor-usage.jsonl は stderr の末尾200字しか残さないため、先頭が切れた断片は検出できない。
+  // 台帳の stderrTail だけを見て「検出漏れ」と誤診しないための記録。
+  assert.equal(detectQuotaLimit('', `M. ${real}`, 1, '').matched, false);
+});
+
+// 2026-11-06〜07 に実測した ChatGPT Plus(cr@orgiast.jp) の月次上限到達メッセージ。
+// 月次リセット日(Nov 11)が明示されている。この検出により codex の全滅判定が混在
+// (timeout + usage_limit → lane_outage_unrepaired)になるのを防ぐ。
+test('detectQuotaLimit: 2026-11-06 実測の月次上限メッセージ（Nov 11 リセット）を検出する', () => {
+  const actualStderr = "ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 11th, 2026 5:00 PM.";
+  assert.equal(detectQuotaLimit('', actualStderr, 1, 'do something').matched, true);
+  // stderrTail（末尾200字）でも検出できることを確認（台帳の記録形式）
+  const tail200 = actualStderr.slice(-200);
+  assert.equal(detectQuotaLimit('', tail200, 1, '').matched, true);
+  // 行頭欠落した断片（M. が付く）は先頭のプレフィックス一致が必要なパターンには一致しない
+  //（既存 line 433 と同様の挙動: 末尾200字の先頭"mit."からは pattern が起動しない）
+  assert.equal(detectQuotaLimit('', `M. ${tail200}`, 1, '').matched, false);
+});
+
+// 2026-10-20 19:15Z の実測メッセージ全文。この検出自体は正しく（同セッションの rate_limits は
+// "primary":null / credits 0）、偽陽性だったのは再開時刻のパースと delegation-health の突き合わせ。
+test('detectQuotaLimit: 2026-10-20 実測の日付なし再開時刻を含む全文を検出する', () => {
+  const message = "ERROR: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at 8:20 AM.";
+  const check = detectQuotaLimit('', message, 1, 'do something');
+  assert.equal(check.matched, true);
+  assert.equal(check.pattern, "You've hit your usage limit");
 });
 
 test('detectQuotaLimit: テストランナー、コード、行番号の疑似一致を除外する', () => {
@@ -226,6 +531,63 @@ test('fallback の読み取り専用指示なら空 diff でも失敗扱いに�
   }), false);
 });
 
+test('shouldFlagEmptyFallbackDiff returns false when treeChanged is true', () => {
+  assert.equal(shouldFlagEmptyFallbackDiff({
+    executorName: 'fallback',
+    wantedEdit: true,
+    timedOut: false,
+    diffText: '',
+    treeChanged: true,
+  }), false);
+});
+
+// 2026-10-19 実測: fallback の「直近3件すべて失敗」のうち2件は kind:verify だった。
+// 「〜を修正したか検証して」を implement と誤認して wantedEdit=true にし、空diff→astra昇格→
+// gemini fallback まで走らせて error として台帳に残していた。読み取り専用の kind は編集を要求しない。
+test('wantsEdit は kind=implement のときだけ真になる', () => {
+  assert.equal(wantsEdit('implement', 'この不具合を修正してください'), true);
+  assert.equal(wantsEdit('verify', 'この不具合を修正したか検証してください'), false);
+  assert.equal(wantsEdit('investigate', '修正箇所を調べて'), false);
+  assert.equal(wantsEdit('classify', 'この修正依頼を分類して'), false);
+  assert.equal(wantsEdit('summarize', '修正内容を要約して'), false);
+  assert.equal(wantsEdit('implement', 'この不具合を修正してください', true), false);
+  assert.equal(wantsEdit('implement', '一覧を出して'), false);
+});
+
+test('snapshotWorkingTree non-git directory: snapshot changes when file is added', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-nongit-'));
+  try {
+    const snap1 = snapshotWorkingTree(tempDir);
+    
+    // Add a file
+    const testFile = path.join(tempDir, 'test_file.txt');
+    fs.writeFileSync(testFile, 'hello', 'utf8');
+    
+    const snap2 = snapshotWorkingTree(tempDir);
+    assert.notEqual(snap1, snap2);
+  } finally {
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
+test('snapshotWorkingTree non-git directory: snapshot is identical when nothing changes', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-nongit-same-'));
+  try {
+    const testFile = path.join(tempDir, 'test_file.txt');
+    fs.writeFileSync(testFile, 'hello', 'utf8');
+
+    const snap1 = snapshotWorkingTree(tempDir);
+    const snap2 = snapshotWorkingTree(tempDir);
+    assert.equal(snap1, snap2);
+  } finally {
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
 test('--no-fallback が指定されても指示文が引数として食われず、正しく除外される', () => {
   const result = run(['--dry-run', '--no-fallback', 'これは指示文です']);
   assert.equal(result.status, 0);
@@ -237,7 +599,10 @@ test('枠切れ発生時に --no-fallback を指定した場合はフォール�
   const mockResults = [
     { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: "" }
   ];
-  const result = run(['--no-fallback', '指示内容'], {
+  // --force-native: このテストは「枠切れ→フォールバック」の経路だけを見る。WSL の有無で
+  // 分岐が変わると Windows 実機で必ず落ちるため、codex 実行経路を固定する。
+  // Mock-only quota test: avoid scanning the developer's large real worktree.
+  const result = run(['--force-native', '--cwd', workDir(), '--no-fallback', '指示内容'], {
     env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults) }
   });
   // フォールバックしないため非ゼロ終了
@@ -247,35 +612,220 @@ test('枠切れ発生時に --no-fallback を指定した場合はフォール�
   assert.match(result.stdout, /executor=codex/);
 });
 
+test('detectCodexAuthFailure は 401 / 未ログインを検知し、指示文に含まれる文言は無視する', () => {
+  assert.equal(detectCodexAuthFailure('', 'error: 401 Unauthorized'), true);
+  assert.equal(detectCodexAuthFailure('', 'Error: Missing bearer or basic authentication in header'), true);
+  assert.equal(detectCodexAuthFailure('Not logged in. Run `codex login` to authenticate.', ''), true);
+  assert.equal(detectCodexAuthFailure('', 'invalid_api_key'), true);
+  assert.equal(detectCodexAuthFailure('all good', ''), false);
+  // 指示文に同じ文言が入っているだけのときは認証失敗とみなさない。
+  assert.equal(detectCodexAuthFailure('error: 401 Unauthorized', '', '401 Unauthorized の扱いを直して'), false);
+});
+
+test('isCodexAuthFailure は失敗終了した Codex の認証エラーだけを検知する', () => {
+  assert.equal(isCodexAuthFailure({ status: 0, output: 'error: 401 Unauthorized' }), false);
+  assert.equal(isCodexAuthFailure({ status: 1, output: 'error: 401 Unauthorized' }), true);
+  assert.equal(isCodexAuthFailure({ status: 'error', stderr: 'error: 401 Unauthorized' }), true);
+  assert.equal(isCodexAuthFailure({ status: 1, timedOut: true, stderr: 'error: 401 Unauthorized' }), false);
+  assert.equal(isCodexAuthFailure({ status: 1, output: 'error: 401 Unauthorized' }, '401 Unauthorized の扱いを直して'), false);
+  assert.equal(isCodexAuthFailure(undefined), false);
+});
+
+test('Codex が認証失敗(401)したら再試行せず代替バックエンドへ回す', () => {
+  const mockResults = [
+    { status: 1, output: '', stderr: '401 Unauthorized: Missing bearer or basic authentication' },
+    { status: 0, output: 'Qwen Code CLI has successfully edited files.', stderr: '' },
+  ];
+  const result = run(['--force-native', '--cwd', workDir(), '指示内容'], {
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults), GEMINI_API_KEY: '', OPENROUTER_API_KEY: 'sk-test' },
+  });
+  assert.equal(result.status, 0);
+  assert.match(result.stderr, /Codex の認証に失敗しました/);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
+  assert.match(result.stdout, /Codex 未ログイン\(認証失敗\)/);
+});
+
 test('枠切れ発生時にフォールバックが成功した場合は 0 で終了しヘッダ・フッタを出力する', () => {
   const mockResults = [
     { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: "" },
     { status: 0, output: "Qwen Code CLI has successfully edited files.", stderr: "" }
   ];
-  const result = run(['指示内容'], {
-    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults), GEMINI_API_KEY: '', DEEPSEEK_API_KEY: 'sk-test' }
+  // Mock-only quota test: avoid scanning the developer's large real worktree.
+  const result = run(['--force-native', '--cwd', workDir(), '指示内容'], {
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults), GEMINI_API_KEY: '', OPENROUTER_API_KEY: 'sk-test' }
   });
   assert.equal(result.status, 0);
-  assert.match(result.stdout, /executor=fallback:deepseek/);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
   assert.match(result.stderr, /Falling back to an agentic CLI/);
 });
 
-test('第1フォールバックがタイムアウトしたら第2バックエンドへ進み成功する', () => {
+test('第1フォールバック(cheap-code:deepseek)がタイムアウトしたら次のバックエンドへ進み成功する', () => {
+  // 2026-10-29 の既定順入れ替え（deepseek → glm → gemini）後は、deepseek がタイムアウトすると
+  // 次は gemini-cli が試される（ZAI キー無しの環境では cheap-code:glm は候補から外れる）。
   const mockResults = [
     { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: '' },
     { status: 124, output: '', stderr: '', timedOut: true },
     { status: 0, output: 'Qwen Code CLI has successfully completed.', stderr: '' }
   ];
-  const result = run(['指示内容'], {
+  // Mock-only quota test: avoid scanning the developer's large real worktree.
+  const result = run(['--force-native', '--cwd', workDir(), '指示内容'], {
     env: {
+      ...geminiOnPathEnv(),
       CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults),
       GEMINI_API_KEY: 'gemini-test',
-      DEEPSEEK_API_KEY: 'deepseek-test'
+      OPENROUTER_API_KEY: 'deepseek-test'
     }
   });
   assert.equal(result.status, 0);
-  assert.match(result.stdout, /executor=fallback:deepseek/);
+  assert.match(result.stdout, /executor=fallback:gemini-cli/);
   assert.match(result.stderr, /タイムアウトしたため次のバックエンドへ/);
+});
+
+// 2026-10-17〜18 に fallback が 3 件連続で全滅した実障害の再発防止:
+// 先頭バックエンドの CLI が存在せず cmd.exe が「コマンドが見つからない」で exit 1 しても、
+// 次のバックエンドへ進んで成功すること。
+test('フォールバック先の CLI が無い(コマンドが見つからない)場合は次のバックエンドへ進む', () => {
+  const mockResults = [
+    { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: '' },
+    { status: 1, output: '', stderr: "'gemini' は、内部コマンドまたは外部コマンド、 操作可能なプログラムまたはバッチ ファイルとして認識されていません。" },
+    { status: 0, output: 'DeepSeek edited the files.', stderr: '' }
+  ];
+  // 2026-10-29 以降の既定順は deepseek 先頭だが、この再発防止テストは「先頭バックエンドの CLI 不在」
+  // の実障害（gemini の CLI が無く cmd.exe が「コマンドが見つからない」で exit 1）を固定するため、
+  // codex-fallback-order.json で gemini を先頭に固定して再現する。
+  const home = workDir();
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'codex-fallback-order.json'), JSON.stringify(['gemini-cli', 'cheap-code:deepseek']), 'utf8');
+  const result = run(['--force-native', '--cwd', workDir(), '指示内容'], {
+    home,
+    env: {
+      ...geminiOnPathEnv(),
+      CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults),
+      GEMINI_API_KEY: 'gemini-test',
+      OPENROUTER_API_KEY: 'deepseek-test'
+    }
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
+  assert.match(result.stderr, /CLI が見つからないため次のバックエンドへ/);
+});
+
+test('gemini-cli が HTTP 402 を返したら記録して OpenRouter の次候補へ進む', () => {
+  const home = workDir();
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'codex-fallback-order.json'), JSON.stringify(['gemini-cli', 'cheap-code:deepseek']));
+  const result = run(['--force-native', '--cwd', home, '指示内容'], {
+    home,
+    env: {
+      ...geminiOnPathEnv(),
+      CODEX_DO_MOCK_RESULTS: JSON.stringify([
+        { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: '' },
+        { status: 1, output: '', stderr: 'HTTP 402: Your prepayment credits are depleted' },
+        { status: 0, output: 'OpenRouter backend completed.', stderr: '' }
+      ]),
+      GEMINI_API_KEY: 'gemini-test',
+      OPENROUTER_API_KEY: 'openrouter-test'
+    }
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /fallback backend=gemini-cli/);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
+  assert.equal(isProviderBillingBlocked(home, 'gemini'), true);
+});
+
+test('フォールバック連鎖の各試行が台帳1行の chain に残る', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-chain-a-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const mockResults = [
+    { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: '' },
+    { status: 1, output: '', stderr: 'rate limit' },
+    { status: 124, output: '', stderr: '', timedOut: true },
+    { status: 0, output: 'Qwen Code CLI has successfully completed.', stderr: '' }
+  ];
+  const result = run(['--force-native', '--cwd', home, '指示内容'], {
+    home,
+    env: {
+      ...geminiOnPathEnv(),
+      CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults),
+      GEMINI_API_KEY: 'gemini-test',
+      OPENROUTER_API_KEY: 'deepseek-test',
+      ZAI_API_KEY: 'zai-test'
+    }
+  });
+  assert.equal(result.status, 0);
+
+  const ledgerFile = path.join(home, '.claude', 'executor-usage.jsonl');
+  const rows = fs.readFileSync(ledgerFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const fallbackRows = rows.filter(r => r.provider === 'fallback');
+
+  assert.equal(fallbackRows.length, 1);
+  const row = fallbackRows[0];
+  assert.ok(row.chain);
+  assert.equal(row.chain.length, 3);
+
+  assert.equal(row.chain[0].outcome, 'exhausted');
+  assert.equal(row.chain[1].outcome, 'timeout');
+  assert.equal(row.chain[1].timedOut, true);
+  assert.equal(row.chain[2].outcome, 'ok');
+  assert.equal(row.chain[2].status, 0);
+
+  for (const item of row.chain) {
+    assert.equal(typeof item.backend, 'string');
+    assert.equal(typeof item.model, 'string');
+    assert.equal(typeof item.secs, 'number');
+    assert.equal(typeof item.stderrTail, 'string');
+  }
+
+  assert.equal(row.attempts, 1);
+});
+
+test('単一バックエンドで成功した場合 chain は1要素', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-chain-b-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const mockResults = [
+    { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: '' },
+    { status: 0, output: 'done', stderr: '' }
+  ];
+  const result = run(['--force-native', '--cwd', home, '指示内容'], {
+    home,
+    env: {
+      CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults),
+      GEMINI_API_KEY: '',
+      OPENROUTER_API_KEY: 'sk-test'
+    }
+  });
+  assert.equal(result.status, 0);
+
+  const ledgerFile = path.join(home, '.claude', 'executor-usage.jsonl');
+  const rows = fs.readFileSync(ledgerFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const fallbackRows = rows.filter(r => r.provider === 'fallback');
+
+  assert.equal(fallbackRows.length, 1);
+  const row = fallbackRows[0];
+  assert.ok(row.chain);
+  assert.equal(row.chain.length, 1);
+  assert.equal(row.chain[0].outcome, 'ok');
+});
+
+test('codex 行には chain キーが付かない', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-chain-c-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const result = run(['--force-native', '--cwd', home, '--model', 'sol', '説明して'], {
+    home,
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([
+      { status: 1, output: '', stderr: 'failed to lookup address information' },
+      { status: 0, output: 'done', stderr: '' },
+    ]) },
+  });
+  assert.equal(result.status, 0);
+
+  const ledgerFile = path.join(home, '.claude', 'executor-usage.jsonl');
+  const rows = fs.readFileSync(ledgerFile, 'utf8').trim().split('\n').map(JSON.parse);
+  const codexRows = rows.filter(r => r.provider === 'codex');
+
+  assert.equal(codexRows.length, 1);
+  const row = codexRows[0];
+  assert.equal('chain' in row, false);
 });
 
 test('Codex もフォールバック(Qwen Code) も失敗した場合は非ゼロで終了する', () => {
@@ -283,37 +833,41 @@ test('Codex もフォールバック(Qwen Code) も失敗した場合は非ゼ�
     { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: "" },
     { status: 12, output: "", stderr: "Qwen Code execution error" }
   ];
-  const result = run(['指示内容'], {
-    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults), GEMINI_API_KEY: '', DEEPSEEK_API_KEY: 'sk-test' }
+  // Mock-only quota test: avoid scanning the developer's large real worktree.
+  const result = run(['--force-native', '--cwd', workDir(), '指示内容'], {
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults), GEMINI_API_KEY: '', OPENROUTER_API_KEY: 'sk-test' }
   });
   assert.equal(result.status, 12);
-  assert.match(result.stdout, /executor=fallback:deepseek/);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
 });
 
-test('枠切れ発生時に DEEPSEEK_API_KEY が無ければフォールバックせず非ゼロで終了する', () => {
+test('枠切れ発生時に OPENROUTER_API_KEY が無ければフォールバックせず非ゼロで終了する', () => {
   const mockResults = [
     { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: "" }
   ];
-  const prev = process.env.DEEPSEEK_API_KEY;
-  delete process.env.DEEPSEEK_API_KEY;
+  const prev = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
   try {
-    const result = run(['指示内容'], {
+    // Mock-only quota test: avoid scanning the developer's large real worktree.
+    const result = run(['--force-native', '--cwd', workDir(), '指示内容'], {
       env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults), GEMINI_API_KEY: '', OPENROUTER_API_KEY: '' }
     });
     assert.equal(result.status, 1);
     assert.match(result.stdout, /executor=fallback:unknown/);
-    assert.match(result.stderr, /GEMINI_API_KEY、DEEPSEEK_API_KEY、OPENROUTER_API_KEY が無いため/);
+    assert.match(result.stderr, /GEMINI_API_KEY、OPENROUTER_API_KEY、ZAI_API_KEY が無いため/);
   } finally {
-    if (prev !== undefined) process.env.DEEPSEEK_API_KEY = prev;
+    if (prev !== undefined) process.env.OPENROUTER_API_KEY = prev;
   }
 });
 
-test('buildQwenArgs は -y と --exclude-tools run_shell_command を必ず両方含む', () => {
+test('buildQwenArgs は -y を含み、run_shell_command を除外しない', () => {
+  // 2026-10-12 実測: --exclude-tools run_shell_command を付けると qwen からシェル実行ツールが
+  // 消え、`echo` 1つ実行できない(モデルが「shell 実行ツールが無い」と回答する)。
+  // 代替実行者はテスト・git を回す必要があるので除外しない。
   const args = buildQwenArgs();
   assert.ok(args.includes('-y'));
-  const excludeIndex = args.indexOf('--exclude-tools');
-  assert.ok(excludeIndex >= 0);
-  assert.equal(args[excludeIndex + 1], 'run_shell_command');
+  assert.ok(!args.includes('--exclude-tools'));
+  assert.ok(!args.includes('run_shell_command'));
 });
 
 test('buildQwenArgs は --approval-mode を含まない', () => {
@@ -348,19 +902,17 @@ test('buildQwenArgs は既定値と上書き値の両方で正しい引数を返
   const defaults = buildQwenArgs();
   assert.deepEqual(defaults, [
     '--auth-type', 'openai',
-    '-m', 'deepseek-chat',
+    '-m', 'deepseek/deepseek-v4-flash',
     '-y',
-    '--exclude-tools', 'run_shell_command',
     '--max-wall-time', '1800',
     '--max-tool-calls', '80',
     '-p', 'Follow-the-instructions-provided-on-stdin.'
   ]);
-  const custom = buildQwenArgs({ model: 'deepseek-reasoner', timeoutSecs: 300, maxToolCalls: 40 });
+  const custom = buildQwenArgs({ model: 'deepseek-flash', timeoutSecs: 300, maxToolCalls: 40 });
   assert.deepEqual(custom, [
     '--auth-type', 'openai',
-    '-m', 'deepseek-reasoner',
+    '-m', 'deepseek-flash',
     '-y',
-    '--exclude-tools', 'run_shell_command',
     '--max-wall-time', '300',
     '--max-tool-calls', '40',
     '-p', 'Follow-the-instructions-provided-on-stdin.'
@@ -372,8 +924,8 @@ test('buildQwenEnv は OPENAI_* を設定し GEMINI/GOOGLE キーを削除し ba
   const snapshot = { ...base };
   const env = buildQwenEnv(base, 'deepseek-key');
   assert.equal(env.OPENAI_API_KEY, 'deepseek-key');
-  assert.equal(env.OPENAI_BASE_URL, 'https://api.deepseek.com/v1');
-  assert.equal(env.OPENAI_MODEL, 'deepseek-chat');
+  assert.equal(env.OPENAI_BASE_URL, 'https://openrouter.ai/api/v1');
+  assert.equal(env.OPENAI_MODEL, 'deepseek/deepseek-v4-flash');
   assert.equal(env.QWEN_CODE_SUPPRESS_YOLO_WARNING, '1');
   assert.ok(!('GEMINI_API_KEY' in env));
   assert.ok(!('GOOGLE_API_KEY' in env));
@@ -381,17 +933,20 @@ test('buildQwenEnv は OPENAI_* を設定し GEMINI/GOOGLE キーを削除し ba
 });
 
 test('buildQwenEnv は model と baseUrl を上書きできる', () => {
-  const env = buildQwenEnv({}, 'key', { model: 'deepseek-reasoner', baseUrl: 'https://example.com/v1' });
-  assert.equal(env.OPENAI_MODEL, 'deepseek-reasoner');
+  const env = buildQwenEnv({}, 'key', { model: 'deepseek-flash', baseUrl: 'https://example.com/v1' });
+  assert.equal(env.OPENAI_MODEL, 'deepseek-flash');
   assert.equal(env.OPENAI_BASE_URL, 'https://example.com/v1');
 });
 
-test('buildGeminiArgs は auto_edit を使い -y を含めず、末尾に空白なし marker を置く', () => {
+test('buildGeminiArgs は yolo を使い -y を含めず、末尾に空白なし marker を置く', () => {
+  // 2026-10-12 実測: auto_edit は編集ツールのみ自動承認でシェル実行ツールが使えず、
+  // 代替実行者がテスト・git を一度も実行できない（qwen の --exclude-tools と同じ実害）。
+  // yolo は全ツール自動承認なのでシェルが使える。
   const marker = 'Custom-marker-without-spaces.';
   const args = buildGeminiArgs({ marker });
   const approvalIndex = args.indexOf('--approval-mode');
   assert.ok(approvalIndex >= 0);
-  assert.equal(args[approvalIndex + 1], 'auto_edit');
+  assert.equal(args[approvalIndex + 1], 'yolo');
   assert.ok(!args.includes('-y'));
   assert.deepEqual(args.slice(-2), ['-p', marker]);
   for (const arg of args) assert.ok(!/\s/.test(arg), `argv 要素に空白が含まれる: ${JSON.stringify(arg)}`);
@@ -411,42 +966,42 @@ test('buildGeminiEnv は Gemini キーと trust を設定し、OPENAI_* と base
 test('loadDeepseekKey は process.env を最優先する', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-ds-'));
   fs.mkdirSync(path.join(dir, '.claude'), { recursive: true });
-  fs.writeFileSync(path.join(dir, '.claude', 'deepseek.env'), 'DEEPSEEK_API_KEY=from-file\n', 'utf8');
-  const prev = process.env.DEEPSEEK_API_KEY;
-  process.env.DEEPSEEK_API_KEY = 'from-env';
+  fs.writeFileSync(path.join(dir, '.claude', 'openrouter.env'), 'OPENROUTER_API_KEY=from-file\n', 'utf8');
+  const prev = process.env.OPENROUTER_API_KEY;
+  process.env.OPENROUTER_API_KEY = 'from-env';
   try {
     assert.equal(loadDeepseekKey(dir), 'from-env');
   } finally {
-    if (prev === undefined) delete process.env.DEEPSEEK_API_KEY;
-    else process.env.DEEPSEEK_API_KEY = prev;
+    if (prev === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = prev;
   }
 });
 
-test('loadDeepseekKey はファイルから export DEEPSEEK_API_KEY="..." 形式を読める', () => {
+test('loadDeepseekKey はファイルから export OPENROUTER_API_KEY="..." 形式を読める', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-ds-'));
   fs.mkdirSync(path.join(dir, '.claude'), { recursive: true });
-  fs.writeFileSync(path.join(dir, '.claude', 'deepseek.env'), [
+  fs.writeFileSync(path.join(dir, '.claude', 'openrouter.env'), [
     '# コメント行は無視',
-    'export DEEPSEEK_API_KEY="sk-abc-123"',
+    'export OPENROUTER_API_KEY="sk-abc-123"',
     'OTHER=ignored'
   ].join('\n'), 'utf8');
-  const prev = process.env.DEEPSEEK_API_KEY;
-  delete process.env.DEEPSEEK_API_KEY;
+  const prev = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
   try {
     assert.equal(loadDeepseekKey(dir), 'sk-abc-123');
   } finally {
-    if (prev !== undefined) process.env.DEEPSEEK_API_KEY = prev;
+    if (prev !== undefined) process.env.OPENROUTER_API_KEY = prev;
   }
 });
 
 test('loadDeepseekKey はキーが無ければ null を返す', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-ds-'));
-  const prev = process.env.DEEPSEEK_API_KEY;
-  delete process.env.DEEPSEEK_API_KEY;
+  const prev = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
   try {
     assert.equal(loadDeepseekKey(dir), null);
   } finally {
-    if (prev !== undefined) process.env.DEEPSEEK_API_KEY = prev;
+    if (prev !== undefined) process.env.OPENROUTER_API_KEY = prev;
   }
 });
 
@@ -466,13 +1021,13 @@ function makeHomeWithEnv(files) {
 // process.env の影響を受けないよう、テスト中は両キーを退避・削除・復元する。
 function withEnvKeysCleared(fn) {
   const prevOR = process.env.OPENROUTER_API_KEY;
-  const prevDS = process.env.DEEPSEEK_API_KEY;
+  const prevDS = process.env.OPENROUTER_API_KEY;
   const prevGemini = process.env.GEMINI_API_KEY;
   const prevModel = process.env.CODEX_DO_FREE_MODEL;
   const prevGeminiModel = process.env.CODEX_DO_GEMINI_MODEL;
   const prevPreferFree = process.env.CODEX_DO_PREFER_FREE;
   delete process.env.OPENROUTER_API_KEY;
-  delete process.env.DEEPSEEK_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
   delete process.env.GEMINI_API_KEY;
   delete process.env.CODEX_DO_FREE_MODEL;
   delete process.env.CODEX_DO_GEMINI_MODEL;
@@ -482,8 +1037,8 @@ function withEnvKeysCleared(fn) {
   } finally {
     if (prevOR === undefined) delete process.env.OPENROUTER_API_KEY;
     else process.env.OPENROUTER_API_KEY = prevOR;
-    if (prevDS === undefined) delete process.env.DEEPSEEK_API_KEY;
-    else process.env.DEEPSEEK_API_KEY = prevDS;
+    if (prevDS === undefined) delete process.env.OPENROUTER_API_KEY;
+    else process.env.OPENROUTER_API_KEY = prevDS;
     if (prevGemini === undefined) delete process.env.GEMINI_API_KEY;
     else process.env.GEMINI_API_KEY = prevGemini;
     if (prevModel === undefined) delete process.env.CODEX_DO_FREE_MODEL;
@@ -495,35 +1050,44 @@ function withEnvKeysCleared(fn) {
   }
 }
 
-test('resolveFallbackBackends は既定で gemini-cli → deepseek → openrouter-free の順に置く', () => {
+test('resolveFallbackBackends は既定で cheap-code:deepseek → cheap-code:glm → gemini-cli の順に置く（gemini-cli は最終手段）', () => {
+  // 2026-10-29 実測: gemini-cli を先頭にした根拠（2026-09-03 の 5/5 品質実測）は、gemini CLI 側の
+  // sandbox 不調（run_shell_command のポリシー拒否・workspace 解決失敗で無音停滞）により
+  // 10-23〜10-28 のフォールバックで 15/15 が最大600秒を廃棄してタイムアウトし成立しなくなった
+  // （delegation-health:fallback_chain_timeout 2026-10-27 起票）。同時期に cheap-code:deepseek は
+  // 141〜482 秒で成功したため、既定は「成功が速く確実な cheap-code → 最終手段の gemini-cli」にする。
+  // kind:qwen(実在しない qwen バイナリ依存)は既定に出さない（2026-09-21・[[project-tetsuko-growth-loop]]）。
   withEnvKeysCleared(() => {
     const dir = makeHomeWithEnv({
       'openrouter.env': 'OPENROUTER_API_KEY=sk-or-1\n',
-      'deepseek.env': 'DEEPSEEK_API_KEY=sk-ds-1\n',
+      'zai.env': 'ZAI_API_KEY=sk-zai-1\n',
       'gemini.env': 'GEMINI_API_KEY=sk-gemini-1\n'
     });
-    const backends = resolveFallbackBackends(dir);
-    assert.deepEqual(backends.map(({ name }) => name), ['gemini-cli', 'deepseek', 'openrouter-free']);
-    assert.deepEqual(backends.map(({ kind }) => kind), ['gemini', 'qwen', 'qwen']);
-    assert.equal(backends[0].model, 'gemini-3.7-flash');
-    assert.equal(backends[0].apiKey, 'sk-gemini-1');
-    assert.equal(backends[1].baseUrl, 'https://api.deepseek.com/v1');
-    assert.equal(backends[2].baseUrl, 'https://openrouter.ai/api/v1');
+    const backends = resolveFallbackBackends(dir, { executableAvailable: () => true });
+    assert.deepEqual(backends.map(({ name }) => name), ['cheap-code:deepseek', 'cheap-code:glm', 'gemini-cli']);
+    assert.deepEqual(backends.map(({ kind }) => kind), ['cheap-code', 'cheap-code', 'gemini']);
+    assert.ok(!backends.some((b) => b.kind === 'qwen'), '既定の並びに kind:qwen(実在しないqwenバイナリ依存)を含めない');
+    assert.equal(backends[0].provider, 'deepseek');
+    assert.equal(backends[1].provider, 'glm');
+    assert.equal(backends[2].model, 'gemini-3.6-flash');
+    assert.equal(backends[2].apiKey, 'sk-gemini-1');
   });
 });
 
-test('resolveFallbackBackends は prefer-free でも残りを gemini-cli → deepseek の順に保つ', () => {
+test('resolveFallbackBackends は CODEX_DO_PREFER_FREE=1 を設定しても既定と同じ順を保つ（後方互換）', () => {
+  // 2026-10-29 から CODEX_DO_PREFER_FREE の読取を廃止した（既定が cheapest 順になったため同一）。
+  // 環境変数を設定しても順序は変わらないことを後方互換として固定する。
   withEnvKeysCleared(() => {
     const prev = process.env.CODEX_DO_PREFER_FREE;
     process.env.CODEX_DO_PREFER_FREE = '1';
     try {
       const dir = makeHomeWithEnv({
         'openrouter.env': 'OPENROUTER_API_KEY=sk-or-1\n',
-        'deepseek.env': 'DEEPSEEK_API_KEY=sk-ds-1\n',
+        'zai.env': 'ZAI_API_KEY=sk-zai-1\n',
         'gemini.env': 'GEMINI_API_KEY=sk-gemini-1\n'
       });
-      const backends = resolveFallbackBackends(dir);
-      assert.deepEqual(backends.map(({ name }) => name), ['openrouter-free', 'gemini-cli', 'deepseek']);
+      const backends = resolveFallbackBackends(dir, { executableAvailable: () => true });
+      assert.deepEqual(backends.map(({ name }) => name), ['cheap-code:deepseek', 'cheap-code:glm', 'gemini-cli']);
     } finally {
       if (prev === undefined) delete process.env.CODEX_DO_PREFER_FREE;
       else process.env.CODEX_DO_PREFER_FREE = prev;
@@ -531,28 +1095,28 @@ test('resolveFallbackBackends は prefer-free でも残りを gemini-cli → dee
   });
 });
 
-test('resolveFallbackBackends はキーが一部だけなら存在する分だけを順序どおり返す', () => {
+test('resolveFallbackBackends はキーが一部だけなら存在する分だけを順序どおり返す（OpenRouter単独でもDeepSeekが使える）', () => {
   withEnvKeysCleared(() => {
-    const onlyOR = resolveFallbackBackends(makeHomeWithEnv({ 'openrouter.env': 'OPENROUTER_API_KEY=sk-or-1\n' }));
-    assert.equal(onlyOR.length, 1);
-    assert.equal(onlyOR[0].name, 'openrouter-free');
+    // OpenRouter のキーだけで DeepSeek coding lane を選択できる。
+    const onlyOR = resolveFallbackBackends(makeHomeWithEnv({ 'openrouter.env': 'OPENROUTER_API_KEY=sk-or-1\n' }), { executableAvailable: () => true });
+    assert.deepEqual(onlyOR.map(b => b.name), ['cheap-code:deepseek']);
 
-    const onlyDS = resolveFallbackBackends(makeHomeWithEnv({ 'deepseek.env': 'DEEPSEEK_API_KEY=sk-ds-1\n' }));
-    assert.equal(onlyDS.length, 1);
-    assert.equal(onlyDS[0].name, 'deepseek');
+    const onlyDS = resolveFallbackBackends(makeHomeWithEnv({ 'deepseek.env': 'DEEPSEEK_API_KEY=sk-ds-1\n' }), { executableAvailable: () => true });
+    assert.deepEqual(onlyDS, [], 'native credentials must not enable the gateway lane');
 
     const geminiAndOR = resolveFallbackBackends(makeHomeWithEnv({
       'gemini.env': 'GEMINI_API_KEY=sk-gemini-1\n',
       'openrouter.env': 'OPENROUTER_API_KEY=sk-or-1\n'
-    }));
-    assert.deepEqual(geminiAndOR.map(({ name }) => name), ['gemini-cli', 'openrouter-free']);
+    }), { executableAvailable: () => true });
+    // 2026-10-29: 既定順の入れ替え（cheap-code 先頭・gemini-cli 最終手段）に追随。
+    assert.deepEqual(geminiAndOR.map(({ name }) => name), ['cheap-code:deepseek', 'gemini-cli']);
   });
 });
 
 test('resolveFallbackBackends はどのキーも無ければ空配列を返す', () => {
   withEnvKeysCleared(() => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-home-'));
-    assert.deepEqual(resolveFallbackBackends(dir), []);
+    assert.deepEqual(resolveFallbackBackends(dir, { executableAvailable: () => true }), []);
   });
 });
 
@@ -560,24 +1124,26 @@ test('resolveFallbackBackends は codex-fallback-order.json があればその�
   withEnvKeysCleared(() => {
     const dir = makeHomeWithEnv({
       'openrouter.env': 'OPENROUTER_API_KEY=sk-or-1\n',
-      'deepseek.env': 'DEEPSEEK_API_KEY=sk-ds-1\n',
       'gemini.env': 'GEMINI_API_KEY=sk-gemini-1\n'
     });
     fs.writeFileSync(path.join(dir, '.claude', 'codex-fallback-order.json'), JSON.stringify(['qwen', 'openrouter-free', 'gemini-cli']));
-    const backends = resolveFallbackBackends(dir);
+    const backends = resolveFallbackBackends(dir, { executableAvailable: () => true });
     assert.deepEqual(backends.map(({ name }) => name), ['deepseek', 'openrouter-free', 'gemini-cli']);
     // cheap-code:glm は ZAI キーが無いとスキップされ、残りだけが返る
     fs.writeFileSync(path.join(dir, '.claude', 'codex-fallback-order.json'), JSON.stringify(['gemini-cli', 'cheap-code:glm']));
-    const withCheap = resolveFallbackBackends(dir);
+    const withCheap = resolveFallbackBackends(dir, { executableAvailable: () => true });
     assert.deepEqual(withCheap.map(({ name }) => name), ['gemini-cli']);
   });
 });
 
-test('resolveQwenBackends は CODEX_DO_FREE_MODEL で openrouter-free の model を上書きできる', () => {
+test('resolveQwenBackends は CODEX_DO_FREE_MODEL で openrouter-free の model を上書きできる（明示指定時）', () => {
+  // openrouter-free(kind:'qwen') は2026-09-21に既定順から外れたため、既定のキーだけでは出てこない。
+  // codex-fallback-order.json で明示指定した機体（qwen CLI 導入済み等）向けの挙動として検証する。
   withEnvKeysCleared(() => {
     process.env.CODEX_DO_FREE_MODEL = 'z-ai/glm-5.2:free';
     const dir = makeHomeWithEnv({ 'openrouter.env': 'OPENROUTER_API_KEY=sk-or-1\n' });
-    const backends = resolveQwenBackends(dir);
+    fs.writeFileSync(path.join(dir, '.claude', 'codex-fallback-order.json'), JSON.stringify(['openrouter-free']));
+    const backends = resolveQwenBackends(dir, { executableAvailable: () => true });
     assert.equal(backends[0].name, 'openrouter-free');
     assert.equal(backends[0].model, 'z-ai/glm-5.2:free');
   });
@@ -587,10 +1153,54 @@ test('resolveQwenBackends は resolveFallbackBackends の後方互換別名で�
   withEnvKeysCleared(() => {
     const dir = makeHomeWithEnv({
       'gemini.env': 'GEMINI_API_KEY=sk-gemini-1\n',
-      'deepseek.env': 'DEEPSEEK_API_KEY=sk-ds-1\n'
+      'openrouter.env': 'OPENROUTER_API_KEY=sk-ds-1\n'
     });
-    assert.deepEqual(resolveQwenBackends(dir), resolveFallbackBackends(dir));
+    const options = { executableAvailable: () => true };
+    assert.deepEqual(resolveQwenBackends(dir, options), resolveFallbackBackends(dir, options));
   });
+});
+
+test('resolveFallbackBackends は gemini CLI が無ければキーがあっても候補から外す', () => {
+  withEnvKeysCleared(() => {
+    const dir = makeHomeWithEnv({
+      'gemini.env': 'GEMINI_API_KEY=sk-gemini-1\n',
+      'openrouter.env': 'OPENROUTER_API_KEY=sk-ds-1\n'
+    });
+    const backends = resolveFallbackBackends(dir, { executableAvailable: (cmd) => cmd !== 'gemini' });
+    assert.deepEqual(backends.map(({ name }) => name), ['cheap-code:deepseek']);
+  });
+});
+
+test('findExecutable は PATH と PATHEXT から最初に存在する実行ファイルを返す', () => {
+  const options = {
+    env: { PATH: 'C:\\a;C:\\b', PATHEXT: '.EXE;.CMD' },
+    platform: 'win32',
+    existsImpl: (candidate) => candidate === 'C:\\b\\gemini.CMD'
+  };
+  assert.equal(findExecutable('gemini', options), 'C:\\b\\gemini.CMD');
+  assert.equal(findExecutable('missing', options), null);
+});
+
+test('isBackendCliMissing は CLI 欠落だけを検出する', () => {
+  assert.equal(isBackendCliMissing('', "'gemini' は、内部コマンドまたは外部コマンド、 操作可能なプログラムまたはバッチ ファイルとして認識されていません。"), true);
+  assert.equal(isBackendCliMissing('', '/bin/sh: gemini: not found'), true);
+  assert.equal(isBackendCliMissing('', 'gemini: not found'), true);
+  assert.equal(isBackendCliMissing('', 'src/app.ts(3,1): error TS1005'), false);
+  // アプリ側の ENOENT（ファイル不在）は spawn 失敗ではないので進めてはならない。
+  assert.equal(isBackendCliMissing('', "Error: ENOENT: no such file or directory, open 'data/x.csv'"), false);
+  assert.equal(isBackendCliMissing('', 'spawn gemini ENOENT'), true);
+});
+
+test('shouldAdvanceToNextBackend は次のバックエンドへ進む結果を分類する', () => {
+  assert.deepEqual(shouldAdvanceToNextBackend({ aborted: true, timedOut: true }), { advance: true, outcome: 'blocked' });
+  assert.deepEqual(shouldAdvanceToNextBackend({ cliMissing: true, status: 1 }), { advance: true, outcome: 'cli_missing' });
+  assert.deepEqual(shouldAdvanceToNextBackend({ exhausted: true, status: 1 }), { advance: true, outcome: 'exhausted' });
+  assert.deepEqual(shouldAdvanceToNextBackend({ timedOut: true }), { advance: true, outcome: 'timeout' });
+  assert.deepEqual(shouldAdvanceToNextBackend({ status: 0 }), { advance: false, outcome: 'ok' });
+  assert.deepEqual(shouldAdvanceToNextBackend({ status: 1 }), { advance: false, outcome: 'failed' });
+  // status 0 は exhausted/cliMissing より優先（成功終了は絶対に捨てない）
+  assert.deepEqual(shouldAdvanceToNextBackend({ status: 0, exhausted: true }), { advance: false, outcome: 'ok' });
+  assert.deepEqual(shouldAdvanceToNextBackend({ status: 0, cliMissing: true }), { advance: false, outcome: 'ok' });
 });
 
 test('loadGeminiKey は process.env、.claude/gemini.env、~/.gemini/.env の順で読む', () => {
@@ -619,15 +1229,128 @@ test('isBackendExhausted は上限系メッセージで true を返す', () => {
   assert.equal(isBackendExhausted('', 'insufficient_quota'), true);
 });
 
+test('isBackendExhausted はクールダウンによる起動省略で true を返す', () => {
+  assert.equal(isBackendExhausted('', '[cheap-code] deepseek はクールダウン中です(2026-10-28T04:00:33.800Zまで)。起動を省略しました。'), true);
+  assert.equal(isBackendExhausted('', 'provider glm is in cooldown until ...'), true);
+});
+
 test('isBackendExhausted は通常の成功出力で false を返す', () => {
   assert.equal(isBackendExhausted('Qwen Code CLI has successfully edited files.', ''), false);
   assert.equal(isBackendExhausted('', 'All tests passed'), false);
+  assert.equal(isBackendExhausted('', 'normal failure'), false);
 });
 
 test('isBackendExhausted は 429/413 がファイル行番号(コロン隣接)なら誤検出しない', () => {
   assert.equal(isBackendExhausted('tools/codex-do.mjs:429:12', ''), false);
   assert.equal(isBackendExhausted('', 'Applied edit in tools/codex-do.mjs:429: added helper function'), false);
   assert.equal(isBackendExhausted('src/CaseList.js:413:function foo()', ''), false);
+});
+
+test('isBackendExhausted は unrecognized_model 警告では false を返す（警告は枯渇ではない）', () => {
+  assert.equal(isBackendExhausted('', '[claude-code:unrecognized_model] {"model":"deepseek/deepseek-v4-flash","query_source":"sdk"}'), false);
+  assert.equal(isBackendExhausted('', 'unrecognized_model'), false);
+  assert.equal(isBackendExhausted('', 'Unrecognized_Model'), false);
+});
+
+test('冷却中 backend の probe 成功 → 通常予算で実行され chain に probe_failed が入らない', (t) => {
+  const mockResults = [
+    { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: '' },
+    // probe: 成功
+    { status: 0, output: 'OK', stderr: '' },
+    // 本番: 成功
+    { status: 0, output: 'Qwen Code CLI has successfully completed.', stderr: '' },
+  ];
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-probe-success-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const claude = path.join(home, '.claude');
+  fs.mkdirSync(claude, { recursive: true });
+  fs.writeFileSync(path.join(claude, 'openrouter.env'), 'OPENROUTER_API_KEY=sk-test\n', 'utf8');
+  // cheap-code を冷却状態にする（fallback-backend-history.jsonl に timeout 行を追加）
+  const coolingFile = path.join(claude, 'fallback-backend-history.jsonl');
+  fs.writeFileSync(coolingFile, `${JSON.stringify({ t: Date.now(), backend: 'cheap-code:deepseek', outcome: 'timeout' })}\n`, 'utf8');
+  const result = run(['--force-native', '--cwd', home, '指示内容'], {
+    home,
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults), GEMINI_API_KEY: '', OPENROUTER_API_KEY: 'sk-test' },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
+  // chain に probe_failed がなく、ok で終わっている
+  const ledger = fs.readFileSync(path.join(home, '.claude/executor-usage.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+  const fallbackRow = ledger.find(r => r.provider === 'fallback');
+  assert.ok(fallbackRow, 'fallback 行が存在');
+  assert.ok(fallbackRow.chain, 'chain が存在');
+  assert.equal(fallbackRow.chain.filter(a => a.outcome === 'probe_failed').length, 0, 'probe_failed がないこと');
+  assert.equal(fallbackRow.chain.filter(a => a.outcome === 'ok').length, 1, 'ok が 1 件あること');
+});
+
+test('冷却中 backend の probe 失敗 → probe_failed で次のバックエンドへ進む', (t) => {
+  const mockResults = [
+    { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: '' },
+    // probe: 失敗（gemini が無い）
+    { status: 1, output: '', stderr: "'gemini' is not recognized", timedOut: false },
+    // 2つめのバックエンド: 成功
+    { status: 0, output: 'done', stderr: '' },
+  ];
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-probe-fail-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const claude = path.join(home, '.claude');
+  fs.mkdirSync(claude, { recursive: true });
+  fs.writeFileSync(path.join(claude, 'openrouter.env'), 'OPENROUTER_API_KEY=sk-test\n', 'utf8');
+  const coolingFile = path.join(claude, 'fallback-backend-history.jsonl');
+  // 両方の backend を冷却状態にする → skipCoolingBackends は keepAtLeastOne で全件残す
+  fs.writeFileSync(coolingFile, [
+    JSON.stringify({ t: Date.now(), backend: 'gemini-cli', outcome: 'timeout' }),
+    JSON.stringify({ t: Date.now(), backend: 'cheap-code:deepseek', outcome: 'timeout' }),
+  ].join('\n') + '\n', 'utf8');
+  fs.writeFileSync(path.join(claude, 'codex-fallback-order.json'), JSON.stringify(['gemini-cli', 'cheap-code:deepseek']));
+  const result = run(['--force-native', '--cwd', home, '指示内容'], {
+    home,
+    env: { ...geminiOnPathEnv(), CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults), GEMINI_API_KEY: 'sk-gemini', OPENROUTER_API_KEY: 'sk-test' },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  // 2つめのバックエンド(cheap-code:deepseek)が成功
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
+  const ledger = fs.readFileSync(path.join(home, '.claude/executor-usage.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+  const fallbackRow = ledger.find(r => r.provider === 'fallback');
+  assert.ok(fallbackRow?.chain, 'chain が存在');
+  assert.ok(fallbackRow.chain.some(a => a.outcome === 'probe_failed'), 'probe_failed が存在');
+});
+
+test('probeBackendAlive は本番 cwd ではなく一時ディレクトリで起動される（cwd 引数廃止の構造的保証）', (t) => {
+  // 2026-11-11 修正: probeBackendAlive の cwd 引数を廃止した。probeDir(os.tmpdir()配下)が
+  // 常に使われるため、ping 中の AI が本番リポジトリを読んだり触ったりしない。
+  // 既存の冷却 probe 統合テストの仕組みを流用し、probe 成功 → 本番実行が流れることと、
+  // production cwd に probe の残骸が残らないことを検証する。
+  const mockResults = [
+    { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: '' },
+    // probe: 成功 (production cwd ではなく一時ディレクトリで実行される)
+    { status: 0, output: 'OK', stderr: '' },
+    // 本番: 成功
+    { status: 0, output: 'Qwen Code CLI has successfully completed.', stderr: '' },
+  ];
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-probe-cwd-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const claude = path.join(home, '.claude');
+  fs.mkdirSync(claude, { recursive: true });
+  fs.writeFileSync(path.join(claude, 'openrouter.env'), 'OPENROUTER_API_KEY=sk-test\n', 'utf8');
+  // cheap-code を冷却状態 → probe が実行される条件を作る
+  const coolingFile = path.join(claude, 'fallback-backend-history.jsonl');
+  fs.writeFileSync(coolingFile, `${JSON.stringify({ t: Date.now(), backend: 'cheap-code:deepseek', outcome: 'timeout' })}\n`, 'utf8');
+  const result = run(['--force-native', '--cwd', home, '指示内容'], {
+    home,
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults), GEMINI_API_KEY: '', OPENROUTER_API_KEY: 'sk-test' },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  // chain に probe_failed が無く、ok で終わっている
+  const ledger = fs.readFileSync(path.join(home, '.claude/executor-usage.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+  const fallbackRow = ledger.find(r => r.provider === 'fallback');
+  assert.ok(fallbackRow, 'fallback 行が存在');
+  assert.ok(fallbackRow.chain, 'chain が存在');
+  assert.equal(fallbackRow.chain.filter(a => a.outcome === 'probe_failed').length, 0, 'probe_failed がないこと');
+  assert.equal(fallbackRow.chain.filter(a => a.outcome === 'ok').length, 1, 'ok が 1 件あること');
+  // production cwd (home) に probe の一時ディレクトリが作成されていないことを確認
+  const cwdProbeDirs = fs.readdirSync(home).filter(n => n.startsWith('codex-probe-'));
+  assert.equal(cwdProbeDirs.length, 0, 'production cwd に probe 用ディレクトリが作成されないこと');
 });
 
 test('loadEnvKey は process.env を最優先し、ファイルの export VAR="..." 形式も読める', () => {
@@ -662,14 +1385,14 @@ test('loadEnvKey はキーが無ければ null を返す', () => {
 });
 
 test('loadDeepseekKey は loadEnvKey の薄いラッパとして振る舞いが変わらない', () => {
-  const dir = makeHomeWithEnv({ 'deepseek.env': 'export DEEPSEEK_API_KEY="sk-ds-1"\n' });
-  const prev = process.env.DEEPSEEK_API_KEY;
-  delete process.env.DEEPSEEK_API_KEY;
+  const dir = makeHomeWithEnv({ 'openrouter.env': 'export OPENROUTER_API_KEY="sk-ds-1"\n' });
+  const prev = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
   try {
     assert.equal(loadDeepseekKey(dir), 'sk-ds-1');
-    assert.equal(loadEnvKey(dir, 'deepseek.env', 'DEEPSEEK_API_KEY'), 'sk-ds-1');
+    assert.equal(loadEnvKey(dir, 'openrouter.env', 'OPENROUTER_API_KEY'), 'sk-ds-1');
   } finally {
-    if (prev !== undefined) process.env.DEEPSEEK_API_KEY = prev;
+    if (prev !== undefined) process.env.OPENROUTER_API_KEY = prev;
   }
 });
 
@@ -677,22 +1400,68 @@ test('codex-fallback: cheap-code:glm が usage_limit クールダウン中なら
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-cooldown-'));
   const claude = path.join(home, '.claude'); fs.mkdirSync(claude, { recursive: true });
   fs.writeFileSync(path.join(claude, 'zai.env'), 'ZAI_API_KEY=zai-test\n', 'utf8');
-  fs.writeFileSync(path.join(claude, 'deepseek.env'), 'DEEPSEEK_API_KEY=ds-test\n', 'utf8');
+  fs.writeFileSync(path.join(claude, 'openrouter.env'), 'OPENROUTER_API_KEY=ds-test\n', 'utf8');
   fs.writeFileSync(path.join(claude, 'provider-cooldown.json'), JSON.stringify({ glm: { until: Date.now() + 5 * 60 * 60 * 1000, reason: 'usage_limit', at: new Date().toISOString() } }));
   fs.writeFileSync(path.join(claude, 'codex-fallback-order.json'), JSON.stringify(['cheap-code:glm', 'gemini-cli']));
-  const backends = resolveFallbackBackends(home);
+  const backends = resolveFallbackBackends(home, { executableAvailable: () => true });
   assert.ok(backends.length >= 1);
   assert.equal(backends[0].provider, 'deepseek');
   assert.equal(backends[0].name, 'cheap-code:deepseek');
+});
+
+test('codex-fallback: cheap-code:deepseek が provider-cooldown 中（http_402）なら候補から外す', () => {
+  // deepseek は HTTP 402 Insufficient Balance の恒久課金切れ状態。provider-cooldown.json に
+  // billing provider(openrouter) の cooldown があるときは cheap-code:deepseek を候補に入れない。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-deepseek-cooldown-'));
+  const claude = path.join(home, '.claude'); fs.mkdirSync(claude, { recursive: true });
+  fs.writeFileSync(path.join(claude, 'openrouter.env'), 'OPENROUTER_API_KEY=ds-test\n', 'utf8');
+  fs.writeFileSync(path.join(claude, 'gemini.env'), 'GEMINI_API_KEY=sk-gemini-1\n', 'utf8');
+  fs.writeFileSync(path.join(claude, 'provider-cooldown.json'), JSON.stringify({ openrouter: { until: Date.now() + 24 * 60 * 60 * 1000, reason: 'http_402', at: new Date().toISOString() } }));
+  const backends = resolveFallbackBackends(home, { executableAvailable: () => true });
+  // openrouter が cooldown 中なので cheap-code:deepseek は除外される
+  assert.equal(backends.some((b) => b.name === 'cheap-code:deepseek'), false, 'deepseek should be excluded when openrouter is in cooldown');
+  // gemini-cli はキーがあるので残る
+  assert.equal(backends.some((b) => b.name === 'gemini-cli'), true, 'gemini-cli should survive');
+});
+
+test('codex-fallback: Gemini の直 API が billing と判定済みなら gemini-cli を候補から外す', () => {
+  const home = makeHomeWithEnv({
+    'gemini.env': 'GEMINI_API_KEY=sk-gemini-1\n',
+    'openrouter.env': 'OPENROUTER_API_KEY=sk-or-1\n'
+  });
+  const claude = path.join(home, '.claude');
+  fs.writeFileSync(path.join(claude, 'lane-health.json'), JSON.stringify({ lanes: { gemini: { alive: false, reason: 'billing', via: 'openrouter' }, openrouter: { alive: true } } }));
+  assert.equal(isProviderBillingBlocked(home, 'gemini'), true);
+  assert.deepEqual(resolveFallbackBackends(home, { executableAvailable: () => true }).map((b) => b.name), ['cheap-code:deepseek']);
+});
+
+test('Gemini 402/前払い残高切れは枯渇として次候補へ進める', () => {
+  const error = 'HTTP 402: Your prepayment credits are depleted';
+  assert.equal(isBackendBillingFailure('', error), true);
+  assert.equal(isBackendExhausted('', error), true);
+  assert.deepEqual(shouldAdvanceToNextBackend({ status: 1, exhausted: isBackendExhausted('', error) }), { advance: true, outcome: 'exhausted' });
+});
+
+test('codex-fallback: glm 差し替えで deepseek と重複しても連鎖に同名 backend は1回だけ入る（timeout 済みの再投入で時間を捨てない）', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-dedupe-'));
+  const claude = path.join(home, '.claude'); fs.mkdirSync(claude, { recursive: true });
+  fs.writeFileSync(path.join(claude, 'zai.env'), 'ZAI_API_KEY=zai-test\n', 'utf8');
+  fs.writeFileSync(path.join(claude, 'openrouter.env'), 'OPENROUTER_API_KEY=ds-test\n', 'utf8');
+  fs.writeFileSync(path.join(claude, 'provider-cooldown.json'), JSON.stringify({ glm: { until: Date.now() + 5 * 60 * 60 * 1000, reason: 'usage_limit', at: new Date().toISOString() } }));
+  const options = { executableAvailable: () => true };
+  // 既定順（cheap-code:deepseek → cheap-code:glm → gemini-cli）で glm が cooldown 差し替えにより deepseek と重複しても1回だけ
+  assert.deepEqual(resolveFallbackBackends(home, options).map((b) => b.name), ['cheap-code:deepseek']);
+  fs.writeFileSync(path.join(claude, 'codex-fallback-order.json'), JSON.stringify(['cheap-code:deepseek', 'cheap-code:glm']));
+  assert.deepEqual(resolveFallbackBackends(home, options).map((b) => b.name), ['cheap-code:deepseek']);
 });
 
 test('codex-fallback: クールダウン無しなら glm を維持する', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-normal-'));
   const claude = path.join(home, '.claude'); fs.mkdirSync(claude, { recursive: true });
   fs.writeFileSync(path.join(claude, 'zai.env'), 'ZAI_API_KEY=zai-test\n', 'utf8');
-  fs.writeFileSync(path.join(claude, 'deepseek.env'), 'DEEPSEEK_API_KEY=ds-test\n', 'utf8');
+  fs.writeFileSync(path.join(claude, 'openrouter.env'), 'OPENROUTER_API_KEY=ds-test\n', 'utf8');
   fs.writeFileSync(path.join(claude, 'codex-fallback-order.json'), JSON.stringify(['cheap-code:glm']));
-  const backends = resolveFallbackBackends(home);
+  const backends = resolveFallbackBackends(home, { executableAvailable: () => true });
   assert.equal(backends[0].provider, 'glm');
   assert.equal(backends[0].name, 'cheap-code:glm');
 });
@@ -720,17 +1489,101 @@ test('wslCodexLaunchPlan: ディストリが見つからなければ中断する
   assert.equal(wslCodexLaunchPlan({ distroFound: false, codexPresent: true, versionOk: false, installAttempted: false, retried: false }), 'abort');
 });
 
-test('wslCodexLaunchPlan: allowNative を明示したときだけネイティブへ移行する', () => {
-  assert.equal(wslCodexLaunchPlan({ distroFound: false, codexPresent: false, versionOk: false, installAttempted: false, retried: false, allowNative: true }), 'native');
-  assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: true, versionOk: false, installAttempted: false, retried: true, allowNative: true }), 'native');
-  assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: false, versionOk: false, installAttempted: true, retried: false, allowNative: true }), 'native');
+test('wslCodexLaunchPlan: ネイティブが解決できるときネイティブへ移行する', () => {
+  assert.equal(wslCodexLaunchPlan({ distroFound: false, codexPresent: false, versionOk: false, installAttempted: false, retried: false, nativeAvailable: true }), 'native');
+  assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: true, versionOk: false, installAttempted: false, retried: true, nativeAvailable: true }), 'native');
+  assert.equal(wslCodexLaunchPlan({ distroFound: true, codexPresent: false, versionOk: false, installAttempted: true, retried: false, nativeAvailable: true }), 'native');
 });
 
 test('WSL codex のプローブはコールドスタートを待てる', () => {
   assert.ok(WSL_PROBE_TIMEOUT_MS >= 60000);
 });
 
-const { decideCodexLane, buildCodexExecArgs, normalizeCodexModel } = await import('./codex-do.mjs');
+// WSL 経路の中断は win32 でしか通らないため、他OSでは明示的に skip する
+// （CI は Linux。ここを skip しても Windows 実機での回帰は検出できる）。
+test('WSL が使えず中断するときも台帳に launched:false の1行を残す', { skip: process.platform !== 'win32' }, (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-wslabort-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const result = run(['--no-fallback', '--cwd', home, '--model', 'sol', '説明して'], {
+    home,
+    env: { CODEX_DO_WSL_PROBE: 'absent', CODEX_DO_NATIVE_PROBE: 'absent' },
+  });
+  assert.equal(result.status, 3, result.stderr);
+  const ledger = path.join(home, '.claude', 'executor-usage.jsonl');
+  assert.ok(fs.existsSync(ledger), '中断経路でも台帳に行が残ること（無音故障の回帰）');
+  const rows = fs.readFileSync(ledger, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].provider, 'codex');
+  assert.equal(rows[0].out, 0);
+  assert.equal(rows[0].status, 'error');
+  assert.equal(rows[0].exitCode, 3);
+  assert.equal(rows[0].launched, false);
+});
+
+// 2026-09-19 実測: この PC は `wsl -l -q` が空で、起動失敗のまま process.exit(3) していたため
+// codex-do 本来のフォールバック連鎖へ到達せず委譲が毎回死んでいた（台帳に launched:false が残り続けた）。
+test('WSL ディストリが無くても代替バックエンドがあるなら起動失敗で死なず委譲を続ける', { skip: process.platform !== 'win32' }, (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-wslfallback-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const result = run(['--cwd', home, '--model', 'sol', '説明して'], {
+    home,
+    env: {
+      CODEX_DO_WSL_PROBE: 'absent',
+      CODEX_DO_NATIVE_PROBE: 'absent',
+      CODEX_DO_MOCK_RESULTS: JSON.stringify([{ status: 0, output: 'done', stderr: '' }]),
+      GEMINI_API_KEY: '',
+      OPENROUTER_API_KEY: 'sk-test'
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
+  const rows = fs.readFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const codexRow = rows.find((item) => item.provider === 'codex');
+  assert.ok(codexRow, '起動失敗は台帳に残すこと（無音故障の回帰）');
+  assert.equal(codexRow.launched, false);
+  assert.equal(codexRow.out, 0);
+  assert.match(codexRow.stderrTail, /WSL ディストリが見つかりませんでした/);
+  // WSL 不在は一過性でないので再試行しない（再試行の記録 attempts が 1 のまま）
+  assert.equal(codexRow.attempts, 1);
+});
+
+test('起動に成功した行は launched:true で記録される', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-launched-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const result = run(['--force-native', '--cwd', home, '--model', 'sol', '説明して'], {
+    home,
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([{ status: 0, output: 'done', stderr: '' }]) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const rows = fs.readFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(rows[0].launched, true);
+});
+
+test('spawn エラーのメッセージを台帳の spawnError と stderrTail に残す', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-spawnerr-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  // child.on('error') 経路の模擬: status が数値で残らず、原因は error だけに載る(spawn codex ENOENT)。
+  // 即時失敗は1回だけ再試行されるので mock は2件ぶん用意する。
+  const spawnError = 'spawn codex ENOENT';
+  const result = run(['--force-native', '--cwd', home, '--model', 'sol', '説明して'], {
+    home,
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([
+      { status: null, error: spawnError },
+      { status: null, error: spawnError },
+    ]) },
+  });
+  assert.notEqual(result.status, 0);
+  const rows = fs.readFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].provider, 'codex');
+  assert.equal(rows[0].launched, true);
+  assert.equal(rows[0].status, 'error');
+  assert.equal(rows[0].exitCode, null);
+  assert.equal(rows[0].spawnError, spawnError);
+  assert.equal(rows[0].stderrTail, spawnError);
+});
+
+const { decideCodexLane, buildCodexExecArgs, isInsideGitRepo, normalizeCodexModel, wslCodexArgs, detectChatGptAuth, probeChatGptAuth } = await import('./codex-do.mjs');
 const ASTRA = 'gpt-6-astra', SOL = 'gpt-5.6-sol';
 for (const [name, input, slug, reason] of [
   ['explicit model wins', { model: 'sol', lane: 'astra' }, SOL, 'explicit_model'],
@@ -754,11 +1607,25 @@ for (const [name, input, slug, reason] of [
   ['default Sol', {}, SOL, 'default_sol'],
   ['auto cooldown', { timeoutSecs: 2700, astraCooldownMs: 1 }, SOL, 'astra_cooldown:long_timeout'],
   ['astra lane cooldown', { lane: 'astra', astraCooldownMs: 1 }, SOL, 'astra_cooldown:lane_astra'],
+  // ChatGPT アカウント認証では sol/astra が invalid_request_error(400) で拒否される(2026-09-21実測)ため、
+  // auto かつ明示指定が無い時だけ既定モデル(slug undefined)へ倒す。
+  ['chatgpt auth overrides default sol', { chatgptAuth: true }, undefined, 'chatgpt_auth_default:default_sol'],
+  ['chatgpt auth respects explicit --model', { chatgptAuth: true, model: 'sol' }, SOL, 'explicit_model'],
+  ['chatgpt auth respects explicit --lane', { chatgptAuth: true, lane: 'astra' }, ASTRA, 'lane_astra'],
+  ['chatgpt auth false behaves like unset(apikey環境)', { chatgptAuth: false }, SOL, 'default_sol'],
+  ['chatgpt auth unknown(null)も従来どおり', { chatgptAuth: null, timeoutSecs: 2700 }, ASTRA, 'long_timeout'],
 ]) {
   test(`decideCodexLane: ${name}`, () => {
     assert.deepEqual(decideCodexLane(input), { slug, effort: slug === ASTRA ? 'high' : undefined, reason });
   });
 }
+
+test('decideCodexLane: chatgpt auth は astra 相当の選択でも effort=high は保つ(モデルだけ既定へ倒す)', () => {
+  assert.deepEqual(
+    decideCodexLane({ chatgptAuth: true, timeoutSecs: 2700 }),
+    { slug: undefined, effort: 'high', reason: 'chatgpt_auth_default:long_timeout' },
+  );
+});
 
 test('normalizeCodexModel: aliases and unknown slugs', () => {
   assert.equal(normalizeCodexModel('astra'), ASTRA);
@@ -766,11 +1633,128 @@ test('normalizeCodexModel: aliases and unknown slugs', () => {
   assert.equal(normalizeCodexModel('future-slug'), 'future-slug');
 });
 
+for (const [name, json, expected] of [
+  ['null/空文字は null', null, null],
+  ['壊れたJSONは null', '{not valid json', null],
+  ['配列(objectでない)は null', '[1,2,3]', null],
+  ['OPENAI_API_KEY があれば apikey(false)', JSON.stringify({ OPENAI_API_KEY: 'sk-x' }), false],
+  ['api_key があれば apikey(false)', JSON.stringify({ api_key: 'sk-x' }), false],
+  ['tokens.id_token があれば chatgpt(true)', JSON.stringify({ tokens: { id_token: 'x' } }), true],
+  ['tokens.access_token だけでも chatgpt(true)', JSON.stringify({ tokens: { access_token: 'x' } }), true],
+  ['tokens はあるが中身が空なら null', JSON.stringify({ tokens: {} }), null],
+  ['どちらの目印も無ければ null', JSON.stringify({ other: 1 }), null],
+]) {
+  test(`detectChatGptAuth: ${name}`, () => {
+    assert.equal(detectChatGptAuth(json), expected);
+  });
+}
+
+test('probeChatGptAuth: CODEX_DO_AUTH_MODE で実機を触らず上書きできる(WSL の無い CI 用)', () => {
+  assert.equal(probeChatGptAuth({ env: { CODEX_DO_AUTH_MODE: 'chatgpt' } }), true);
+  assert.equal(probeChatGptAuth({ env: { CODEX_DO_AUTH_MODE: 'apikey' } }), false);
+  assert.equal(probeChatGptAuth({ env: { CODEX_DO_AUTH_MODE: 'unknown' } }), null);
+});
+
+test('probeChatGptAuth: native 経路は auth.json を注入したファイル読み取りで判定する', () => {
+  const home = '/home/test';
+  const read = (file) => {
+    assert.equal(file, path.join(home, '.codex', 'auth.json'));
+    return JSON.stringify({ tokens: { id_token: 'x' } });
+  };
+  assert.equal(probeChatGptAuth({ forceNative: true, platform: 'win32', env: {}, readFileImpl: read, homeDir: home }), true);
+  assert.equal(probeChatGptAuth({ platform: 'linux', env: {}, readFileImpl: read, homeDir: home }), true);
+});
+
+test('probeChatGptAuth: 読めない・壊れている場合は null を返し従来動作(sol優先)を維持する', () => {
+  const throwing = () => { throw new Error('ENOENT'); };
+  assert.equal(probeChatGptAuth({ forceNative: true, platform: 'win32', env: {}, readFileImpl: throwing, homeDir: '/home/test' }), null);
+});
+
+test('probeChatGptAuth: Windows/WSL 経路は distro 一覧と auth.json 読取を spawnImpl に注入できる', () => {
+  const spawnImpl = (cmd, args) => {
+    assert.equal(cmd, 'wsl');
+    if (args[0] === '-l') return { status: 0, stdout: 'Ubuntu\0\r\n\0' };
+    assert.deepEqual(args.slice(0, 2), ['-d', 'Ubuntu']);
+    return { status: 0, stdout: JSON.stringify({ tokens: { id_token: 'x' } }) };
+  };
+  assert.equal(probeChatGptAuth({ platform: 'win32', forceNative: false, env: {}, spawnImpl }), true);
+});
+
+test('probeChatGptAuth: WSL 側の distro 一覧・cat が失敗したら null(既定sol維持)', () => {
+  assert.equal(probeChatGptAuth({
+    platform: 'win32', env: {}, spawnImpl: () => ({ status: 1, stdout: '' }),
+  }), null, 'distro一覧が失敗');
+  assert.equal(probeChatGptAuth({
+    platform: 'win32', env: {},
+    spawnImpl: (cmd, args) => args[0] === '-l' ? { status: 0, stdout: '' } : ({ status: 0, stdout: '' }),
+  }), null, 'distroが1件も無い');
+  assert.equal(probeChatGptAuth({
+    platform: 'win32', env: {},
+    spawnImpl: (cmd, args) => args[0] === '-l' ? { status: 0, stdout: 'Ubuntu\0\r\n\0' } : ({ status: 1, stdout: '' }),
+  }), null, 'auth.json の cat が失敗');
+});
+
 test('buildCodexExecArgs: model, effort, sandbox and stdin without spaces', () => {
   const args = buildCodexExecArgs({ slug: ASTRA, effort: 'high' });
-  assert.deepEqual(args, ['exec', '-m', ASTRA, '-c', 'model_reasoning_effort="high"', '-s', 'workspace-write', '-']);
+  assert.deepEqual(args, ['exec', '-m', ASTRA, '-c', 'model_reasoning_effort="high"', '-c', 'plugins={"makeloop@makeloop"={enabled=false}}', '-s', 'workspace-write', '-']);
   assert.ok(args.every((arg) => !/\s/.test(arg)));
-  assert.deepEqual(buildCodexExecArgs({ slug: SOL, review: true }), ['exec', '-m', SOL, '-s', 'read-only', '-']);
+  assert.deepEqual(buildCodexExecArgs({ slug: SOL, review: true }), ['exec', '-m', SOL, '-c', 'plugins={"makeloop@makeloop"={enabled=false}}', '-s', 'read-only', '-']);
+});
+
+// Fixtures may live below the checkout (custom TMPDIR); their parent repo is not part of this test.
+function fixtureGitIo(root) {
+  return { stat(file) {
+    if (!file.startsWith(root + path.sep)) throw new Error('outside fixture');
+    return fs.statSync(file);
+  } };
+}
+
+test('isInsideGitRepo: cwd または祖先の実在する .git を検出する', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-gitdir-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const nested = path.join(root, 'packages', 'app');
+  fs.mkdirSync(nested, { recursive: true });
+  // 2026-09-23 実測の再現: `.git` は在るが HEAD を持たない空殻。Windows の existsSync は true でも
+  // git は "not a git repository" を返す(auto-session の起動ディレクトリ CLAUDE.md配布 がこの形)。
+  // ここを repo と誤判定すると codex に --skip-git-repo-check が渡らず、exit 1 / 出力ゼロで死ぬ。
+  fs.mkdirSync(path.join(root, '.git', 'info'), { recursive: true });
+  assert.equal(fs.existsSync(path.join(root, '.git')), true);
+  assert.equal(isInsideGitRepo(root, fixtureGitIo(root)), false);
+  assert.equal(isInsideGitRepo(nested, fixtureGitIo(root)), false);
+  // 誤判定しないので WSL 経路には skip フラグが入る(出力ゼロ即死の回避)
+  const codexArgs = buildCodexExecArgs({ slug: SOL });
+  assert.ok(wslCodexArgs({ distro: 'Ubuntu', cwd: root, codexArgs, inGitRepo: isInsideGitRepo(root, fixtureGitIo(root)) }).includes('--skip-git-repo-check'));
+  // HEAD が生えた時点で初めてリポジトリとして扱う
+  fs.writeFileSync(path.join(root, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+  assert.equal(isInsideGitRepo(root, fixtureGitIo(root)), true);
+  assert.equal(isInsideGitRepo(nested, fixtureGitIo(root)), true);
+});
+
+test('isInsideGitRepo: worktree の gitfile は指す先が実在するときだけリポジトリ', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-gitfile-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const worktree = path.join(root, 'wt');
+  fs.mkdirSync(worktree, { recursive: true });
+  fs.writeFileSync(path.join(worktree, '.git'), `gitdir: ${path.join(root, 'missing')}\n`);
+  assert.equal(isInsideGitRepo(worktree, fixtureGitIo(root)), false);
+  fs.mkdirSync(path.join(root, 'real'));
+  fs.writeFileSync(path.join(root, 'real', 'HEAD'), 'ref: refs/heads/main\n');
+  fs.writeFileSync(path.join(worktree, '.git'), `gitdir: ${path.join(root, 'real')}\n`);
+  assert.equal(isInsideGitRepo(worktree, fixtureGitIo(root)), true);
+});
+
+test('isInsideGitRepo: 祖先方向に .git が無ければ false', () => {
+  assert.equal(isInsideGitRepo(path.resolve('/virtual/plain')), false);
+  assert.equal(isInsideGitRepo(path.resolve('/elsewhere/deep/path')), false);
+});
+
+test('wslCodexArgs: 非リポジトリだけ stdin マーカー直前に skip フラグを入れる', () => {
+  const cwd = '/work/task';
+  const codexArgs = buildCodexExecArgs({ slug: SOL });
+  assert.deepEqual(wslCodexArgs({ distro: 'Ubuntu', cwd, codexArgs, inGitRepo: false }),
+    ['-d', 'Ubuntu', '--cd', cwd, '--', 'codex', 'exec', '-m', SOL, '-c', 'plugins={"makeloop@makeloop"={enabled=false}}', '-s', 'workspace-write', '--skip-git-repo-check', '-']);
+  assert.deepEqual(wslCodexArgs({ distro: 'Ubuntu', cwd, codexArgs, inGitRepo: true }),
+    ['-d', 'Ubuntu', '--cd', cwd, '--', 'codex', ...codexArgs]);
 });
 
 test('CLI validates routing options and dry-run reports model/effort', () => {
@@ -783,6 +1767,26 @@ test('CLI validates routing options and dry-run reports model/effort', () => {
   assert.doesNotMatch(result.stdout, /--lane|--effort|--no-escalate/);
 });
 
+test('CLI: ChatGPT アカウント認証では dry-run が sol/astra ではなく既定モデルを報告する', () => {
+  // CODEX_DO_AUTH_MODE で実機の WSL/auth.json に触らず決定的に検証する。
+  const chatgpt = run(['--dry-run', '指示'], { env: { CODEX_DO_AUTH_MODE: 'chatgpt' } });
+  assert.equal(chatgpt.status, 0, chatgpt.stderr);
+  assert.match(chatgpt.stdout, /executor=codex model=既定\(codexのデフォルト\) effort=default lane=chatgpt_auth_default:default_sol/);
+  assert.match(chatgpt.stderr, /chatgpt_auth_default: ChatGPTアカウント認証のため sol\/astra を使わず codex 既定モデルで実行します/);
+
+  // apikey/unknown(=判定不能)では従来どおり sol が既定のまま。
+  const apikey = run(['--dry-run', '指示'], { env: { CODEX_DO_AUTH_MODE: 'apikey' } });
+  assert.match(apikey.stdout, /executor=codex model=gpt-5\.6-sol effort=default lane=default_sol/);
+  const unknown = run(['--dry-run', '指示'], { env: { CODEX_DO_AUTH_MODE: 'unknown' } });
+  assert.match(unknown.stdout, /executor=codex model=gpt-5\.6-sol effort=default lane=default_sol/);
+
+  // 明示 --model / --lane は ChatGPT 認証下でも尊重される(ユーザーの意図的な指定のため)。
+  const explicitModel = run(['--dry-run', '--model', 'sol', '指示'], { env: { CODEX_DO_AUTH_MODE: 'chatgpt' } });
+  assert.match(explicitModel.stdout, /executor=codex model=gpt-5\.6-sol effort=default lane=explicit_model/);
+  const explicitLane = run(['--dry-run', '--lane', 'astra', '指示'], { env: { CODEX_DO_AUTH_MODE: 'chatgpt' } });
+  assert.match(explicitLane.stdout, /executor=codex model=gpt-6-astra effort=high lane=lane_astra/);
+});
+
 function runRouting(t, args, mocks, cooldown = null) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-routing-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -791,7 +1795,7 @@ function runRouting(t, args, mocks, cooldown = null) {
   if (cooldown) fs.writeFileSync(path.join(claude, 'provider-cooldown.json'), JSON.stringify(cooldown));
   fs.writeFileSync(path.join(claude, 'codex-fallback-order.json'), JSON.stringify(['cheap-code:deepseek']));
   const result = run(['--force-native', '--cwd', home, ...args], {
-    home, env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mocks), DEEPSEEK_API_KEY: 'test-key' },
+    home, env: { CODEX_DO_MOCK_RESULTS: JSON.stringify(mocks), OPENROUTER_API_KEY: 'test-key' },
   });
   const read = (name) => {
     try { return fs.readFileSync(path.join(claude, name), 'utf8'); } catch { return ''; }
@@ -821,7 +1825,7 @@ test('Astra and Sol quota proceed to cheap-code once', (t) => {
   assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
   assert.ok(result.cooldown.codex.until > Date.now());
   assert.equal(result.ledger.length, 3);
-  assert.deepEqual(result.ledger.map((r) => [r.timedOut, r.status]), [[false, 1], [false, 1], [false, 0]]);
+  assert.deepEqual(result.ledger.map((r) => [r.timedOut, r.status]), [[false, 'error'], [false, 'error'], [false, 'ok']]);
 });
 
 for (const [name, first, prompt] of [
@@ -835,7 +1839,7 @@ for (const [name, first, prompt] of [
     assert.equal(result.status, name === 'empty diff' ? 1 : 0, result.stderr);
     assert.match(result.stdout, /sol 失敗 → astra へ昇格/);
     assert.deepEqual(result.ledger.map((r) => [r.model, r.escalated]), [[`codex-cli/${SOL}`, false], [`codex-cli/${ASTRA}`, true]]);
-    assert.deepEqual(result.ledger.map((r) => [r.timedOut, r.status]), [[first.timedOut === true, first.status ?? 0], [false, 0]]);
+    assert.deepEqual(result.ledger.map((r) => [r.timedOut, r.status]), [[first.timedOut === true, first.timedOut || first.status === 124 ? 'timeout' : first.status ? 'error' : 'ok'], [false, 'ok']]);
   });
 }
 
@@ -912,7 +1916,7 @@ console.log('done');
   assert.equal(calls.length, 3);
   const expectedArgs = (options) => {
     const args = buildCodexExecArgs(options);
-    args.splice(-1, 0, '--skip-git-repo-check');
+    if (!isInsideGitRepo(home)) args.splice(-1, 0, '--skip-git-repo-check');
     return args;
   };
   assert.deepEqual(calls[0].args, expectedArgs({ slug: ASTRA, effort: 'high' }));
@@ -922,4 +1926,612 @@ console.log('done');
   assert.equal(calls[1].input, calls[2].input);
   assert.ok(calls[0].input.endsWith(instruction));
   assert.ok(calls.every((call) => !call.args.some((arg) => arg.includes('literal'))));
+});
+
+// ---- 実行レーンの保留(A) / 無人割当(B) / 作業種別の振り分け(C) ----
+const MONTHS_EN = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function futureLimitText(daysAhead = 2) {
+  const d = new Date(Date.now() + daysAhead * 86400000);
+  d.setHours(3, 12, 0, 0);
+  return `ERROR: You've hit your usage limit. Upgrade to Pro, or try again at ${MONTHS_EN[d.getMonth()]} ${d.getDate()}th, ${d.getFullYear()} 3:12 AM.`;
+}
+const readLedger = (home) => fs.readFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+const lastJson = (stdout) => JSON.parse(stdout.trim().split('\n').filter((l) => l.startsWith('{')).pop());
+const tmpHome = (t, name) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), `${name}-`));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  return home;
+};
+const unattendedRow = (extra = {}) => JSON.stringify({ t: new Date().toISOString(), provider: 'codex', origin: 'unattended', status: 'ok', ...extra });
+
+test('A: 上限メッセージの stderr で codex-cooldown.json が書かれ、次回起動は Codex を呼ばず deferred(75) になる', (t) => {
+  const home = tmpHome(t, 'codex-cooldown-gate');
+  const first = run(['--force-native', '--cwd', home, '--no-fallback', '--model', 'sol', '新機能を実装して'], {
+    home,
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([{ status: 1, output: 'partial', stderr: futureLimitText(2) }]) },
+  });
+  assert.notEqual(first.status, 0);
+  const cooldown = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'codex-cooldown.json'), 'utf8'));
+  // 本文が示す再開時刻は約2日先だが、writer が 5 時間へ丸める。
+  // 2026-10-11〜14 は週次リセットの 90.5 時間がそのまま入り、Codex 本体は健全なのに
+  // 3 日間一度も再試行されなかった(丸めが無いと枠回復後も無音で死ぬ)。
+  assert.equal(cooldown.reason, 'usage_limit:capped');
+  assert.ok(Math.abs(cooldown.until - (Date.now() + 5 * 3600 * 1000)) < 60000, 'until は約5時間後');
+  assert.ok(Math.abs(cooldown.t - Date.now()) < 60000);
+  // 2回目はモックを渡さない。本物の Codex を起動しようとしたら deferred にならず失敗する。
+  const second = run(['--force-native', '--cwd', home, '新機能を実装して'], { home });
+  assert.equal(second.status, 75, second.stderr);
+  const payload = lastJson(second.stdout);
+  assert.equal(payload.status, 'deferred');
+  assert.equal(payload.reason, 'codex_cooldown');
+  assert.equal(payload.retryAt, cooldown.until);
+  const row = readLedger(home).at(-1);
+  assert.equal(row.status, 'deferred');
+  assert.equal(row.launched, false);
+});
+
+test('A: cooldown 中でも代替バックエンドがあれば deferred にせず codex を起動しないままフォールバックへ回る', (t) => {
+  const home = tmpHome(t, 'codex-cooldown-fallback');
+  fs.writeFileSync(path.join(home, '.claude', 'codex-cooldown.json'), JSON.stringify({ until: Date.now() + 4 * 86400000, reason: 'usage_limit', t: Date.now() }));
+  fs.writeFileSync(path.join(home, '.claude', 'codex-cooldown-recheck.json'), JSON.stringify({ at: Date.now() }));
+  // モックは1件だけ。codex が起動されればこの1件を codex が消費してフォールバックが失敗する。
+  const mock = JSON.stringify([{ status: 0, output: 'Qwen Code CLI has successfully completed.', stderr: '' }]);
+  const result = run(['--force-native', '--cwd', home, '--kind', 'implement', '指示内容'], {
+    home, env: { CODEX_DO_MOCK_RESULTS: mock, GEMINI_API_KEY: '', OPENROUTER_API_KEY: 'sk-test' },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek \(理由: Codex usage limit クールダウン中\)/);
+  assert.match(result.stderr, /codex_cooldown.*代替バックエンドへ回します/);
+  assert.doesNotMatch(result.stderr, /保留: codex_cooldown/);
+  assert.doesNotMatch(result.stdout, /"status":"deferred"/);
+  // --no-fallback の明示があれば従来どおり保留(75)。
+  const strict = run(['--force-native', '--cwd', home, '--kind', 'implement', '--no-fallback', '指示内容'], {
+    home, env: { CODEX_DO_MOCK_RESULTS: mock, GEMINI_API_KEY: '', OPENROUTER_API_KEY: 'sk-test' },
+  });
+  assert.equal(strict.status, 75, strict.stderr);
+  assert.equal(lastJson(strict.stdout).reason, 'codex_cooldown');
+  // deferred 行に fallbackSkipped が記録されていることを確認
+  const deferredRow = readLedger(home).at(-1);
+  assert.equal(deferredRow.status, 'deferred');
+  assert.equal(deferredRow.fallbackSkipped, 'no_fallback_flag');
+});
+
+test('A: 解析できない上限メッセージは24時間後を既定にしつつ writer が5時間へ丸める', (t) => {
+  const home = tmpHome(t, 'codex-cooldown-24h');
+  run(['--force-native', '--cwd', home, '--no-fallback', '--model', 'sol', '実装して'], {
+    home,
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([{ status: 1, output: 'partial', stderr: "ERROR: You've hit your usage limit. Please try again later." }]) },
+  });
+  const cooldown = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'codex-cooldown.json'), 'utf8'));
+  assert.equal(cooldown.reason, 'usage_limit:capped');
+  assert.ok(Math.abs(cooldown.until - (Date.now() + 5 * 3600 * 1000)) < 120000, '24時間既定も5時間へ丸める');
+});
+
+test('A: cooldown 中で代替バックエンドが無い場合、deferred 行に fallbackSkipped=no_backends が記録される', (t) => {
+  const home = tmpHome(t, 'codex-cooldown-no-backends');
+  fs.writeFileSync(path.join(home, '.claude', 'codex-cooldown.json'), JSON.stringify({ until: Date.now() + 4 * 86400000, reason: 'usage_limit', t: Date.now() }));
+  // recheck を抑制する（cooldown が 5h を超えると recheck=true になり cooldown をバイパスするため）
+  fs.writeFileSync(path.join(home, '.claude', 'codex-cooldown-recheck.json'), JSON.stringify({ at: Date.now() }));
+  // API キーを設定しない → resolveFallbackBackends が空
+  const result = run(['--force-native', '--cwd', home, '--kind', 'implement', '指示内容'], { home });
+  assert.equal(result.status, 75, result.stderr);
+  assert.equal(lastJson(result.stdout).reason, 'codex_cooldown');
+  const deferredRow = readLedger(home).at(-1);
+  assert.equal(deferredRow.status, 'deferred');
+  assert.equal(deferredRow.fallbackSkipped, 'no_backends');
+});
+
+test('A: cooldown が過去なら通常どおり Codex を起動する', (t) => {
+  const home = tmpHome(t, 'codex-cooldown-past');
+  fs.writeFileSync(path.join(home, '.claude', 'codex-cooldown.json'), JSON.stringify({ until: Date.now() - 1000, reason: 'usage_limit', t: 1 }));
+  const result = run(['--force-native', '--cwd', home, '--model', 'sol', '実装して'], { home, env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([{ status: 0, output: 'done' }]) } });
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('A: provider-limit-history で until が未来の glm は候補から外れ、deepseek へ差し替わる', (t) => {
+  const home = tmpHome(t, 'codex-glm-history');
+  fs.writeFileSync(path.join(home, '.claude', 'zai.env'), 'ZAI_API_KEY=z\n');
+  fs.writeFileSync(path.join(home, '.claude', 'openrouter.env'), 'OPENROUTER_API_KEY=d\n');
+  fs.writeFileSync(path.join(home, '.claude', 'codex-fallback-order.json'), JSON.stringify(['cheap-code:glm']));
+  const history = path.join(home, '.claude', 'provider-limit-history.jsonl');
+  fs.writeFileSync(history, `${JSON.stringify({ t: new Date().toISOString(), provider: 'glm', until: Date.now() + 3600000, reason: 'usage_limit' })}\n`);
+  assert.deepEqual(resolveFallbackBackends(home, { executableAvailable: () => true }).map((b) => b.name), ['cheap-code:deepseek']);
+  fs.appendFileSync(history, `${JSON.stringify({ t: new Date().toISOString(), provider: 'openrouter', until: Date.now() + 3600000, reason: 'usage_limit' })}\n`);
+  assert.equal(resolveFallbackBackends(home, { executableAvailable: () => true }).some((b) => b.provider === 'deepseek' || b.provider === 'glm'), false);
+});
+
+test('B: 当日の unattended Codex が8件あれば9件目は unattended_budget で deferred(75)、interactive は通る', (t) => {
+  const home = tmpHome(t, 'codex-budget-gate');
+  const lines = Array.from({ length: 8 }, () => unattendedRow());
+  // 数えない行: 一昨日 / interactive / deferred / 他 provider
+  lines.push(unattendedRow({ t: new Date(Date.now() - 2 * 86400000).toISOString() }));
+  lines.push(unattendedRow({ origin: 'interactive' }));
+  lines.push(unattendedRow({ status: 'deferred' }));
+  lines.push(unattendedRow({ provider: 'fallback' }));
+  fs.writeFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), `${lines.join('\n')}\n`);
+  const ninth = run(['--force-native', '--cwd', home, '--origin', 'unattended', '実装して'], { home });
+  assert.equal(ninth.status, 75, ninth.stderr);
+  const payload = lastJson(ninth.stdout);
+  assert.equal(payload.reason, 'unattended_budget');
+  assert.ok(payload.retryAt > Date.now());
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, '.claude', 'executor-budget.json'), 'utf8')), { codex: { unattendedPerDay: 8 }, glm: { unattendedPerDay: 20 } });
+  const interactive = run(['--force-native', '--cwd', home, '--model', 'sol', '実装して'], { home, env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([{ status: 0, output: 'done' }]) } });
+  assert.equal(interactive.status, 0, interactive.stderr);
+});
+
+test('B: 無人枠到達でも代替バックエンドがあれば deferred にせずフォールバックへ回る', (t) => {
+  const home = tmpHome(t, 'codex-budget-fallback');
+  fs.writeFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), `${Array.from({ length: 8 }, () => unattendedRow()).join('\n')}\n`);
+  // モックは1件だけ。Codex を起動せず代替バックエンドに渡すことを確認する。
+  const mock = JSON.stringify([{ status: 0, output: 'Qwen Code CLI has successfully completed.', stderr: '' }]);
+  const args = ['--force-native', '--cwd', home, '--kind', 'implement', '--origin', 'unattended'];
+  const env = { CODEX_DO_MOCK_RESULTS: mock, GEMINI_API_KEY: '', OPENROUTER_API_KEY: 'sk-test' };
+  const result = run([...args, '指示内容'], { home, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek \(理由: Codex 無人枠の日次上限に到達\)/);
+  assert.match(result.stderr, /unattended_budget.*無人枠 8\/8 件.*代替バックエンドへ回します/);
+  assert.doesNotMatch(result.stdout, /"status":"deferred"/);
+  const rows = readLedger(home);
+  assert.equal(rows.length, 9);
+  assert.equal(rows.some((row) => row.status === 'deferred'), false);
+  assert.equal(rows.at(-1).provider, 'fallback');
+  // --no-fallback の明示があれば従来どおり保留(75)。
+  const strict = run([...args, '--no-fallback', '指示内容'], { home, env });
+  assert.equal(strict.status, 75, strict.stderr);
+  assert.equal(lastJson(strict.stdout).status, 'deferred');
+  assert.equal(lastJson(strict.stdout).reason, 'unattended_budget');
+});
+
+test('B: 8件に満たなければ unattended でも通り、台帳に origin=unattended が残る', (t) => {
+  const home = tmpHome(t, 'codex-budget-under');
+  fs.writeFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), `${Array.from({ length: 7 }, () => unattendedRow()).join('\n')}\n`);
+  const result = run(['--force-native', '--cwd', home, '--model', 'sol', '--origin', 'unattended', '実装して'], { home, env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([{ status: 0, output: 'done' }]) } });
+  assert.equal(result.status, 0, result.stderr);
+  const row = readLedger(home).at(-1);
+  assert.equal(row.origin, 'unattended');
+  assert.equal(row.provider, 'codex');
+});
+
+test('B: 既存の executor-budget.json は尊重される(上限2なら3件目で保留)', (t) => {
+  const home = tmpHome(t, 'codex-budget-custom');
+  fs.writeFileSync(path.join(home, '.claude', 'executor-budget.json'), JSON.stringify({ codex: { unattendedPerDay: 2 }, glm: { unattendedPerDay: 20 } }));
+  fs.writeFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), `${[1, 2].map(() => unattendedRow()).join('\n')}\n`);
+  assert.equal(run(['--force-native', '--cwd', home, '--origin', 'unattended', '実装して'], { home }).status, 75);
+});
+
+test('B: --budget で残り割当を表示し、Codex は起動しない', (t) => {
+  const home = tmpHome(t, 'codex-budget-show');
+  fs.writeFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), `${[1, 2, 3].map(() => unattendedRow()).join('\n')}\n`);
+  const result = run(['--budget'], { home });
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout.split('\n')[0]);
+  assert.deepEqual(summary.codex, { limit: 8, used: 3, remaining: 5 });
+  assert.equal(summary.glm.limit, 20);
+});
+
+test('B: 不正な --origin / --kind は終了コード2', () => {
+  assert.equal(run(['--origin', 'robot', '--dry-run', '実装して']).status, 2);
+  assert.equal(run(['--kind', 'magic', '--dry-run', '実装して']).status, 2);
+});
+
+test('C: investigate は Codex を使わず llm-ask(gemini)の結果を返し、台帳に llm-ask として残る', (t) => {
+  const home = tmpHome(t, 'codex-kind-llm');
+  const result = run(['--force-native', '--cwd', home, '原因を調査してレポートにまとめて'], {
+    home,
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([{ status: 0, output: '調査結果: 原因は X' }]) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /調査結果: 原因は X/);
+  assert.match(result.stdout, /executor=llm-ask:gemini kind=investigate/);
+  const row = readLedger(home).at(-1);
+  assert.equal(row.provider, 'llm-ask');
+  assert.equal(row.kind, 'investigate');
+  const warning = '[codex-do] 注意: llm-ask 経路のためコマンドは実行していません。出力中の「実行結果」は検証されていません';
+  const lines = result.stdout.trim().split(/\r?\n/);
+  assert.equal(lines[0], warning);
+  assert.equal(lines.at(-1), warning);
+});
+
+test('C: llm-ask は gemini → deepseek の順に失敗時フォールバックする', (t) => {
+  const home = tmpHome(t, 'codex-kind-chain');
+  const result = run(['--force-native', '--cwd', home, '--kind', 'summarize', 'この文書'], {
+    home,
+    env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([{ status: 1, output: '', stderr: 'quota' }, { status: 0, output: '要約です' }]) },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /executor=llm-ask:deepseek kind=summarize/);
+});
+
+test('C: llm-ask が全滅しても Codex には落とさず失敗を返す', (t) => {
+  const home = tmpHome(t, 'codex-kind-allfail');
+  const bad = { status: 1, output: '', stderr: 'x' };
+  const result = run(['--force-native', '--cwd', home, '--kind', 'classify', '分類して'], { home, env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([bad, bad, bad]) } });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--kind implement/);
+});
+
+test('C: --kind implement / verify と、--model 明示は従来どおり Codex を使う', (t) => {
+  const home = tmpHome(t, 'codex-kind-codex');
+  const ok = { CODEX_DO_MOCK_RESULTS: JSON.stringify([{ status: 0, output: 'done' }]) };
+  for (const extra of [['--kind', 'implement'], ['--kind', 'verify'], ['--model', 'sol']]) {
+    const result = run(['--force-native', '--cwd', home, ...extra, '原因を調査して'], { home, env: ok });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /executor=codex/);
+  }
+});
+
+test('C: --dry-run は kind と経路を表示する', () => {
+  const result = run(['--dry-run', '--origin', 'unattended', 'この議事録を要約して']);
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /kind=summarize origin=unattended route=llm-ask/);
+});
+
+test('C: 長い --prompt-file は自動判定せず implement(Codex)として扱う', () => {
+  const file = writePrompt(`# 仕様\n${'調査 '.repeat(600)}\n完了条件: なし\n`);
+  const result = run(['--dry-run', '--prompt-file', file]);
+  assert.match(result.stdout, /kind=implement/);
+});
+
+// 2026-10-10 nishi-PC 実測: Codex CLI の上限文言は U+2019（’）付きで出る。ASCII の ' だけでは検出できず、
+// クールダウンも代替バックエンドへの切替も起きずに同じ失敗を 3 回繰り返した。
+test('detectQuotaLimit: U+2019 の引用符つき usage limit 文言を検出する', () => {
+  const stderr = 'ERROR: You\u2019ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Oct 14th, 2026 9:53 PM.';
+  const r = detectQuotaLimit('', stderr, 1, '');
+  assert.equal(r.matched, true);
+  assert.equal(r.pattern, "You've hit your usage limit");
+});
+
+test('killProcessTree は Windows でプロセス木ごと殺す（タイムアウトを実効させる）', () => {
+  const calls = [];
+  killProcessTree({ pid: 4242, kill: (sig) => calls.push(['kill', sig]) },
+    { spawnImpl: (cmd, args) => calls.push([cmd, args]), platform: 'win32' });
+  assert.deepEqual(calls, [['taskkill', ['/pid', '4242', '/T', '/F']]]);
+});
+
+// 2026-11-04 実測: sync taskkill の待ち（最大10秒）がイベントループを止め、締切後の猶予タイマーごと
+// 後ろへずらして予算210秒の主経路が 226.786 秒まで伸びた。非同期 spawn で complete を待たない。
+test('killProcessTree は taskkill の完了を待たない（締切後の猶予を食い潰さない）', () => {
+  const calls = [];
+  let unrefed = false;
+  killProcessTree({ pid: 4242, kill: () => {} }, {
+    platform: 'win32',
+    spawnImpl: (cmd, args, options) => {
+      calls.push({ cmd, args, options });
+      return { unref: () => { unrefed = true; }, kill: () => {} };
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.stdio, 'ignore');
+  // spawnSync の timeout を渡す＝呼び出し側が完了までブロックする、という旧実装の印。
+  assert.equal('timeout' in calls[0].options, false);
+  assert.equal(unrefed, true, 'taskkill の子プロセスは unref して親の終了を待たせない');
+});
+
+test('killProcessTree は非 Windows で SIGKILL を送る', () => {
+  const calls = [];
+  killProcessTree({ pid: 4242, kill: (sig) => calls.push(['kill', sig]) },
+    { spawnImpl: () => { throw new Error('windows 以外では spawn しない'); }, platform: 'linux' });
+  assert.deepEqual(calls, [['kill', 'SIGKILL']]);
+});
+
+test('killProcessTree は pid が無ければ何もしない', () => {
+  const calls = [];
+  killProcessTree({ kill: () => calls.push('kill') },
+    { spawnImpl: () => calls.push('spawn'), platform: 'win32' });
+  assert.deepEqual(calls, []);
+});
+
+test('WSL 不在はネイティブ既定、require-wsl は中断、allow-native は no-op', async () => {
+  assert.equal(wslCodexLaunchPlan({distroFound:false,nativeAvailable:true}), 'native');
+  assert.equal(wslCodexLaunchPlan({distroFound:false,nativeAvailable:true,requireWsl:true}), 'abort');
+  assert.equal(wslCodexLaunchPlan({distroFound:false,allowNative:true}), 'abort');
+  const {nativeSandboxMode, applyNativeSandbox, resolveNativeCodex, recordLaneMode} = await import('./codex-do.mjs');
+  assert.equal(nativeSandboxMode(), 'danger-full-access');
+  assert.equal(nativeSandboxMode({review:true}), 'read-only');
+  assert.deepEqual(applyNativeSandbox(['exec','-s','workspace-write','-']), ['exec','-s','danger-full-access','-']);
+  assert.equal(resolveNativeCodex({platform:'win32',env:{APPDATA:'C:/fixture'},existsImpl:()=>true}).prefixArgs.length,1);
+  const h=fs.mkdtempSync(path.join(os.tmpdir(),'lane-mode-'));
+  try {recordLaneMode('native','danger-full-access',{home:h});const m=JSON.parse(fs.readFileSync(path.join(h,'.claude/lane-mode.json'),'utf8'));assert.equal(m.codex.mode,'native');assert.ok(Date.parse(m.codex.verifiedAt));} finally {fs.rmSync(h,{recursive:true,force:true});}
+});
+
+test('buildUsageRow は timeoutSecs と chain[].budgetSecs を台帳へ残す', () => {
+  const now = new Date('2026-10-22T00:00:00Z');
+  const row = buildUsageRow({
+    result: { status: 124, timedOut: true, outputChars: 0, stderr: '' },
+    model: 'codex-cli/gpt-5.6-sol', seconds: 1800.28, provider: 'codex',
+    timeoutSecs: 1800, lane: 'default_sol', promptChars: 400, origin: 'interactive', kind: 'implement', cwd: 'C:/repo', now,
+  });
+  assert.equal(row.timeoutSecs, 1800);
+  assert.equal(row.secs, 1800.28);
+  assert.equal(row.lane, 'default_sol');
+  assert.equal(row.in, 100);
+
+  const chained = buildUsageRow({
+    result: { status: 124, timedOut: true, outputChars: 0, stderr: '' }, model: 'x',
+    seconds: 950, timeoutSecs: 1800, now,
+    chain: [{ backend: 'gemini-cli', outcome: 'timeout', secs: 950, budgetSecs: 900 }],
+  });
+  assert.deepEqual(chained.chain.map((a) => a.budgetSecs), [900]);
+  assert.equal(chained.timeoutSecs, 1800);
+});
+
+test('buildUsageRow は timeoutSecs が無ければ行に生やさない（旧形式との互換）', () => {
+  const row = buildUsageRow({ result: { status: 0, outputChars: 4 }, model: 'm', seconds: 1, now: new Date('2026-10-22T00:00:00Z') });
+  assert.equal('timeoutSecs' in row, false);
+  assert.equal(row.status, 'ok');
+});
+
+// 2026-10-23 実測: gemini が拒否を3回出して以後無音のまま600秒 timeout になった（打ち切り未発火3件）。
+// chunk 到着時だけの判定では再評価されないため、周期タイマーで無音停滞も打ち切る。
+function fakeGeminiEnv(body) {
+  const dir = workDir();
+  fs.writeFileSync(path.join(dir, 'fake-gemini.mjs'), body, 'utf8');
+  if (process.platform === 'win32') {
+    fs.writeFileSync(path.join(dir, 'gemini.CMD'), '@echo off\r\nnode "%~dp0fake-gemini.mjs" %*\r\n', 'utf8');
+  } else {
+    fs.writeFileSync(path.join(dir, 'gemini'), `#!/bin/sh\nexec node "${path.join(dir, 'fake-gemini.mjs')}" "$@"\n`, { mode: 0o755 });
+  }
+  const pathKey = Object.keys(process.env).find((key) => key.toUpperCase() === 'PATH') || 'PATH';
+  return { PATH: `${dir}${path.delimiter}${process.env[pathKey] || ''}` };
+}
+
+function runFakeGemini(body, extraEnv = {}, timeoutSecs = 60) {
+  const mockResults = [
+    { status: 1, output: "You've hit your usage limit. Please try again later.", stderr: '' },
+    { real: true },
+    { status: 0, output: 'DeepSeek edited the files.', stderr: '' }
+  ];
+  // 2026-10-29: 既定のフォールバック順が「cheap-code 先頭」に変わったため、このテストが検証したい
+  // 「gemini のポリシー停滞打ち切り」を gemini が最初に試される順序で再現する。
+  const home = workDir();
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'codex-fallback-order.json'), JSON.stringify(['gemini-cli', 'cheap-code:deepseek']), 'utf8');
+  const started = Date.now();
+  const result = run(['--force-native', '--cwd', workDir(), '--timeout', String(timeoutSecs), '指示内容'], {
+    home,
+    env: {
+      ...fakeGeminiEnv(body),
+      CODEX_DO_MOCK_RESULTS: JSON.stringify(mockResults),
+      GEMINI_API_KEY: 'gemini-test',
+      OPENROUTER_API_KEY: 'deepseek-test',
+      CODEX_DO_POLICY_STALL_MIN_ELAPSED_SECS: '1',
+      CODEX_DO_POLICY_STALL_CHECK_MS: '200',
+      ...extraEnv
+    }
+  });
+  return { result, home, elapsedSecs: (Date.now() - started) / 1000 };
+}
+
+const DENY = 'Error executing tool run_shell_command: Tool execution denied by policy.\n';
+const silentAfter = (stderrText, stdoutText = '') =>
+  `process.stdout.write(${JSON.stringify(stdoutText)}); process.stderr.write(${JSON.stringify(stderrText)}); setInterval(() => {}, 1000);`;
+
+// 2026-10-28 実測: 予算600秒の gemini-cli 試行が 1044 秒。親が終わった後に孫が pipe を握り続けると
+// taskkill /T の木から外れ 'close' が来ず、timeout が実効しなかった。猶予後は close を待たず打ち切る。
+test('timeout 後に孫プロセスが pipe を握り続けても猶予後に打ち切り次のバックエンドへ進む', () => {
+  const { result, elapsedSecs } = runFakeGemini(
+    // 孫の cwd は作業ディレクトリ外にする（Windows で孫が cwd を握ると after の rmSync が EPERM になる）
+    `import { spawn } from 'node:child_process';\nimport os from 'node:os';\nspawn(process.execPath, ['-e', 'setTimeout(()=>{},15000)'], { stdio: 'inherit', detached: true, cwd: os.tmpdir() }).unref();\nprocess.exit(0);`,
+    { CODEX_DO_GEMINI_TIMEOUT_SECS: '2', CODEX_DO_TIMEOUT_KILL_GRACE_MS: '1000' }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
+  assert.ok(elapsedSecs < 10, `孫が pipe を握ると timeout が実効せず ${elapsedSecs} 秒かかった`);
+});
+
+// 2026-11-04: timeout_waste_exceeds_cap の証拠は「予算210秒の主経路が 226.786 秒」だった。
+// kill が同期だと締切+taskkill待ち+猶予まで伸びるので、台帳の試行秒数が予算+猶予に収まることを固定する。
+test('timeout 行の試行秒数は予算+kill猶予に収まる（kill で締切が伸びない）', () => {
+  const { result, home: ledgerHome } = runFakeGemini(
+    silentAfter(''), { CODEX_DO_GEMINI_TIMEOUT_SECS: '2', CODEX_DO_TIMEOUT_KILL_GRACE_MS: '1000' }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const ledger = fs.readFileSync(path.join(ledgerHome, '.claude', 'executor-usage.jsonl'), 'utf8')
+    .split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  const timedOut = ledger.flatMap((row) => (row.chain || []).filter((a) => a.outcome === 'timeout'));
+  assert.ok(timedOut.length >= 1, 'gemini 試行が timeout として台帳に残る');
+  for (const attempt of timedOut) {
+    const allowed = attempt.budgetSecs + 1 + 2; // 予算 + kill猶予(1秒) + 起動/計測の揺れ(2秒)
+    assert.ok(attempt.secs <= allowed,
+      `${attempt.backend} が予算${attempt.budgetSecs}秒+猶予1秒を超えて ${attempt.secs} 秒記録された`);
+  }
+});
+
+test('gemini が拒否3回の後に無音で停滞しても周期判定で打ち切り次のバックエンドへ進む', () => {
+  const { result, elapsedSecs } = runFakeGemini(silentAfter(DENY.repeat(3)));
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /ポリシー拒否が続き/);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
+  assert.ok(elapsedSecs < 50, `無音停滞が打ち切られず ${elapsedSecs} 秒かかった`);
+});
+
+// 2026-11-02 実測: 予算300秒 = 停滞判定の閾値秒だと締切タイマーが先に発火し outcome=timeout になっていた。
+test('予算が停滞判定の閾値秒以下でも、締切時に拒否3回・低出力なら blocked として次へ進む', () => {
+  const { result, home } = runFakeGemini(
+    silentAfter(DENY.repeat(3)),
+    { CODEX_DO_GEMINI_TIMEOUT_SECS: '3', CODEX_DO_POLICY_STALL_MIN_ELAPSED_SECS: '3', CODEX_DO_POLICY_STALL_CHECK_MS: '600000' }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /executor=fallback:cheap-code:deepseek/);
+  assert.match(result.stderr, /ポリシー拒否で停滞しているため/);
+  // 実 chain の台帳に残る実測値まで固定する。outcome が timeout のままだと
+  // delegation-health の policy_stall_not_aborted が再発する（2026-11-02 実測の再現条件）。
+  const ledger = fs.readFileSync(path.join(home, '.claude', 'executor-usage.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const gemini = ledger.at(-1).chain.find((a) => a.backend === 'gemini-cli');
+  assert.equal(gemini.outcome, 'blocked');
+  assert.ok(gemini.policyDenials >= 3, `拒否回数が台帳に残る: ${gemini.policyDenials}`);
+  assert.equal(gemini.outChars, 0);
+  assert.ok(gemini.budgetSecs <= 3, `打ち切った試行の予算: ${gemini.budgetSecs}`);
+});
+
+test('ポリシー停滞の打ち切りは出力400字以上・拒否3回未満・無効化指定では発火しない', () => {
+  const cases = [
+    { name: '出力400字以上', body: silentAfter(DENY.repeat(3), 'x'.repeat(400)) },
+    { name: '拒否2回', body: silentAfter(DENY.repeat(2)) },
+    { name: '無効化', body: silentAfter(DENY.repeat(3)), env: { CODEX_DO_POLICY_STALL_ABORT: '0' } }
+  ];
+  for (const c of cases) {
+    const { result } = runFakeGemini(c.body, c.env, 8);
+    assert.doesNotMatch(result.stderr, /ポリシー拒否が続き/, c.name);
+    assert.match(result.stderr, /秒で応答を終えなかった/, c.name);
+  }
+});
+
+test('期限前の生存確認は Codex の正常終了時だけ cooldown を解除する', async () => {
+  const { clearCooldownAfterRecheck } = await import('./codex-do.mjs');
+  const home = workDir();
+  const file = path.join(home, '.claude', 'codex-cooldown.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const saved = JSON.stringify({ until: Date.now() + 3 * 86400000 });
+  fs.writeFileSync(file, saved);
+  const logs = [];
+  const base = { home, recheck: true, result: { status: 0, output: 'PONG', stderr: '', launched: true }, quotaMatched: false, log: message => logs.push(message) };
+  for (const override of [
+    { recheck: false },
+    { result: { status: 1 } },
+    { result: { status: null } },
+    { result: { status: 0, timedOut: true } },
+    { result: { status: 0, launched: false } },
+    { quotaMatched: true },
+    { result: { status: 0, output: "You've hit your usage limit" } },
+    { result: { status: 0, stderr: 'You’ve hit your usage limit' } },
+  ]) {
+    assert.equal(clearCooldownAfterRecheck({ ...base, ...override }), false);
+    assert.equal(fs.readFileSync(file, 'utf8'), saved);
+    assert.deepEqual(logs, []);
+  }
+  assert.equal(clearCooldownAfterRecheck(base), true);
+  assert.equal(fs.existsSync(file), false);
+  assert.deepEqual(logs, ['[codex-do] cooldown を期限前の生存確認で解除']);
+});
+
+
+test('長期 cooldown の再確認成功で CLI が解除し、再度上限なら更新する', (t) => {
+  for (const limited of [false, true]) {
+    const home = tmpHome(t, 'codex-recheck-cli');
+    const file = path.join(home, '.claude', 'codex-cooldown.json');
+    fs.writeFileSync(file, JSON.stringify({ until: Date.now() + 3 * 86400000 }));
+    const result = run(['--force-native', '--cwd', home, '--model', 'sol', '--no-fallback', 'Reply PONG'], {
+      home, env: { CODEX_DO_MOCK_RESULTS: JSON.stringify([limited
+        ? { status: 1, output: 'partial', stderr: "ERROR: You've hit your usage limit. Please try again later." }
+        : { status: 0, output: 'PONG' }]) },
+    });
+    assert.match(result.stdout, /executor=codex/);
+    assert.ok(JSON.parse(fs.readFileSync(path.join(home, '.claude', 'codex-cooldown-recheck.json'), 'utf8')).at > 0);
+    if (limited) {
+      assert.equal(fs.existsSync(file), true);
+      assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).until < Date.now() + 6 * 3600000);
+      assert.doesNotMatch(result.stderr, /cooldown を期限前の生存確認で解除/);
+    } else {
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(fs.existsSync(file), false);
+      assert.match(result.stderr, /\[codex-do\] cooldown を期限前の生存確認で解除/);
+    }
+  }
+});
+
+// 2026-11-01 実測: 予算210秒の codex 主経路が 226.8 秒。secs は launchCodex 全体（再試行・起動前時間を含む）を
+// 計るのに execute の timer は呼び出しごとに --timeout 全量で掛かっていた。fast-fail の再試行（attempt 2）に
+// 残り予算だけが渡ることで、主経路全体が予算を超えないことを偽 codex で見る。
+function fakeNativeCodexEnv(body) {
+  const dir = workDir();
+  const script = path.join(dir, 'fake-codex.mjs');
+  fs.writeFileSync(script, body.replaceAll('__DIR__', JSON.stringify(dir)), 'utf8');
+  if (process.platform === 'win32') {
+    const binDir = path.join(dir, 'npm', 'node_modules', '@openai', 'codex', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(path.join(binDir, 'codex.js'), `import ${JSON.stringify(pathToFileURL(script).href)};\n`, 'utf8');
+    return { APPDATA: dir, ProgramFiles: path.join(dir, 'none') };
+  }
+  fs.writeFileSync(path.join(dir, 'codex'), `#!/bin/sh\nexec node "${script}" "$@"\n`, { mode: 0o755 });
+  const pathKey = Object.keys(process.env).find((key) => key.toUpperCase() === 'PATH') || 'PATH';
+  return { PATH: `${dir}${path.delimiter}${process.env[pathKey] || ''}` };
+}
+
+test('fast-fail 再試行の timer は主経路の残り予算だけで掛かり、全体で --timeout を超えない', () => {
+  const env = fakeNativeCodexEnv(`
+import fs from 'node:fs';
+import path from 'node:path';
+const marker = path.join(__DIR__, 'first-done');
+if (!fs.existsSync(marker)) {
+  fs.writeFileSync(marker, '1');
+  setTimeout(() => process.exit(1), 4000);
+} else {
+  setInterval(() => {}, 1000);
+}
+`);
+  const result = run(['--force-native', '--cwd', workDir(), '--no-fallback', '--timeout', '8', '指示内容'], { env });
+  const timeouts = [...result.stderr.matchAll(/が (\d+(?:\.\d+)?) 秒で応答を終えなかった/g)].map((m) => Number(m[1]));
+  assert.ok(timeouts.length >= 1, `timeout 発火が見えない: ${result.stderr}`);
+  // 1 回目が約 4 秒使うので、2 回目の timer は 8 秒ではなく残り約 4 秒でなければならない。
+  assert.ok(timeouts[0] <= 5, `再試行の timer が残り予算でなく ${timeouts[0]} 秒だった`);
+});
+
+// ── parseCodexOutput ──────────────────────────────────────────────
+// delegation-health codex_empty_output 診断用: 出力の空/JSON/パースエラーを分類する。
+
+test('parseCodexOutput: null または undefined は no_output', () => {
+  const r = parseCodexOutput(null);
+  assert.equal(r.status, 'no_output');
+  assert.equal(r.raw, '');
+});
+
+test('parseCodexOutput: 空文字列は no_output', () => {
+  const r = parseCodexOutput('');
+  assert.equal(r.status, 'no_output');
+  assert.equal(r.raw, '');
+});
+
+test('parseCodexOutput: 空白のみは no_output', () => {
+  const r = parseCodexOutput('  \n  \t  ');
+  assert.equal(r.status, 'no_output');
+  assert.equal(r.raw, '  \n  \t  ');
+});
+
+test('parseCodexOutput: 空JSONオブジェクト{}は no_output', () => {
+  const r = parseCodexOutput('{}');
+  assert.equal(r.status, 'no_output');
+  assert.equal(r.raw, '{}');
+});
+
+test('parseCodexOutput: プレーンテキスト(非JSON)は parse_error', () => {
+  const r = parseCodexOutput('some random text output');
+  assert.equal(r.status, 'parse_error');
+  assert.equal(r.raw, 'some random text output');
+});
+
+test('parseCodexOutput: codex 形式のテキスト出力は parse_error', () => {
+  const r = parseCodexOutput('--- a/foo.js\n+++ b/foo.js\n@@ -1 +1 @@\n+console.log("hello");');
+  assert.equal(r.status, 'parse_error');
+});
+
+test('parseCodexOutput: 有効なJSONオブジェクトは ok と解析済みdataを返す', () => {
+  const r = parseCodexOutput('{"key": "value", "num": 42}');
+  assert.equal(r.status, 'ok');
+  assert.equal(r.data.key, 'value');
+  assert.equal(r.data.num, 42);
+});
+
+test('parseCodexOutput: 有効なJSON配列は ok を返す', () => {
+  const r = parseCodexOutput('["a", "b", "c"]');
+  assert.equal(r.status, 'ok');
+  assert.deepEqual(r.data, ['a', 'b', 'c']);
+});
+
+test('parseCodexOutput: 入れ子JSONは ok', () => {
+  const r = parseCodexOutput('{"status": "completed", "files": ["a.js", "b.js"]}');
+  assert.equal(r.status, 'ok');
+  assert.equal(r.data.files.length, 2);
+});
+
+test('parseCodexOutput: JSON null リテラルは no_output', () => {
+  const r = parseCodexOutput('null');
+  assert.equal(r.status, 'no_output');
+});
+
+test('parseCodexOutput: 閉じ括弧欠落のmalformed JSONは parse_error', () => {
+  const r = parseCodexOutput('{"key": "value"');
+  assert.equal(r.status, 'parse_error');
+  assert.ok(r.raw.includes('key'));
 });

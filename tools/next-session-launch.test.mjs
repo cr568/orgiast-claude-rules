@@ -5,9 +5,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
 import {
+  countClaudeProcesses,
   accountConfigPath,
   accountLabel,
   applyTrust,
+  buildRecoveryCommand,
   buildVscodeExtUri,
   buildVscodeUri,
   hasUnsentVscodeTab,
@@ -26,6 +28,7 @@ import {
   pickRoute,
   resolveClaudeBinary,
   resolveConfigDir,
+  resolveLaunchCwd,
   resolveVscodeCli,
   resolveWt,
   runHeadlessNextSession,
@@ -34,6 +37,38 @@ import {
   shouldInstallBundledVsix,
   trustKeyVariants,
 } from './next-session-launch.mjs';
+
+test('cwd は不在の先頭候補を記録し、次の実在候補で探索を止める', () => {
+  const checked = [];
+  assert.deepEqual(resolveLaunchCwd({
+    candidates: [['handoff', '/missing'], ['current', '/present'], ['later', '/unused']],
+    exists: (candidate) => { checked.push(candidate); return candidate === '/present'; },
+    fallback: '/repo',
+  }), {
+    cwd: '/present', missing: [{ source: 'handoff', candidate: '/missing' }],
+    usedFallback: false, explicitMissing: false,
+  });
+  assert.deepEqual(checked, ['/missing', '/present']);
+});
+
+test('cwd 候補が全て不在なら基準パスへフォールバックする', () => {
+  assert.deepEqual(resolveLaunchCwd({
+    candidates: [['handoff', '/missing'], ['current', '']],
+    exists: () => false, fallback: '/repo',
+  }), {
+    cwd: '/repo', missing: [{ source: 'handoff', candidate: '/missing' }, { source: 'current', candidate: '' }],
+    usedFallback: true, explicitMissing: false,
+  });
+});
+
+test('--cwd の不在は explicitMissing として返す', () => {
+  assert.deepEqual(resolveLaunchCwd({
+    candidates: [['--cwd', '/missing']], exists: () => false, fallback: '/repo',
+  }), {
+    cwd: '/repo', missing: [{ source: '--cwd', candidate: '/missing' }],
+    usedFallback: true, explicitMissing: true,
+  });
+});
 
 test('config dir は state、env、既定の順で解決し state の ~ を展開する', () => {
   const home = 'C:\\Users\\test';
@@ -84,6 +119,16 @@ test('Claude Code の open URI にプロンプトを URL エンコードする',
   assert.equal(buildVscodeUri('/session-start'), 'vscode://Anthropic.claude-code/open?prompt=%2Fsession-start');
   assert.equal(buildVscodeUri('日本語 開始'), `vscode://Anthropic.claude-code/open?prompt=${encodeURIComponent('日本語 開始')}`);
   assert.equal(buildVscodeUri(''), 'vscode://Anthropic.claude-code/open');
+});
+
+test('PowerShell 退避コマンドは code CLI の有無に応じた引用済みコマンドを返す', () => {
+  assert.equal(
+    buildRecoveryCommand({ codeCli: 'C:\\Code Folder\\bin\\code.cmd', prompt: '/session-start 日本語' }),
+    `& "C:\\Code Folder\\bin\\code.cmd" --open-url "vscode://Anthropic.claude-code/open?prompt=${encodeURIComponent('/session-start 日本語')}"`,
+  );
+  const fallback = buildRecoveryCommand({ codeCli: '', prompt: '/session-start' });
+  assert.match(fallback, /^& "\$env:LOCALAPPDATA\\Programs\\Microsoft VS Code\\bin\\code\.cmd" --open-url "/);
+  assert.match(fallback, /prompt=%2Fsession-start"$/);
 });
 
 test('自前拡張 URI は prompt/cwd/claude を個別に URL エンコードする', () => {
@@ -172,6 +217,15 @@ test('引き継ぎコメントから Windows cwd を取り出す', () => {
   assert.equal(parseHandoffCwd('コメントなし'), '');
 });
 
+test('引き継ぎコメントをセグメント単位で解析する', () => {
+  const text = '<!-- 前セッション: abc / 更新: 2026-09-18 / cwd: C:/Users/uers/Downloads/CLAUDE.md配布 / model: opus -->';
+  assert.equal(parseHandoffCwd(text), 'C:/Users/uers/Downloads/CLAUDE.md配布');
+  assert.equal(parseHandoffModel(text), 'opus');
+  assert.equal(parseHandoffCwd('<!-- cwd: C:/work -->'), 'C:/work');
+  // model だけのコメントも旧挙動どおり受理する（cwd セグメントの有無に依存しない）
+  assert.equal(parseHandoffModel('<!-- model: sonnet -->'), 'sonnet');
+});
+
 test('VSCode 拡張バージョンを辞書順ではなく数値で比較する', () => {
   const names = ['anthropic.claude-code-2.1.99-win32-x64', 'anthropic.claude-code-2.1.250-win32-x64', 'foo'];
   assert.equal(pickNewestExtensionBinary(names), 'anthropic.claude-code-2.1.250-win32-x64');
@@ -258,8 +312,9 @@ function fakeIo(overrides = {}) {
     calls,
     io: {
       env: { CLAUDE_CLI_PATH: claude },
+      countClaudeProcesses: () => null,
       homedir: () => home,
-      exists: (file) => file === claude,
+      exists: (file) => file === claude || file === 'C:\\work',
       readdir: () => [],
       readFile: async (file) => {
         if (file.endsWith('next-session.md')) return '<!-- 前セッション: abc / 更新: 2026-08-28 / cwd: C:\\work -->';
@@ -367,13 +422,30 @@ test('起動成功時に detached spawn し state を tmp から原子的に更�
   assert.ok(stateRename);
 });
 
+test('handoff cwd が存在しない場合は存在する current cwd を使って通知する', async () => {
+  const handoffCwd = 'C:/missing';
+  const currentCwd = 'D:/current';
+  const { io, calls } = fakeIo({
+    exists: (file) => file === '/fake/claude.exe' || file === currentCwd,
+    readFile: async (file) => {
+      if (file.endsWith('next-session.md')) return `<!-- cwd: ${handoffCwd} -->`;
+      if (file.endsWith('current-session.json')) return JSON.stringify({ cwd: currentCwd });
+      if (file.endsWith('.claude.json')) return '{}';
+      throw new Error('ENOENT');
+    },
+  });
+  assert.equal(await launchNextSession(['--target', 'terminal'], io), 0);
+  assert.equal(calls.spawn[0][2].cwd, currentCwd);
+  assert.ok(calls.logs.includes(`[next-session] 注意: handoff の cwd(${handoffCwd}) が存在しないため ${currentCwd} を使います`));
+});
+
 function pendingTabIo(firstUserLine, readHeadOverride) {
   const codeCli = 'C:\\Code\\bin\\code.cmd';
   const lastLaunchAt = '2026-08-31T10:00:00.000Z';
   const lastLaunch = Date.parse(lastLaunchAt);
   return fakeIo({
     env: { VSCODE_CLI_PATH: codeCli },
-    exists: (file) => file === codeCli,
+    exists: (file) => file === codeCli || file === 'C:\\work',
     now: Date.parse('2026-08-31T10:03:00.000Z'),
     readdir: (dir) => (dir.includes('projects') ? ['candidate.jsonl'] : []),
     stat: () => ({ birthtimeMs: lastLaunch + 1 }),
@@ -467,7 +539,7 @@ test('VSCode 経路は既定で URI だけを撃ち、既存ウィンドウを�
   const waited = [];
   const { io, calls } = fakeIo({
     env: { VSCODE_CLI_PATH: codeCli },
-    exists: (file) => file === codeCli,
+    exists: (file) => file === codeCli || file === 'C:\\work',
     wait: async (ms) => waited.push(ms),
   });
   assert.equal(await launchNextSession(['--target', 'vscode'], io), 0);
@@ -485,12 +557,90 @@ test('VSCode 経路は既定で URI だけを撃ち、既存ウィンドウを�
   assert.match(successLog, /cwd   : C:\\work/);
 });
 
+for (const dryRun of [false, true]) {
+  test(`不在の --cwd は起動せず PowerShell 退避も出さない (dry-run=${dryRun})`, async () => {
+    const codeCli = '/fake/code.cmd';
+    const { io, calls } = fakeIo({
+      env: { VSCODE_CLI_PATH: codeCli },
+      exists: (file) => file === codeCli || file === 'C:\\work',
+    });
+    const args = ['--target', 'vscode', '--cwd', '/missing'];
+    if (dryRun) args.push('--dry-run');
+    assert.equal(await launchNextSession(args, io), 0);
+    assert.ok(calls.logs.includes('[next-session] スキップ: --cwd が指すフォルダが存在しません: /missing'));
+    assert.doesNotMatch(calls.logs.join('\n'), /PowerShell 退避:/);
+    assert.equal(calls.spawn.length, 0);
+    assert.equal(calls.writes.length, 0);
+    assert.equal(calls.renames.length, 0);
+  });
+}
+
+test('解決後に cwd が消えた場合は cwd の不在を通知し PowerShell 退避を出さない', async () => {
+  const codeCli = '/fake/code.cmd';
+  const cwd = '/work';
+  let present = true;
+  const { io, calls } = fakeIo({
+    env: { VSCODE_CLI_PATH: codeCli },
+    exists: (file) => file === codeCli || (file === cwd && present),
+    spawn: (...args) => {
+      calls.spawn.push(args);
+      const child = new EventEmitter();
+      queueMicrotask(() => {
+        present = false;
+        child.emit('error', new Error('spawn cmd.exe ENOENT'));
+      });
+      return child;
+    },
+  });
+  assert.equal(await launchNextSession(['--target', 'vscode', '--cwd', cwd], io), 0);
+  assert.equal(calls.spawn[0][2].cwd, cwd);
+  assert.deepEqual(calls.logs, [`[next-session] スキップ: 起動に失敗しました (cwd が存在しません: ${cwd})`]);
+  assert.equal(calls.writes.length, 0);
+});
+
+test('VSCode spawn が ENOENT の時は PowerShell 退避コマンドを出して exit 0 を保つ', async () => {
+  const codeCli = 'C:\\Code\\bin\\code.cmd';
+  const { io, calls } = fakeIo({
+    env: { VSCODE_CLI_PATH: codeCli },
+    exists: (file) => file === codeCli || file === 'C:\\work',
+    spawn: (...args) => {
+      calls.spawn.push(args);
+      const child = new EventEmitter();
+      child.unref = () => {};
+      queueMicrotask(() => child.emit('error', new Error('spawn cmd.exe ENOENT')));
+      return child;
+    },
+  });
+  assert.equal(await launchNextSession(['--target', 'vscode'], io), 0);
+  const output = calls.logs.join('\n');
+  assert.match(output, /PowerShell 退避:/);
+  assert.match(output, /--open-url/);
+  assert.match(output, /prompt=%2Fsession-start/);
+});
+
+test('ENOENT/spawn ではない起動失敗では PowerShell 退避を出さない', async () => {
+  const codeCli = 'C:\\Code\\bin\\code.cmd';
+  const { io, calls } = fakeIo({
+    env: { VSCODE_CLI_PATH: codeCli },
+    exists: (file) => file === codeCli || file === 'C:\\work',
+    spawn: (...args) => {
+      calls.spawn.push(args);
+      const child = new EventEmitter();
+      child.unref = () => {};
+      queueMicrotask(() => child.emit('error', new Error('permission denied')));
+      return child;
+    },
+  });
+  assert.equal(await launchNextSession(['--target', 'vscode'], io), 0);
+  assert.doesNotMatch(calls.logs.join('\n'), /PowerShell 退避:/);
+});
+
 test('--open-folder のときだけ新規ウィンドウ(-n)を先に開く', async () => {
   const codeCli = 'C:\\Code\\bin\\code.cmd';
   const waited = [];
   const { io, calls } = fakeIo({
     env: { VSCODE_CLI_PATH: codeCli },
-    exists: (file) => file === codeCli,
+    exists: (file) => file === codeCli || file === 'C:\\work',
     wait: async (ms) => waited.push(ms),
   });
   assert.equal(await launchNextSession(['--target', 'vscode', '--open-folder'], io), 0);
@@ -503,7 +653,7 @@ test('--open-folder のときだけ新規ウィンドウ(-n)を先に開く', as
 
 test('VSCode dry-run は route と手順だけを出して spawn しない', async () => {
   const codeCli = 'C:\\Code\\bin\\code.cmd';
-  const { io, calls } = fakeIo({ env: { VSCODE_CLI_PATH: codeCli }, exists: (file) => file === codeCli });
+  const { io, calls } = fakeIo({ env: { VSCODE_CLI_PATH: codeCli }, exists: (file) => file === codeCli || file === 'C:\\work' });
   assert.equal(await launchNextSession(['--target', 'vscode', '--dry-run'], io), 0);
   assert.equal(calls.spawn.length, 0);
   const output = JSON.parse(calls.logs[0]);
@@ -521,7 +671,7 @@ function vscodeExtIo({ installedVersion = '', bundledVersion = '0.3.2', codeCli 
   let exitListenerAttached = false;
   const base = fakeIo({
     env: { VSCODE_CLI_PATH: codeCli, CLAUDE_CLI_PATH: 'C:\\Claude CLI\\claude.exe' },
-    exists: (file) => file === codeCli || file === 'C:\\Claude CLI\\claude.exe',
+    exists: (file) => file === codeCli || file === 'C:\\Claude CLI\\claude.exe' || file === 'C:\\work',
     readdir: (dir) => dir.endsWith('vscode-next-session') ? [`orgiast-next-session-${bundledVersion}.vsix`] : [],
     runCodeCli: async (args) => {
       commands.push(args);
@@ -600,7 +750,7 @@ test('vscode-ext は URI を撃った子プロセスの exit を待ってから�
   let spawnedChild = null;
   const { io } = fakeIo({
     env: { VSCODE_CLI_PATH: codeCli, CLAUDE_CLI_PATH: 'C:\\Claude CLI\\claude.exe' },
-    exists: (file) => file === codeCli || file === 'C:\\Claude CLI\\claude.exe',
+    exists: (file) => file === codeCli || file === 'C:\\Claude CLI\\claude.exe' || file === 'C:\\work',
     readdir: (dir) => dir.endsWith('vscode-next-session') ? ['orgiast-next-session-0.1.0.vsix'] : [],
     runCodeCli: async (args) => {
       commands.push(args);
@@ -636,7 +786,7 @@ test('vscode-ext は URI を撃った子プロセスの exit を待ってから�
 });
 
 test('vscode-ext で code CLI が無い時は理由を出して既存 vscode 経路へフォールバックする', async () => {
-  const base = fakeIo({ env: {}, exists: () => false });
+  const base = fakeIo({ env: {}, exists: (file) => file === 'C:\\work' });
   assert.equal(await launchNextSession(['--target', 'vscode-ext'], base.io), 0);
   assert.equal(base.calls.spawn.length, 0);
   assert.match(base.calls.logs[0], /vscode-ext を使えないため vscode 経路へフォールバック/);
@@ -861,7 +1011,7 @@ test('vscode 経路で state.configDir が指定されていたら効かない�
   const io = {
     ...base.io,
     env: { VSCODE_CLI_PATH: codeCli },
-    exists: (file) => file === codeCli,
+    exists: (file) => file === codeCli || file === 'C:\\work',
     readFile: async (file) => {
       if (file.endsWith('next-session-launch.json')) return JSON.stringify({ enabled: true, configDir: 'D:/team-config' });
       if (file.endsWith('next-session.md')) return '<!-- cwd: C:/work -->';
@@ -978,7 +1128,7 @@ test('headless は glm 失敗後に deepseek の代替レーンで成功する',
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orgiast-nsl-alternate-'));
   try {
     fs.mkdirSync(path.join(tempDir, '.claude'), { recursive: true });
-    fs.writeFileSync(path.join(tempDir, '.claude', 'deepseek.env'), 'DEEPSEEK_API_KEY=test-key\n', 'utf8');
+    fs.writeFileSync(path.join(tempDir, '.claude', 'openrouter.env'), 'OPENROUTER_API_KEY=test-key\n', 'utf8');
     const { calls, spawnImpl } = headlessSpawnRecorder([3, 0]);
     const result = await runHeadlessNextSession({
       env: { ORGIAST_AUTO_SESSION_EXECUTOR: 'cheap-code', ORGIAST_AUTO_SESSION_PROVIDER: 'glm' },
@@ -999,4 +1149,39 @@ test('headless は glm 失敗後に deepseek の代替レーンで成功する',
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+
+test('注入したプロセス数が 12 なら起動をスキップし過負荷をログに出す', async () => {
+  const { io, calls } = fakeIo({ countClaudeProcesses: () => 12 });
+  assert.equal(await launchNextSession(['--target', 'terminal'], io), 0);
+  assert.equal(calls.spawn.length, 0);
+  assert.match(calls.logs.join('\n'), /スキップ:.*過負荷/);
+});
+
+test('過負荷ガードは上限・環境設定・force・取得不能を扱う', () => {
+  const base = { state: {}, now: Date.now(), env: {}, force: false, pendingTab: false };
+  const blocked = shouldLaunch({ ...base, claudeProcesses: 12 });
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.reason, /過負荷/);
+  assert.equal(shouldLaunch({ ...base, claudeProcesses: 11 }).ok, true);
+  assert.equal(shouldLaunch({ ...base, claudeProcesses: 12, force: true }).ok, true);
+  assert.equal(shouldLaunch({ ...base, claudeProcesses: 12, env: { ORGIAST_NEXT_SESSION_MAX_CLAUDE: '20' } }).ok, true);
+  assert.equal(shouldLaunch({ ...base, claudeProcesses: null }).ok, true);
+});
+
+test('tasklist CSV の Claude 行を数え、実行失敗なら null を返す', () => {
+  const fakeExec = (command, args, options) => {
+    assert.equal(command, 'tasklist');
+    assert.deepEqual(args, ['/FI', 'IMAGENAME eq claude.exe', '/FO', 'CSV', '/NH']);
+    assert.equal(options.timeout, 10_000);
+    assert.equal(options.windowsHide, true);
+    return ['"claude.exe","1234","Console","1","100 K"',
+      '"claude.exe","2345","Console","1","100 K"',
+      '"CLAUDE.EXE","3456","Console","1","100 K"',
+      '情報: 指定された条件に一致するタスクはありません。'].join('\r\n');
+  };
+  assert.equal(countClaudeProcesses(fakeExec), 3);
+  assert.equal(countClaudeProcesses(() => { throw new Error('tasklist failed'); }), null);
+  if (process.platform !== 'win32') assert.equal(countClaudeProcesses(), null);
 });
