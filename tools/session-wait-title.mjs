@@ -52,7 +52,7 @@ function isRecordedClosed(id) {
 export function isCloseRitualOnly(nextAction) {
   if (typeof nextAction !== 'string') return false;
   const tab = '(?:(?:タブバーの)?(?:一番右|右端)(?:にある|の))?(?:新しい|この|古い)?タブ';
-  const start = new RegExp(`^${tab}で\\s*(?:Enter\\s*を\\s*(?:1回\\s*)?押(?:す|し)|/session-start\\s*を\\s*送(?:る|り))$`);
+  const start = new RegExp(`^${tab}で\\s*(?:Enter\\s*を\\s*(?:1\\s*回\\s*)?押(?:す|し)|/session-start\\s*を\\s*送(?:る|り))$`);
   const close = /^(?:(?:この)?(?:古い)?タブを\s*(?:✕\s*で\s*)?|(?:この)?セッションを\s*)閉じ(?:る|て|ます)$/;
   return nextAction.split(/[、。→，]/).every(part => {
     const text = part.trim();
@@ -322,7 +322,7 @@ function promptTitle(prompt) {
 }
 
 // UserPromptSubmit の rename 経路へタイトルを渡す。
-export function promptSubmit(input, { readFile = fs.readFileSync, statSize = p => fs.statSync(p).size, resolvePcNumber: resolveNumber = resolvePcNumber, isClosed = isRecordedClosed } = {}) {
+export function promptSubmit(input, { readFile = fs.readFileSync, statSize = p => fs.statSync(p).size, resolvePcNumber: resolveNumber = resolvePcNumber, isClosed = isRecordedClosed, log = logReopen } = {}) {
   try {
     const pc = resolveNumber();
     const file = input?.transcript_path || input?.transcriptPath || '';
@@ -365,7 +365,7 @@ export function apply(input, { readFile = fs.readFileSync, appendFile = fs.appen
 }
 
 // 全プロジェクトの transcript に apply を当てる。subagent・古いもの・巨大なものは飛ばす。
-export function sweepAll({ base = path.join(os.homedir(), '.claude'), now = Date.now(), force = false, resolvePcNumber: resolveNumber = resolvePcNumber, isClosed = isRecordedClosed } = {}) {
+export function sweepAll({ base = path.join(os.homedir(), '.claude'), now = Date.now(), force = false, resolvePcNumber: resolveNumber = resolvePcNumber, isClosed = isRecordedClosed, reopen = reopenRecordedSession, log = logReopen } = {}) {
   const stateFile = path.join(base, 'session-wait-title-state.json');
   try { if (!force && now - JSON.parse(fs.readFileSync(stateFile, 'utf8')).at < SWEEP_COOLDOWN_MS) return { skipped: 'cooldown' }; } catch (e) { logError('sweepAll state read', e); }
   try { fs.writeFileSync(stateFile, JSON.stringify({ at: now })); } catch (e) { logError('sweepAll state write', e); }
@@ -383,7 +383,7 @@ export function sweepAll({ base = path.join(os.homedir(), '.claude'), now = Date
         const stat = fs.statSync(file);
         if (now - stat.mtimeMs > RECENT_DAYS * 86400_000) continue;
         result.scanned += 1;
-        const title = apply({ transcript_path: file, session_id: name.slice(0, -'.jsonl'.length) }, { resolvePcNumber: resolveNumber, isClosed });
+        const title = apply({ transcript_path: file, session_id: name.slice(0, -'.jsonl'.length) }, { resolvePcNumber: resolveNumber, isClosed, reopen, log });
         // PC番号の一括付与で全 transcript の更新日時が今になり、履歴の並び順が崩れるのを防ぐ。
         if (title) { fs.utimesSync(file, stat.atime, stat.mtime); result.titled.push({ session: name.slice(0, 8), title }); }
       } catch (e) { logError(`sweepAll apply ${file}`, e); }
