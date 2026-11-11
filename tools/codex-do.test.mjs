@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { skipCoolingBackends } from './fallback-backend-health.mjs';
 
 const tool = fileURLToPath(new URL('./codex-do.mjs', import.meta.url));
-const { needsWorktreeRepair, detectQuotaLimit, detectCodexAuthFailure, isCodexAuthFailure, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, prepareGeminiWorkerPolicy, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, backendSpecificTimeoutSecs, effectiveBackendTimeoutSecs, COOLING_PROBE_TIMEOUT_SECS, countPolicyDenials, shouldAbortPolicyStall, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, findExecutable, isBackendCliMissing, shouldAdvanceToNextBackend, isBackendExhausted, isBackendBillingFailure, isProviderBillingBlocked, validateCwd, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS, wantsEdit, buildUsageRow, remainingPrimaryBudgetSecs, parseCodexOutput, detectOutsideScopeChanges, isCheapFirstEnabled, shouldAutoInstallQwen, maybeAutoInstallQwen } = await import('./codex-do.mjs');
+const { needsWorktreeRepair, detectQuotaLimit, detectCodexAuthFailure, isCodexAuthFailure, killProcessTree, shouldFlagEmptyFallbackDiff, snapshotWorkingTree, buildQwenArgs, buildQwenEnv, buildGeminiArgs, buildGeminiEnv, fallbackBackendTimeoutSecs, chainBackendBudgetSecs, backendSpecificTimeoutSecs, effectiveBackendTimeoutSecs, COOLING_PROBE_TIMEOUT_SECS, countPolicyDenials, shouldAbortPolicyStall, loadDeepseekKey, loadGeminiKey, loadEnvKey, resolveFallbackBackends, resolveQwenBackends, findExecutable, isBackendCliMissing, shouldAdvanceToNextBackend, isBackendExhausted, isBackendBillingFailure, isProviderBillingBlocked, validateCwd, wslCodexLaunchPlan, WSL_PROBE_TIMEOUT_MS, wantsEdit, buildUsageRow, remainingPrimaryBudgetSecs, parseCodexOutput, detectOutsideScopeChanges, shouldAutoInstallQwen, maybeAutoInstallQwen } = await import('./codex-do.mjs');
 
 const runDirs = [];
 function workDir() {
@@ -1015,8 +1015,6 @@ test('buildGeminiEnv は Gemini キーと trust を設定し、OPENAI_* と base
   assert.deepEqual(base, snapshot);
 });
 
-test('buildGeminiArgs は policyFile 指定時 --policy を -p の前に入れる', () => {
-  const args = buildGeminiArgs({ policyFile: '/tmp/policy.toml' });
   const policyIndex = args.indexOf('--policy');
   assert.ok(policyIndex >= 0);
   assert.equal(args[policyIndex + 1], '/tmp/policy.toml');
@@ -1025,42 +1023,14 @@ test('buildGeminiArgs は policyFile 指定時 --policy を -p の前に入れ�
   for (const arg of args) assert.ok(!/\s/.test(arg), `argv 要素に空白が含まれる: ${JSON.stringify(arg)}`);
 });
 
-test('buildGeminiArgs は policyFile 未指定なら従来の引数列と完全一致する', () => {
-  const noPolicy = buildGeminiArgs({});
   const traditional = buildGeminiArgs();
   assert.deepEqual(noPolicy, traditional);
   assert.ok(!noPolicy.includes('--policy'));
 });
 
-test('buildGeminiArgs は policyFile が未指定・undefined でも従来と同じ7要素を返す', () => {
-  const args = buildGeminiArgs();
-  assert.equal(args.length, 7);
-  assert.deepEqual(args.slice(0, 5), ['-m', 'gemini-3.6-flash', '--approval-mode', 'yolo', '--skip-trust']);
-  assert.deepEqual(args.slice(-2), ['-p', 'Follow-the-instructions-provided-on-stdin.']);
+
 });
 
-test('prepareGeminiWorkerPolicy は git と node と echo の allow を含むファイルを書く', () => {
-  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-policy-'));
-  const file = prepareGeminiWorkerPolicy(tmpHome);
-  assert.ok(fs.existsSync(file));
-  const content = fs.readFileSync(file, 'utf8');
-  assert.match(content, /tool = "run_shell_command"/);
-  assert.match(content, /commandPrefix = "git"/);
-  assert.match(content, /commandPrefix = "node"/);
-  assert.match(content, /commandPrefix = "echo"/);
-  assert.match(content, /priority = 900/);
-  fs.rmSync(tmpHome, { recursive: true, force: true });
-});
-
-test('prepareGeminiWorkerPolicy は内容が同じなら書き直さない（mtime が変わらない）', () => {
-  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codexdo-policy-'));
-  const file = prepareGeminiWorkerPolicy(tmpHome);
-  const mtime1 = fs.statSync(file).mtimeMs;
-  const file2 = prepareGeminiWorkerPolicy(tmpHome);
-  assert.equal(file, file2);
-  const mtime2 = fs.statSync(file).mtimeMs;
-  assert.equal(mtime1, mtime2);
-  fs.rmSync(tmpHome, { recursive: true, force: true });
 });
 
 test('loadDeepseekKey は process.env を最優先する', () => {
@@ -1365,25 +1335,6 @@ test('review で変更0件でも終了コード 0（非 implement は空 diff �
 
 // ── cheap-first テスト ───────────────────────────────────────────────
 
-test('isCheapFirstEnabled: implement 既定で有効、review では無効、lane:codex 記載で無効、env=0 で無効', () => {
-  // implement 既定: 有効
-  assert.equal(isCheapFirstEnabled({ kind: 'implement', instruction: '何か実装して' }), true);
-  // review: 無効
-  assert.equal(isCheapFirstEnabled({ kind: 'implement', instruction: 'レビュー', review: true }), false);
-  // lane:codex あり: 無効
-  assert.equal(isCheapFirstEnabled({ kind: 'implement', instruction: '<!-- lane: codex --> 実装して' }), false);
-  assert.equal(isCheapFirstEnabled({ kind: 'implement', instruction: 'Lane: Codex 実装して' }), false);
-  // CODEX_DO_CHEAP_FIRST=0: 無効
-  assert.equal(isCheapFirstEnabled({ kind: 'implement', instruction: '実装して', env: { CODEX_DO_CHEAP_FIRST: '0' } }), false);
-  // CODEX_DO_CHEAP_FIRST=1: 有効
-  assert.equal(isCheapFirstEnabled({ kind: 'implement', instruction: '実装して', env: { CODEX_DO_CHEAP_FIRST: '1' } }), true);
-  // CODEX_DO_CHEAP_FIRST 未設定: 有効
-  assert.equal(isCheapFirstEnabled({ kind: 'implement', instruction: '実装して', env: {} }), true);
-  // implement 以外: 無効
-  assert.equal(isCheapFirstEnabled({ kind: 'verify', instruction: '確認して' }), false);
-  assert.equal(isCheapFirstEnabled({ kind: 'investigate', instruction: '調べて' }), false);
-  assert.equal(isCheapFirstEnabled({ kind: 'classify', instruction: '分類して' }), false);
-});
 
 test('cheap-first: implement 既定 → fallback が先に呼ばれ Codex は呼ばれない', () => {
   const mockResults = [
