@@ -15,14 +15,11 @@ if ($IdleOnly -or $idle -lt 300000) { @{idleMs=$idle} | ConvertTo-Json -Compress
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 $AE = [System.Windows.Automation.AutomationElement]
 $Scope = [System.Windows.Automation.TreeScope]
-. (Join-Path $PSScriptRoot 'lib\discord-dm-window.ps1')
-$win = Wait-DiscordWindow -FindWindow {
- foreach ($w in $AE::RootElement.FindAll($Scope::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
-  if ($w.Current.Name -match 'Discord') { return $w }
- }
- return $null
+$win = $null
+foreach ($w in $AE::RootElement.FindAll($Scope::Children, [System.Windows.Automation.Condition]::TrueCondition)) {
+ if ($w.Current.Name -match 'Discord') { $win = $w; break }
 }
-# Friends/home has no message list: original stays empty and scan skips restore.
+if (-not $win) { throw 'Discord window not found' }
 $original = ''
 $unread = @()
 foreach ($e in $win.FindAll($Scope::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
