@@ -393,6 +393,7 @@ export function selectContext(items, { sessionId = '', now = Date.now(), sheetUr
   // A real inbox can contain hundreds of old completion asks. Rotate bounded batches;
   // otherwise the relay would demand a 150-line final response on the first turn.
   const required = [...reserved.filter(i => i.kind === 'ask').slice(0, 5), ...reserved.filter(i => i.kind === 'info').slice(0, 3)];
+  required.sort((a, b) => Number(b.source === 'auto-progress-heartbeat') - Number(a.source === 'auto-progress-heartbeat'));
   let requiredText = '';
   for (const item of required) {
     requiredText += `■ ${item.kind} ${item.id} (${item.source}) ${inboxSummary(item)}\n`;
@@ -480,7 +481,7 @@ export function selectContext(items, { sessionId = '', now = Date.now(), sheetUr
     item.shownSessions = [...new Set([...item.shownSessions, sessionId])];
     item.shownCount++; item.lastShownAt = new Date(now).toISOString();
   }
-  return redactSecrets(displayPcNames(ownAskText + dailyText + requiredText + urgentText + text + footer, { home }));
+  return redactSecrets(displayPcNames(requiredText + ownAskText + dailyText + urgentText + text + footer, { home }));
 }
 export function oneScreenSummary(items) {
   const openItems = items.filter(i => i.status === 'open');
