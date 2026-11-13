@@ -81,8 +81,8 @@ test('リクエスト状態はboolean trueのみ（能力やオブジェクト�
   }
 });
 
-test('古いリクエストのpreviewもaskに積まない', async t => {
-  const f = fixture(t, { chats: [chat({ isRequest: true, preview: message({ timestamp: new Date(NOW - 25 * 3600000).toISOString() }) })] });
+test('古いリクエストのpreviewもaskに積まない（7日超）', async t => {
+  const f = fixture(t, { chats: [chat({ isRequest: true, preview: message({ timestamp: new Date(NOW - 8 * 86400000 - 1).toISOString() }) })] });
   const result = await runOnce(f.options);
   assert.equal(result.skipped, 1);
   assert.equal(f.sent.length, 0); assert.equal(f.inboxItems.length, 0);
@@ -271,14 +271,77 @@ test('人の判断が必要かつ answer が空なら送信せず判断待ちの
   assert.equal(f.inboxItems[0].kind, 'ask');
 });
 
-test('24時間より古いメッセージは送信せず skipped（kim-inbox にも積まない）', async t => {
-  const oldMsg = message({ id: 'old1', timestamp: new Date(NOW - 25 * 3600000).toISOString() });
+test('7日より古いメッセージは送信せず skipped（state に skipped を保存しない）', async t => {
+  const oldMsg = message({ id: 'old1', timestamp: new Date(NOW - 8 * 86400000 - 1).toISOString() });
   const f = fixture(t, { messages: [oldMsg] });
   const result = await runOnce(f.options);
   assert.equal(result.replied, 0); assert.equal(f.sent.length, 0);
   assert.equal(f.inboxItems.length, 0);
   assert.equal(result.skipped, 1);
-  assert.equal(f.state().chats.chat1.status, 'skipped');
+  // state に skipped が保存されていないことを確認
+  const st = f.state();
+  assert.equal(st.chats?.chat1?.status !== 'skipped', true);
+});
+
+test('3日前のDM未返信 → 送信対象（maxAgeMs=7dで上書き）', async t => {
+  // own（isSender）より後にユーザーメッセージが来るタイムスタンプ順にする
+  const f = fixture(t, { messages: [
+    message({ id: 'own', isSender: true, timestamp: new Date(NOW - 3 * 86400000 - 60000).toISOString() }),
+    message({ timestamp: new Date(NOW - 3 * 86400000).toISOString() }),
+  ] });
+  const result = await runOnce({ ...f.options, maxAgeMs: 7 * 86400000 });
+  assert.equal(result.replied, 1); assert.equal(f.sent.length, 1);
+});
+test('8日前のDM未返信 → 送信せず、stateにskippedを保存しない', async t => {
+  const f = fixture(t, { messages: [
+    message({ id: 'own', isSender: true, timestamp: new Date(NOW - 8 * 86400000 - 120000).toISOString() }),
+    message({ timestamp: new Date(NOW - 8 * 86400000 - 1).toISOString() }),
+  ] });
+  const result = await runOnce(f.options);
+  assert.equal(result.replied, 0); assert.equal(f.sent.length, 0);
+  assert.equal(result.skipped, 1);
+  const st = f.state();
+  // state.chats に chat1 が存在する場合でも status は skipped ではない
+  assert.equal(st.chats?.chat1?.status !== 'skipped', true);
+});
+test('既定24h: 30時間前のDM未返信 → skipped（stateにskippedを保存しない）', async t => {
+  const f = fixture(t, { messages: [
+    message({ id: 'own', isSender: true, timestamp: new Date(NOW - 30 * 3600000 - 60000).toISOString() }),
+    message({ timestamp: new Date(NOW - 30 * 3600000).toISOString() }),
+  ] });
+  const result = await runOnce(f.options);
+  assert.equal(result.replied, 0); assert.equal(f.sent.length, 0);
+  assert.equal(result.skipped, 1);
+  const st = f.state();
+  assert.equal(st.chats?.chat1?.status !== 'skipped', true);
+});
+test('maxAgeMs=48h: 30時間前のDM → 送信対象、50時間前のDM → 送信せず', async t => {
+  const f = fixture(t, { messages: [
+    message({ id: 'own', isSender: true, timestamp: new Date(NOW - 31 * 3600000).toISOString() }),
+    message({ timestamp: new Date(NOW - 30 * 3600000).toISOString() }),
+  ] });
+  const result = await runOnce({ ...f.options, maxAgeMs: 48 * 3600000 });
+  assert.equal(result.replied, 1); assert.equal(f.sent.length, 1);
+  const f2 = fixture(t, { messages: [
+    message({ id: 'own2', isSender: true, timestamp: new Date(NOW - 51 * 3600000).toISOString() }),
+    message({ timestamp: new Date(NOW - 50 * 3600000).toISOString() }),
+  ] });
+  const result2 = await runOnce({ ...f2.options, maxAgeMs: 48 * 3600000 });
+  assert.equal(result2.replied, 0); assert.equal(f2.sent.length, 0);
+  assert.equal(result2.skipped, 1);
+  const st = f2.state();
+  assert.equal(st.chats?.chat2?.status !== 'skipped', true);
+});
+test('stateにskippedがある会話 → 再評価され送信対象', async t => {
+  // prior.status='skipped' の状態で、同じメッセージが再度評価される
+  const f = fixture(t, { messages: [
+    message({ id: 'own', isSender: true, timestamp: new Date(NOW - 7200000).toISOString() }),
+    message({ timestamp: new Date(NOW - 3600000).toISOString() }),
+  ] });
+  // skip状態をstateに保存（旧コード由来、再評価されるべき）
+  f.save({ version: 1, chats: { chat1: { id: 'm1', timestamp: new Date(NOW - 3600000).toISOString(), sortKey: '2', status: 'skipped' } }, hourly: [], hourlyByChat: {} });
+  const result = await runOnce(f.options);
+  assert.equal(result.replied, 1); assert.equal(f.sent.length, 1);
 });
 
 test('ちょうど24時間前は回答対象', async t => {

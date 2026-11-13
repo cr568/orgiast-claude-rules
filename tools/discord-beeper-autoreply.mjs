@@ -7,7 +7,7 @@ import crypto from 'node:crypto';
 import * as beeper from './beeper-api.mjs';
 import { isEntry } from './is-entry.mjs';
 import {
-  classifyReply, contentFor, createLlm, ensureTaskPriority, decisionReport, sentReport,
+  DEFAULT_MAX_REPLY_AGE, classifyReply, contentFor, createLlm, ensureTaskPriority, decisionReport, sentReport,
   isWithinAllowedTimeWindow, recordSentReply, flushUnreportedSentLogs, recordDecisionPending, readSentLog,
   retryForbiddenAnswer, FORBIDDEN_REPLY_PTN, inventedAmounts
 } from './discord-autoreply.mjs';
@@ -90,6 +90,7 @@ function acquire(dir) {
 export async function runOnce(options = {}) {
   const home = options.home || os.homedir(), dryRun = Boolean(options.dryRun), api = options.api || beeper;
   const now = options.now ? (typeof options.now === 'function' ? options.now() : options.now) : Date.now();
+  const maxAgeMs = options.maxAgeMs ?? DEFAULT_MAX_REPLY_AGE;
   const dir = path.join(home, '.claude', 'discord-beeper-autoreply');
   const stateFile = path.join(dir, 'state.json');
   const result = { ok: true, dryRun, scanned: 0, replied: 0, decisions: [], wouldSend: [], skipped: 0, errors: [] };
@@ -123,7 +124,7 @@ export async function runOnce(options = {}) {
       let latest, question = '', link = `会話名: ${chat.title || chat.id}`;
       const prior = state.chats[chat.id];
       if (prior?.status !== 'sending' && (chat.preview?.isSender
-        || (prior?.id && chat.preview?.id === prior.id))) { result.skipped++; continue; }
+        || (prior?.status !== 'skipped' && prior?.id && chat.preview?.id === prior.id))) { result.skipped++; continue; }
       
       const decide = async (reason, status = 'decision') => {
         const row = { chatID: chat.localChatID || chat.id, chat: chat.title, messageId: latest?.id || null, reason, link, classification: '判断待ち' };
@@ -145,8 +146,8 @@ export async function runOnce(options = {}) {
         if (prior?.status !== 'sending' && isMessageRequest(chat) && chat.preview?.isSender === false
           && chat.preview.id && Number.isFinite(timestamp(chat.preview))) {
           latest = chat.preview; question = plainText(latest.text); link = messageLink(chat, latest);
-          if (now - timestamp(latest) > 24 * HOUR || timestamp(latest) > now) { result.skipped++; continue; }
-          if (prior?.id === latest.id || (prior?.timestamp && compare(latest, prior) <= 0)) { result.skipped++; continue; }
+          if (now - timestamp(latest) > maxAgeMs || timestamp(latest) > now) { result.skipped++; continue; }
+          if (prior?.status !== 'skipped' && (prior?.id === latest.id || (prior?.timestamp && compare(latest, prior) <= 0))) { result.skipped++; continue; }
           await decide('メッセージリクエスト・未承認'); continue;
         }
         const history = await historyFor(api, chat), all = history.items;
@@ -175,13 +176,12 @@ export async function runOnce(options = {}) {
         }
         if (prior?.status === 'uncertain' && (!lastSelf || compare(lastSelf, prior) <= 0)) { result.skipped++; continue; }
         if (!latest || latest.isSender) { result.skipped++; continue; }
-        if (now - timestamp(latest) > 24 * HOUR || timestamp(latest) > now) {
-          state.chats[chat.id] = { ...mark(latest), status: 'skipped' };
-          save(); result.skipped++; continue;
+        if (now - timestamp(latest) > maxAgeMs || timestamp(latest) > now) {
+          result.skipped++; continue;
         }
         link = messageLink(chat, latest);
         const pending = all.filter(m => !m.isSender && (!lastSelf || compare(m, lastSelf) > 0)
-          && (!prior?.timestamp || compare(m, prior) > 0));
+          && (!prior?.timestamp || prior.status === 'skipped' || compare(m, prior) > 0));
         question = pending.map(m => {
           let text = `${m.senderName || ''}: ${plainText(m.text)}`;
           if (m.attachments?.length) {
@@ -190,7 +190,7 @@ export async function runOnce(options = {}) {
           }
           return text;
         }).join('\n');
-        if (prior?.id === latest.id || (prior?.timestamp && compare(latest, prior) <= 0)) { result.skipped++; continue; }
+        if (prior?.status !== 'skipped' && (prior?.id === latest.id || (prior?.timestamp && compare(latest, prior) <= 0))) { result.skipped++; continue; }
         if (isMessageRequest(chat)) { await decide('メッセージリクエスト・未承認'); continue; }
         if (!pending.some(m => plainText(m.text))) {
           state.chats[chat.id] = { ...mark(latest), status: 'fyi' };
@@ -354,9 +354,16 @@ export async function main(args = process.argv.slice(2), options = {}) {
   }
 
   if (!['once', 'loop'].includes(command)) throw new Error('Use once|loop|sent [--dry-run]');
+  const maxAgeHoursIndex = args.indexOf('--max-age-hours');
+  let maxAgeMs;
+  if (maxAgeHoursIndex >= 0) {
+    const n = Number(args[maxAgeHoursIndex + 1]);
+    if (!Number.isInteger(n) || n < 1 || n > 168) throw new Error('--max-age-hours must be an integer between 1 and 168');
+    maxAgeMs = n * HOUR;
+  }
   const deadline = Date.now() + 290000;
   do {
-    const result = await runOnce({ ...options, home, dryRun: args.includes('--dry-run') });
+    const result = await runOnce({ ...options, home, dryRun: args.includes('--dry-run'), maxAgeMs });
     print(result);
     if (!result.ok) return 1;
     if (command === 'once' || result.paused || result.limited || Date.now() + 20000 >= deadline) return 0;
