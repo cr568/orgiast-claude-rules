@@ -134,14 +134,40 @@ const OPENURL_MAX_AGE_MIN = 10;
 export function classifyOrphanOpenUrl(processes, now = Date.now(), opts = {}) {
   const maxAgeMin = opts.openUrlMaxAgeMin ?? OPENURL_MAX_AGE_MIN;
   const rows = Array.isArray(processes) ? processes : processes ? [processes] : [];
+  const children = new Map();
+  for (const row of rows) {
+    const parentPid = Number(row.ParentProcessId ?? row.parentPid);
+    if (!Number.isInteger(parentPid)) continue;
+    const siblings = children.get(parentPid) ?? [];
+    siblings.push(row);
+    children.set(parentPid, siblings);
+  }
+  const hasNodeServiceDescendant = (pid) => {
+    const pending = [...(children.get(pid) ?? [])];
+    const seen = new Set();
+    while (pending.length) {
+      const row = pending.pop();
+      const childPid = Number(row.ProcessId ?? row.pid);
+      if (!Number.isInteger(childPid) || seen.has(childPid)) continue;
+      seen.add(childPid);
+      const childCmd = String(row.CommandLine ?? row.commandLine ?? '');
+      if (childCmd.includes('node.mojom.NodeService')) return true;
+      pending.push(...(children.get(childPid) ?? []));
+    }
+    return false;
+  };
   return rows.flatMap((row) => {
     const name = String(row.Name ?? row.name ?? '').toLowerCase();
     if (!OPENURL_STUCK_NAMES.has(name)) return [];
     const commandLine = String(row.CommandLine ?? row.commandLine ?? '');
     if (!commandLine.includes('--open-url')) return [];
+    // --type= を含む子プロセス自身は対象外
+    if (commandLine.includes('--type=')) return [];
     const createdAt = creationTime(row.CreationDate ?? row.creationDate);
     const ageMin = (now - createdAt) / MINUTE;
     if (!Number.isFinite(ageMin) || ageMin <= maxAgeMin) return [];
+    // 自分の子孫に node.mojom.NodeService（拡張ホスト）がいる ＝ 本物の VS Code 本体 → 残骸ではない
+    if (hasNodeServiceDescendant(Number(row.ProcessId ?? row.pid))) return [];
     const bytes = Number(row.WorkingSetSize ?? row.workingSetSize ?? 0);
     return [{ pid: Number(row.ProcessId ?? row.pid), name, commandLine, kind: 'orphan-open-url', ageMin, mb: Number.isFinite(bytes) ? bytes / 1024 / 1024 : 0 }];
   });
@@ -476,13 +502,13 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       console.log(`process-hygiene: orphan-claude-wait-loops stopped=${waitLoops.length - failedLoops.length} failed=${failedLoops.length}`);
     }
     const orphanOpenUrl = classifyOrphanOpenUrl(processes, now, opts);
-	    console.log(`process-hygiene: orphan-open-url ${opts.kill ? 'kill' : 'dry-run'} ${summary(orphanOpenUrl)}`);
-	    for (const item of orphanOpenUrl) console.log(`pid=${item.pid} age=${item.ageMin.toFixed(0)}min ${item.commandLine.slice(0, 300)}`);
-	    if (opts.kill && orphanOpenUrl.length) {
-	      const failedOpenUrl = (deps.stopOrphanOpenUrls ?? ((items) => stopProcessTrees(items, deps.spawnImpl)))(orphanOpenUrl);
-	      console.log(`process-hygiene: orphan-open-url stopped=${orphanOpenUrl.length - failedOpenUrl.length} failed=${failedOpenUrl.length}`);
-	    }
-	    const freeGb = deps.commitFreeGb !== undefined ? Number(deps.commitFreeGb) : commitFreeGb(deps.spawnImpl);
+    console.log(`process-hygiene: orphan-open-url ${opts.kill ? 'kill' : 'dry-run'} ${summary(orphanOpenUrl)}`);
+    for (const item of orphanOpenUrl) console.log(`pid=${item.pid} age=${item.ageMin.toFixed(0)}min ${item.commandLine.slice(0, 300)}`);
+    if (opts.kill && orphanOpenUrl.length) {
+      const failedOpenUrl = (deps.stopOrphanOpenUrls ?? ((items) => stopProcessTrees(items, deps.spawnImpl)))(orphanOpenUrl);
+      console.log(`process-hygiene: orphan-open-url stopped=${orphanOpenUrl.length - failedOpenUrl.length} failed=${failedOpenUrl.length}`);
+    }
+    const freeGb = deps.commitFreeGb !== undefined ? Number(deps.commitFreeGb) : commitFreeGb(deps.spawnImpl);
     const idleGate = shouldKillVscodeIdle(freeGb, opts.vscodeIdleMinFreeGb);
     console.log(`process-hygiene: vscode-claude-idle gate コミット空き=${Number.isFinite(freeGb) ? freeGb.toFixed(1) : '不明'}GB 閾値=${opts.vscodeIdleMinFreeGb}GB → ${idleGate.kill ? 'kill有効' : 'skip'} (${idleGate.reason})`);
     const cpu = (deps.sampleVscodeCpu ?? (() => sampleVscodeCpu(processes, deps.spawnImpl)))();

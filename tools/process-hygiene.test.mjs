@@ -348,6 +348,12 @@ const codeProc = (pid, commandLine, ageMin, mb = 100) => ({
   CreationDate: new Date(now - ageMin * 60_000).toISOString(),
   WorkingSetSize: mb * 1024 * 1024,
 });
+const childProc = (pid, parentPid, commandLine, ageMin) => ({
+  Name: 'Code.exe', ProcessId: pid, ParentProcessId: parentPid,
+  CommandLine: commandLine,
+  CreationDate: new Date(now - ageMin * 60_000).toISOString(),
+  WorkingSetSize: 100 * 1024 * 1024,
+});
 
 test('orphan-open-url: 10分超の Code.exe --open-url だけ検出する', () => {
   const result = classifyOrphanOpenUrl([
@@ -397,4 +403,31 @@ test('orphan-open-url: --kill でツリー停止し dry-run では止めない',
     else process.env.ORGIAST_LOCK_HOME = previousLockHome;
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test('orphan-open-url: NodeService の子を持つ本体は残骸に入らない', () => {
+  const result = classifyOrphanOpenUrl([
+    codeProc(100, 'C:\\Program Files\\Microsoft VS Code\\Code.exe --open-url vscode://Anthropic.claude-code/open', 120),
+    childProc(101, 100, 'C:\\Program Files\\Microsoft VS Code\\Code.exe --type=crashpad-handler', 120),
+    childProc(102, 100, 'C:\\Program Files\\Microsoft VS Code\\Code.exe --type=utility --utility-sub-type=node.mojom.NodeService', 120),
+    childProc(103, 100, 'C:\\Program Files\\Microsoft VS Code\\Code.exe --type=gpu-process', 120),
+  ], now);
+  assert.equal(result.length, 0);
+});
+
+test('orphan-open-url: 子が crashpad/gpu だけの --open-url は残骸に入る', () => {
+  const result = classifyOrphanOpenUrl([
+    codeProc(200, 'C:\\Program Files\\Microsoft VS Code\\Code.exe --open-url vscode://Anthropic.claude-code/open', 15),
+    childProc(201, 200, 'C:\\Program Files\\Microsoft VS Code\\Code.exe --type=crashpad-handler', 15),
+    childProc(202, 200, 'C:\\Program Files\\Microsoft VS Code\\Code.exe --type=gpu-process', 15),
+  ], now);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].pid, 200);
+});
+
+test('orphan-open-url: --type= を含む子プロセス自身は残骸に入らない', () => {
+  const result = classifyOrphanOpenUrl([
+    { ...codeProc(300, 'Code.exe --open-url vscode://test --type=crashpad-handler', 30) },
+  ], now);
+  assert.equal(result.length, 0);
 });

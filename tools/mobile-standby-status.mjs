@@ -30,10 +30,31 @@ export function defaultFindStuckOpenUrl({ spawnImpl = spawnSync } = {}) {
   const script = `
 $cutoff = (Get-Date).AddSeconds(-60).ToUniversalTime()
 try {
-  $found = @(Get-CimInstance Win32_Process | Where-Object {
-    $_.Name -eq 'Code.exe' -and $null -ne $_.CommandLine -and $_.CommandLine.Contains('--open-url') -and $_.CreationDate -le $cutoff
-  } | Select-Object -First 1)
-  if ($found.Count -gt 0) { Write-Output 'stuck' } else { Write-Output 'none' }
+  $codeProcs = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'Code.exe' })
+  $candidates = @($codeProcs | Where-Object {
+    $null -ne $_.CommandLine -and $_.CommandLine.Contains('--open-url') -and $_.CommandLine -notlike '*--type=*' -and $_.CreationDate -le $cutoff
+  })
+  if ($candidates.Count -eq 0) { Write-Output 'none'; return }
+  $stuck = $true
+  foreach ($c in $candidates) {
+    $hasNodeService = $false
+    $queue = @($c.ProcessId)
+    $seen = @{}
+    $qi = 0
+    while ($qi -lt $queue.Count -and -not $hasNodeService) {
+      $pid = $queue[$qi]; $qi++
+      if ($seen.ContainsKey($pid)) { continue }
+      $seen[$pid] = $true
+      foreach ($child in ($codeProcs | Where-Object { $_.ParentProcessId -eq $pid })) {
+        if ($null -ne $child.CommandLine -and $child.CommandLine.Contains('node.mojom.NodeService')) {
+          $hasNodeService = $true; break
+        }
+        $queue += $child.ProcessId
+      }
+    }
+    if (-not $hasNodeService) { $stuck = $false; break }
+  }
+  if ($stuck) { Write-Output 'stuck' } else { Write-Output 'none' }
 } catch { Write-Output 'none' }
 `;
   const result = spawnImpl('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', windowsHide: true, timeout: OPENURL_STUCK_TIMEOUT_MS });
