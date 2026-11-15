@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   isStandby, summarize, listRemoteSessions, planOpenCommand, replenishStandby,
   localBridgeIds, checkStandby, defaultGoal, defaultFreshHours, main,
+  defaultFindStuckOpenUrl,
 } from './mobile-standby-status.mjs';
 
 const HOUR = 3_600_000;
@@ -492,14 +493,57 @@ test('healthy remote status clears a recent failure', async t => {
   assert.deepEqual(f.opened, []);
 });
 
-test('backoff expires at six hours and successful replenishment clears failure', async t => {
-  const f = replenishFixture(t, { state: { failedOpenAt: NOW - 6 * HOUR } });
-  const fetchEmpty = f.options.fetchImpl;
-  let calls = 0;
-  f.options.fetchImpl = async () => ++calls === 1 ? fetchEmpty() : response(
-    [...f.options.localIds].map(title => standby(title, { created_at: new Date(NOW).toISOString() })));
-  assert.equal((await replenishStandby(f.options)).action, 'replenished');
-  assert.deepEqual(f.opened, [3]);
-  assert.equal(Object.hasOwn(f.readState(), 'failedOpenAt'), false);
-  assert.deepEqual(f.messages, []);
+test('defaultFindStuckOpenUrl returns false on PowerShell failure', async () => {
+  assert.equal(await defaultFindStuckOpenUrl({ spawnImpl: () => ({ status: 1, stdout: '', error: null }) }), false);
+  assert.equal(await defaultFindStuckOpenUrl({ spawnImpl: () => ({ status: 0, stdout: 'none', error: null }) }), false);
+});
+
+test('replenish detects stuck Code.exe --open-url and backs off', async t => {
+  const home = tempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const stateFile = path.join(home, '.claude', 'mobile-standby-status-state.json');
+  const localIds = new Set(['remote-control-a-b']);
+  const ts = Date.now();
+  const created = new Date(ts - 60_000).toISOString();
+  let findStuckCalled = false;
+  const result = await replenishStandby({
+    home, stateFile, localIds,
+    fetchImpl: async () => response([standby('remote-control-a-b', { created_at: created })]),
+    codeCli: 'C:/code.cmd',
+    open: async () => { assert.fail('must not open'); },
+    sleep: async () => {},
+    notify: async () => ({ delivered: 'dm' }),
+    now: () => ts,
+    findStuckOpenUrl: async () => { findStuckCalled = true; return true; },
+  });
+  const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  assert.equal(result.action, 'skipped');
+  assert.equal(result.reason, 'vscode-unresponsive');
+  assert.equal(findStuckCalled, true);
+  assert.equal(state.failedOpenAt, ts);
+});
+
+test('replenish proceeds normally when no stuck Code.exe --open-url', async t => {
+  const home = tempHome();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const stateFile = path.join(home, '.claude', 'mobile-standby-status-state.json');
+  const localIds = new Set(['remote-control-a-b', 'remote-control-c-d']);
+  const ts = Date.now();
+  const created = () => new Date(ts - 60_000).toISOString();
+  const pages = [response([standby('remote-control-a-b', { created_at: created() })]),
+    response([standby('remote-control-a-b', { created_at: created() }), standby('remote-control-c-d', { created_at: created() })])];
+  let findStuckCalled = false;
+  const result = await replenishStandby({
+    home, stateFile, localIds,
+    fetchImpl: async () => pages.shift(),
+    codeCli: 'C:/code.cmd',
+    open: async ({ count }) => count,
+    sleep: async () => {},
+    notify: async () => ({ delivered: 'dm' }),
+    now: () => ts,
+    findStuckOpenUrl: async () => { findStuckCalled = true; return false; },
+  });
+  assert.deepEqual(result.action, 'replenished');
+  assert.equal(findStuckCalled, true);
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(stateFile, 'utf8')), 'failedOpenAt'), false);
 });

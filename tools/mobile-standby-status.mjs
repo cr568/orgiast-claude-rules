@@ -9,7 +9,7 @@ import pool from './lib/mobile-state.cjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { isEntry } from './is-entry.mjs';
 import { buildVscodeUri, resolveVscodeCli } from './next-session-launch.mjs';
 import { notifyKim } from './notify-kim.mjs';
@@ -24,6 +24,22 @@ export const STANDBY_TITLE = /^remote-control-/;
 export const PLACEHOLDER_TITLE = /^\d{3}｜待機中$/;
 // 現在の自動名は <ホスト名スラッグ>-<形容詞>-<名詞>（例 011-prancy-dusk）。
 export const AUTO_TITLE = /^[a-z0-9]+(?:-[a-z0-9]+)*-[a-z]+-[a-z]+$/;
+export const OPENURL_STUCK_TIMEOUT_MS = 15_000;
+
+export function defaultFindStuckOpenUrl({ spawnImpl = spawnSync } = {}) {
+  const script = `
+$cutoff = (Get-Date).AddSeconds(-60).ToUniversalTime()
+try {
+  $found = @(Get-CimInstance Win32_Process | Where-Object {
+    $_.Name -eq 'Code.exe' -and $null -ne $_.CommandLine -and $_.CommandLine.Contains('--open-url') -and $_.CreationDate -le $cutoff
+  } | Select-Object -First 1)
+  if ($found.Count -gt 0) { Write-Output 'stuck' } else { Write-Output 'none' }
+} catch { Write-Output 'none' }
+`;
+  const result = spawnImpl('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', windowsHide: true, timeout: OPENURL_STUCK_TIMEOUT_MS });
+  if (result.error || result.status !== 0) return false;
+  return String(result.stdout ?? '').trim() === 'stuck';
+}
 
 function json(file, fallback = {}) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } }
 function localWaitingTabs(home = os.homedir(), now = Date.now()) {
@@ -153,6 +169,7 @@ export async function replenishStandby({
   home, fetchImpl = fetch, goal = GOAL, localIds, freshHours = defaultFreshHours(home), waitMs = 30_000, now = Date.now,
   spawnProcess = spawn, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   notify = notifyKim, codeCli, open = openStandbyTabs, stateFile,
+  findStuckOpenUrl = defaultFindStuckOpenUrl,
 } = {}) {
   if (!pool.isMobileEnabled(home ?? os.homedir())) return { action: 'skipped', reason: 'disabled' };
   const state = stateFile ? json(stateFile) : {};
@@ -179,6 +196,17 @@ export async function replenishStandby({
   }
   if (Number.isFinite(state.failedOpenAt) && startedAt - state.failedOpenAt < NOTIFY_COOLDOWN) {
     return { action: 'skipped', reason: 'backoff' };
+  }
+  // VS Code が固まっていないか確認。残骸があれば開かずバックオフに乗せる。
+  if (findStuckOpenUrl) {
+    try {
+      const stuck = await findStuckOpenUrl({ spawnImpl: spawnSync });
+      if (stuck) {
+        state.failedOpenAt = now();
+        saveState();
+        return { action: 'skipped', reason: 'vscode-unresponsive' };
+      }
+    } catch { /* 確認失敗時は残骸なし扱いで従来どおり動く */ }
   }
   const cli = codeCli ?? resolveVscodeCli({ env: process.env, exists: fs.existsSync, homedir: home ?? os.homedir() });
   if (!cli) return { action: 'skipped', reason: 'no-vscode-cli', before };
