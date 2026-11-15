@@ -142,20 +142,9 @@ export function classifyOrphanOpenUrl(processes, now = Date.now(), opts = {}) {
     siblings.push(row);
     children.set(parentPid, siblings);
   }
-  const hasNodeServiceDescendant = (pid) => {
-    const pending = [...(children.get(pid) ?? [])];
-    const seen = new Set();
-    while (pending.length) {
-      const row = pending.pop();
-      const childPid = Number(row.ProcessId ?? row.pid);
-      if (!Number.isInteger(childPid) || seen.has(childPid)) continue;
-      seen.add(childPid);
-      const childCmd = String(row.CommandLine ?? row.commandLine ?? '');
-      if (childCmd.includes('node.mojom.NodeService')) return true;
-      pending.push(...(children.get(childPid) ?? []));
-    }
-    return false;
-  };
+  const hasNodeServiceChild = (pid) => (children.get(pid) ?? []).some((child) =>
+    String(child.Name ?? child.name ?? '').toLowerCase() === 'code.exe'
+    && String(child.CommandLine ?? child.commandLine ?? '').includes('node.mojom.NodeService'));
   return rows.flatMap((row) => {
     const name = String(row.Name ?? row.name ?? '').toLowerCase();
     if (!OPENURL_STUCK_NAMES.has(name)) return [];
@@ -166,8 +155,8 @@ export function classifyOrphanOpenUrl(processes, now = Date.now(), opts = {}) {
     const createdAt = creationTime(row.CreationDate ?? row.creationDate);
     const ageMin = (now - createdAt) / MINUTE;
     if (!Number.isFinite(ageMin) || ageMin <= maxAgeMin) return [];
-    // 自分の子孫に node.mojom.NodeService（拡張ホスト）がいる ＝ 本物の VS Code 本体 → 残骸ではない
-    if (hasNodeServiceDescendant(Number(row.ProcessId ?? row.pid))) return [];
+    // 自分の Code.exe 子プロセスに node.mojom.NodeService（拡張ホスト）がいる ＝ 本物の VS Code 本体 → 残骸ではない
+    if (hasNodeServiceChild(Number(row.ProcessId ?? row.pid))) return [];
     const bytes = Number(row.WorkingSetSize ?? row.workingSetSize ?? 0);
     return [{ pid: Number(row.ProcessId ?? row.pid), name, commandLine, kind: 'orphan-open-url', ageMin, mb: Number.isFinite(bytes) ? bytes / 1024 / 1024 : 0 }];
   });

@@ -415,11 +415,12 @@ test('orphan-open-url: NodeService の子を持つ本体は残骸に入らない
   assert.equal(result.length, 0);
 });
 
-test('orphan-open-url: 子が crashpad/gpu だけの --open-url は残骸に入る', () => {
+test('orphan-open-url: 子が crashpad/network/gpu だけの --open-url は残骸に入る', () => {
   const result = classifyOrphanOpenUrl([
     codeProc(200, 'C:\\Program Files\\Microsoft VS Code\\Code.exe --open-url vscode://Anthropic.claude-code/open', 15),
     childProc(201, 200, 'C:\\Program Files\\Microsoft VS Code\\Code.exe --type=crashpad-handler', 15),
     childProc(202, 200, 'C:\\Program Files\\Microsoft VS Code\\Code.exe --type=gpu-process', 15),
+    childProc(203, 200, 'Code.exe --type=utility --utility-sub-type=network.mojom.NetworkService', 15),
   ], now);
   assert.equal(result.length, 1);
   assert.equal(result[0].pid, 200);
@@ -430,4 +431,13 @@ test('orphan-open-url: --type= を含む子プロセス自身は残骸に入ら�
     { ...codeProc(300, 'Code.exe --open-url vscode://test --type=crashpad-handler', 30) },
   ], now);
   assert.equal(result.length, 0);
+});
+
+test('orphan-open-url: unrelated or non-Code NodeService does not protect an orphan', () => {
+  const result = classifyOrphanOpenUrl([
+    codeProc(400, 'Code.exe --open-url vscode://test', 15),
+    childProc(401, 999, 'Code.exe --utility-sub-type=node.mojom.NodeService', 15),
+    { ...childProc(402, 400, 'node.mojom.NodeService', 15), Name: 'node.exe' },
+  ], now);
+  assert.deepEqual(result.map(row => row.pid), [400]);
 });

@@ -32,27 +32,15 @@ $cutoff = (Get-Date).AddSeconds(-60).ToUniversalTime()
 try {
   $codeProcs = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'Code.exe' })
   $candidates = @($codeProcs | Where-Object {
-    $null -ne $_.CommandLine -and $_.CommandLine.Contains('--open-url') -and $_.CommandLine -notlike '*--type=*' -and $_.CreationDate -le $cutoff
+    $null -ne $_.CommandLine -and $_.CommandLine.Contains('--open-url') -and $_.CommandLine -notlike '*--type=*' -and $_.CreationDate -lt $cutoff
   })
   if ($candidates.Count -eq 0) { Write-Output 'none'; return }
-  $stuck = $true
+  $stuck = $false
   foreach ($c in $candidates) {
-    $hasNodeService = $false
-    $queue = @($c.ProcessId)
-    $seen = @{}
-    $qi = 0
-    while ($qi -lt $queue.Count -and -not $hasNodeService) {
-      $pid = $queue[$qi]; $qi++
-      if ($seen.ContainsKey($pid)) { continue }
-      $seen[$pid] = $true
-      foreach ($child in ($codeProcs | Where-Object { $_.ParentProcessId -eq $pid })) {
-        if ($null -ne $child.CommandLine -and $child.CommandLine.Contains('node.mojom.NodeService')) {
-          $hasNodeService = $true; break
-        }
-        $queue += $child.ProcessId
-      }
-    }
-    if (-not $hasNodeService) { $stuck = $false; break }
+    $nodeServiceChildren = @($codeProcs | Where-Object {
+      $_.ParentProcessId -eq $c.ProcessId -and $null -ne $_.CommandLine -and $_.CommandLine.Contains('node.mojom.NodeService')
+    })
+    if ($nodeServiceChildren.Count -eq 0) { $stuck = $true; break }
   }
   if ($stuck) { Write-Output 'stuck' } else { Write-Output 'none' }
 } catch { Write-Output 'none' }

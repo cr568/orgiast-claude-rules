@@ -541,9 +541,35 @@ test('replenish proceeds normally when no stuck Code.exe --open-url', async t =>
     sleep: async () => {},
     notify: async () => ({ delivered: 'dm' }),
     now: () => ts,
-    findStuckOpenUrl: async () => { findStuckCalled = true; return false; },
+    findStuckOpenUrl: () => defaultFindStuckOpenUrl({
+      // PowerShell reports none for a main process with a NodeService child.
+      spawnImpl: () => { findStuckCalled = true; return { status: 0, stdout: 'none\r\n' }; },
+    }),
   });
   assert.deepEqual(result.action, 'replenished');
   assert.equal(findStuckCalled, true);
   assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(stateFile, 'utf8')), 'failedOpenAt'), false);
+});
+
+test('defaultFindStuckOpenUrl queries direct Code children and reports any orphan', () => {
+  let invocation;
+  const run = stdout => defaultFindStuckOpenUrl({
+    spawnImpl: (...args) => { invocation = args; return { status: 0, stdout }; },
+  });
+  assert.equal(run('none\r\n'), false);
+  const [command, args, options] = invocation;
+  assert.equal(command, 'powershell');
+  const script = args.at(-1);
+  assert.match(script, /Get-CimInstance Win32_Process/);
+  assert.match(script, /\$_.Name -eq 'Code.exe'/);
+  assert.match(script, /\$_.CommandLine.Contains\('--open-url'\)/);
+  assert.match(script, /\$_.CommandLine -notlike '\*--type=\*'/);
+  assert.match(script, /\$_.CreationDate -lt \$cutoff/);
+  assert.match(script, /\$_.ParentProcessId -eq \$c.ProcessId/);
+  assert.match(script, /\$_.CommandLine.Contains\('node.mojom.NodeService'\)/);
+  assert.match(script, /\$stuck = \$false/);
+  assert.match(script, /if \(\$nodeServiceChildren.Count -eq 0\) { \$stuck = \$true; break }/);
+  assert.doesNotMatch(script, /\$pid\s*=/i);
+  assert.equal(options.timeout, 15_000);
+  assert.equal(run('stuck\r\n'), true);
 });
