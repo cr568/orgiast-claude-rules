@@ -13,7 +13,7 @@
     "apps": { "reason": "社内アプリのソース。配布先PCの実行時参照なし" },
     "analysis": { "reason": "分析メモ。実行時参照なし" },
     "data": { "reason": "codex 可用性プローブ履歴等のデータ。booth-case-study-gen.test.mjs のテストデータ（booth-projects.json）を含む", "runtimeRefOk": true },
-    "evidence": { "reason": "証跡置き場。実��時参照なし" },
+    "evidence": { "reason": "証跡置き場。実行時参照なし" },
     "reports": { "reason": "レポート置き場。実行時参照なし" },
     "results": { "reason": "PR作業の結果レポート。配布先PCの実行時参照なし" },
     "package.json": { "reason": "repo 自体の依存宣言。tools の参照は対象アプリ側の package.json" },
@@ -57,6 +57,7 @@
     "tasks": { "reason": "Codex への実装指示ファイル。配布先PCの実行時参照なし" },
     "runs": { "reason": "session-fold bench 等の計測の出力（runs/c041-timeseries）。配布先PCの実行時参照なし" },
     "tests": { "reason": "テストフィクスチャ。tools/session-fold-bench.mjs 等の実行時参照のみで配布不要", "runtimeRefOk": true },
-    "research": { "reason": "AIニュース提案の調査レポート。配布先PCの実行時参照なし" }
+    "research": { "reason": "AIニュース提案の調査レポート。配布先PCの実行時参照なし" },
+    ".steering": { "reason": "設計ドキュメント。配布先PCの実行時参照なし" }
   }
 }
