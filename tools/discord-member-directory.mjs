@@ -7,6 +7,10 @@ import { isEntry } from './is-entry.mjs';
 const GUILD_ID = '715211007307284530';
 const API_URL = `https://discord.com/api/v10/guilds/${GUILD_ID}/members/search`;
 const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Verified live guild + calendar identity, 2026-10-04.
+const EMAIL_MEMBERS = {
+  'm.kanau@orgiast.jp': { id: '1382566741464449124', name: '百瀬' },
+};
 
 export function normalizeName(value) {
   return String(value ?? '').normalize('NFKC').trim().toLocaleLowerCase().replace(/[\p{P}\p{S}\s]+/gu, '');
@@ -19,6 +23,10 @@ function memberLabels(member) {
 export function matchMember(query, members) {
   const source = String(query ?? '').trim();
   const email = /^[^@\s]+@[^@\s]+$/.test(source);
+  if (email) {
+    const exact = (members || []).filter((member) => member.emails?.some((value) => value.toLowerCase() === source.toLowerCase()));
+    if (exact.length) return exact.length === 1 ? { id: String(exact[0].id), label: memberLabels(exact[0])[0] } : null;
+  }
   const lookup = normalizeName(email ? source.slice(0, source.indexOf('@')) : source);
   if (!lookup) return null;
   const rows = (Array.isArray(members) ? members : []).map((member) => ({ member, labels: memberLabels(member) }));
@@ -71,8 +79,20 @@ async function requestMembers(url, token, fetchImpl) {
   return null;
 }
 
-export async function getDiscordMembers({ query = '', home = os.homedir(), refresh = false, now = new Date(), fetchImpl = fetch } = {}) {
-  const queries = searchQueries(query);
+// Use the existing secretary's calendar identity directory, not email-fragment guesses.
+export function emailIdentityName(query, home) {
+  if (!/^[^@\s]+@[^@\s]+$/.test(query)) return '';
+  const directory = readJson(path.join(home, '.claude', 'secretary-state', 'calendar-cache.json'));
+  const names = [...new Set(Object.values(directory?.calendars || {})
+    .filter((entry) => entry.id?.toLowerCase() === query.toLowerCase() && entry.label)
+    .map((entry) => normalizeName(entry.label)))];
+  return names.length === 1 ? names[0] : '';
+}
+
+export async function getDiscordMembers({ query = '', home = os.homedir(), refresh = false, now = new Date(), fetchImpl = fetch, persistCache = true } = {}) {
+  const explicit = EMAIL_MEMBERS[String(query).trim().toLowerCase()];
+  const identityName = explicit ? normalizeName(explicit.name) : emailIdentityName(query, home);
+  const queries = searchQueries(identityName || query);
   if (queries.length === 0) return [];
   const cacheFile = path.join(home, '.claude', 'orgiast-discord-members.json');
   const cached = readJson(cacheFile);
@@ -92,10 +112,23 @@ export async function getDiscordMembers({ query = '', home = os.homedir(), refre
       members = await requestMembers(url, token, fetchImpl);
       if (members === null) return null;
       cache.queries[searchQuery] = { fetched_at: now.toISOString(), members };
-      fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
-      fs.writeFileSync(cacheFile, `${JSON.stringify(cache, null, 2)}\n`, 'utf8');
+      if (persistCache) {
+        fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+        fs.writeFileSync(cacheFile, `${JSON.stringify(cache, null, 2)}\n`, 'utf8');
+      }
     }
-    if (members.length > 0) return members;
+    if (members.length > 0) {
+      if (identityName) {
+        const exact = members.filter((member) => explicit
+          ? String(member.id) === explicit.id
+          : memberLabels(member).some((label) => normalizeName(label) === identityName));
+        if (exact.length === 1) return [{ ...exact[0], emails: [query] }];
+        // Ambiguous directory identities must never be guessed.
+        if (exact.length > 1) return [];
+        continue;
+      }
+      return members;
+    }
   }
   return [];
 }

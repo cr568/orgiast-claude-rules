@@ -63,6 +63,66 @@ test('requirements-freeze に核となる文字列がすべて含まれる', () 
   assert.match(source, /user\s*の?手作業回数/, 'requirements-freeze に「user の手作業回数」がありません');
 });
 
+test('design-deck はハイブリッド企画書モデルと修正分担を固定する', () => {
+  const source = readSkill('design-deck');
+  for (const text of [
+    '見せる資料はハイブリッド企画書モデル',
+    '実写真2〜4枚',
+    '見出し14字以内',
+    '写真面積は40%以上',
+    '写真の内容・雰囲気・構図への不満',
+    '文字・数字・表・余白への不満',
+    'Genspark: 写真配置の文法',
+    'Canva は使わない',
+  ]) {
+    assert.ok(source.includes(text), `design-deck に「${text}」がありません`);
+  }
+});
+
+test('design-deck pipeline は必須ファイルと7ページ型を同梱する', () => {
+  const pipeline = path.join(skillsDir, 'design-deck', 'pipeline');
+  for (const file of ['README.md', 'pages.example.json', 'gen-visuals.mjs', 'build.mjs', 'preview.mjs']) {
+    assert.ok(fs.existsSync(path.join(pipeline, file)), `pipeline/${file} がありません`);
+  }
+  const pages = JSON.parse(fs.readFileSync(path.join(pipeline, 'pages.example.json'), 'utf8'));
+  assert.deepEqual(pages.map((page) => page.type), ['cover', 'stats', 'visual', 'table', 'timeline', 'compare', 'perspective']);
+  for (const page of pages) {
+    for (const photo of page.photoSources ?? []) assert.ok(photo.startsWith('../'), `${page.id}: 写真パスが相対ではありません`);
+  }
+});
+
+test('modern-web-guidance は版固定・テレメトリ停止・ローカル実行を固定する', () => {
+  const source = readSkill('modern-web-guidance');
+  const lines = source.split(/\r?\n/);
+
+  // 1. @latest を含む npx 行があっても禁止/使わないを述べる行だけ
+  const badLatestLines = lines.filter((l) => l.includes('npx') && l.includes('@latest') && !l.includes('禁止') && !l.includes('使わない'));
+  assert.equal(badLatestLines.length, 0, `@latest + npx の許容されない行: ${badLatestLines.join(', ')}`);
+
+  // 2. modern-web.mjs の search/retrieve/legacy-scan 行はすべて DISABLE_TELEMETRY=1 で始まる
+  for (const sub of ['search', 'retrieve', 'legacy-scan']) {
+    const subLines = lines.filter((l) => l.includes('modern-web.mjs"') && l.includes(sub));
+    assert.ok(subLines.length >= 1, `${sub} を含む modern-web.mjs 行がありません`);
+    for (const l of subLines) {
+      assert.ok(l.trimStart().startsWith('DISABLE_TELEMETRY=1'), `${sub} 行が DISABLE_TELEMETRY=1 で始まりません: ${l.trim()}`);
+    }
+  }
+
+  // 3. 版固定の npx フォールバックが含まれる
+  assert.ok(source.includes('npx -y modern-web-guidance@1.0.0'), '版固定の npx フォールバックがありません');
+
+  // 4. 必須ファイルが存在する
+  const requiredFiles = [
+    'modern-web.mjs', 'search.mjs', 'LICENSE',
+    'gen/guides.json', 'gen/guide-chunks.json.gz', 'gen/guide-chunks.i8', 'gen/guide-chunks.scale.f32',
+    'gen/query-words.json', 'gen/query-words.i8', 'gen/query-words.scale.f32',
+  ];
+  const skillDir = path.join(skillsDir, 'modern-web-guidance');
+  for (const file of requiredFiles) {
+    assert.ok(fs.existsSync(path.join(skillDir, file)), `${file} が modern-web-guidance/ に存在しません`);
+  }
+});
+
 if (isEntry(import.meta.url)) {
   process.exitCode = 0;
 }

@@ -171,3 +171,95 @@ test('2段目のdigestとproposalsをtopicsと本文へ反映する', async (t) 
   assert.match(digest, /要約段で生成した話題/);
   assert.match(digest, /価格設定を確認/);
 });
+
+for (const profile of ['ai', 'cafe', 'minpaku']) {
+  test(`${profile} は対象チャットだけをLLMと処理履歴に渡し出力を分離する`, async (t) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'line-profile-'));
+    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    const base = path.join(home, '.claude'), dir = path.join(base, 'line-openchat');
+    fs.mkdirSync(dir, { recursive: true });
+    const input = [
+      { id: 'minpaku', chat: '民泊オーナー雑談ルーム(283)', text: '清掃費を3500円に変更して利益率が改善したという情報です。', ts: Date.now() + 2 },
+      { id: 'cafe', chat: 'レンスペ民の集い', text: '平日1500円', ts: Date.now() + 1 },
+      { id: 'ai', chat: '生成AI', text: 'Claudeの新モデルの料金が大幅に下がったというニュースです。', ts: Date.now() },
+    ];
+    fs.writeFileSync(path.join(dir, '2026-10.jsonl'), input.map(JSON.stringify).join('\n'));
+    const other = profile === 'ai' ? 'cafe' : 'ai-news';
+    for (const suffix of ['digest.md', 'proposals.jsonl', 'topics.jsonl']) fs.writeFileSync(path.join(base, `${other}-${suffix}`), '既存データ');
+    const otherState = profile === 'ai' ? 'state-cafe.json' : 'state.json';
+    fs.writeFileSync(path.join(dir, otherState), '{"processedIds":["existing"]}');
+    const category = profile === 'cafe' ? '価格' : profile === 'minpaku' ? '価格・稼働率' : 'cost';
+    const calls = [];
+    const result = await runDigest({
+      home, args: [...(profile !== 'ai' ? ['--profile', profile] : []), '--limit', '1'], log() {},
+      llm: async (request) => {
+        calls.push(request);
+        return { text: calls.length === 1
+          ? JSON.stringify({ items: [{ i: 0, category, score: 3 }] })
+          : JSON.stringify({ digest: ['改善案を試す'], proposals: [{ title: '料金を試す', action: '試す', evidence: '参加者の投稿', category, confidence: 'medium' }] }) };
+      },
+    });
+    assert.equal(result.processed, 1);
+    assert.equal(calls.length, 2);
+    const expected = input.find((m) => m.id === profile);
+    assert.deepEqual(calls[0].messages[1].content.split('\n').map(JSON.parse), [{ i: 0, text: expected.text }]);
+    assert.deepEqual(Object.keys(JSON.parse(calls[1].messages[1].content)), [category]);
+    if (profile === 'cafe') {
+      assert.match(calls[0].messages[0].content, /212coffee/);
+      assert.match(calls[1].messages[0].content, /他店オーナー/);
+    } else if (profile === 'minpaku') {
+      assert.match(calls[0].messages[0].content, /特区民泊/);
+      assert.match(calls[1].messages[0].content, /全室稼働95%/);
+    }
+    const prefix = profile === 'cafe' ? 'cafe' : profile === 'minpaku' ? 'minpaku' : 'ai-news';
+    assert.equal(JSON.parse(fs.readFileSync(path.join(base, `${prefix}-proposals.jsonl`), 'utf8')).category, category);
+    assert.match(fs.readFileSync(path.join(base, `${prefix}-topics.jsonl`), 'utf8'), /改善案を試す/);
+    assert.match(fs.readFileSync(path.join(base, `${prefix}-digest.md`), 'utf8'), profile === 'cafe' ? /<!-- CAFE-DIGEST-START -->/ : profile === 'minpaku' ? /<!-- MINPAKU-DIGEST-START -->/ : /<!-- AI-NEWS-START -->/);
+    const state = JSON.parse(fs.readFileSync(path.join(dir, profile === 'cafe' ? 'state-cafe.json' : profile === 'minpaku' ? 'state-minpaku.json' : 'state.json'), 'utf8'));
+    assert.deepEqual(state.processedIds, [profile]);
+    for (const suffix of ['digest.md', 'proposals.jsonl', 'topics.jsonl']) assert.equal(fs.readFileSync(path.join(base, `${other}-${suffix}`), 'utf8'), '既存データ');
+    assert.equal(fs.readFileSync(path.join(dir, otherState), 'utf8'), '{"processedIds":["existing"]}');
+  });
+}
+
+test('未知または欠落したprofileを拒否する', async () => {
+  for (const args of [['--profile', 'x'], ['--profile'], ['--profile', 'toString']]) {
+    await assert.rejects(runDigest({ args }), /--profile は/);
+  }
+});
+
+test('カフェマーカーのみ置換してAI区間を保持する', () => {
+  const ai = '<!-- AI-NEWS-START -->\nAI\n<!-- AI-NEWS-END -->';
+  assert.equal(replaceMarkerSection(`${ai}\n<!-- CAFE-DIGEST-START -->\n旧\n<!-- CAFE-DIGEST-END -->\n後`, '新', 'CAFE-DIGEST'), `${ai}\n<!-- CAFE-DIGEST-START -->\n新\n<!-- CAFE-DIGEST-END -->\n後`);
+  assert.match(replaceMarkerSection(ai, '新', 'CAFE-DIGEST'), /<!-- CAFE-DIGEST-START -->\n新/);
+});
+
+test('カフェ前処理は15文字境界とURL・数字を使いAI短文を除く', () => {
+  const texts = ['あ'.repeat(14), 'あ'.repeat(15), '1500円', '１５００円', 'https://x.jp', 'GPT公開'];
+  assert.deepEqual(preprocessMessages(texts.map((text) => ({ text })), { minLength: 15, meaningful: (text) => /[0-9０-９]/u.test(text) }).map((m) => m.text), [texts[1], '1500円', 'https://x.jp']);
+});
+
+test('minpaku前処理は数字なし15字以上の運営ノウハウも残す', () => {
+  const texts = ['あ'.repeat(14), 'あ'.repeat(15), '1500円', 'チェックアウト時にシーツを剥がす運営ノウハウ'];
+  assert.deepEqual(preprocessMessages(texts.map((text) => ({ text })), { minLength: 15 }).map((m) => m.text), [texts[1], 'チェックアウト時にシーツを剥がす運営ノウハウ']);
+});
+
+test('cafe seedはカフェチャットに入り別プロファイルに影響しない', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'line-cafe-seed-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  await runDigest({ home, args: ['--profile', 'cafe', '--seed'], llm: async () => ({ text: '{"items":[{"i":0,"category":"価格","score":1}]}' }), log() {} });
+  const dir = path.join(home, '.claude', 'line-openchat');
+  const input = fs.readdirSync(dir).find((file) => file.endsWith('.jsonl'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, input), 'utf8')).chat, 'レンスペ民の集い');
+  assert.equal(fs.existsSync(path.join(dir, 'state.json')), false);
+});
+
+test('minpaku seedは民泊チャットに入り別プロファイルに影響しない', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'line-minpaku-seed-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  await runDigest({ home, args: ['--profile', 'minpaku', '--seed'], llm: async () => ({ text: '{"items":[{"i":0,"category":"価格・稼働率","score":1}]}' }), log() {} });
+  const dir = path.join(home, '.claude', 'line-openchat');
+  const input = fs.readdirSync(dir).find((file) => file.endsWith('.jsonl'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, input), 'utf8')).chat, '民泊オーナー雑談ルーム');
+  assert.equal(fs.existsSync(path.join(dir, 'state.json')), false);
+});
