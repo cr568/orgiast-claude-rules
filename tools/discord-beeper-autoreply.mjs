@@ -30,6 +30,21 @@ export function plainText(text = '') {
   return String(text).replace(/<br\s*\/?\s*>|<\/p>/gi, '\n').replace(/<[^>]*>/g, '')
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').trim();
 }
+// 通話通知など、返信すべきでない合成メッセージ
+const SYNTHETIC_PTN = /started a call|Use the Discord app to answer|不在着信|missed call/i;
+export function isSyntheticMessage(m) {
+  if (!m || m.isSender) return false;
+  return m.type === 'TEXT' && SYNTHETIC_PTN.test(plainText(m.text || ''));
+}
+export function selectReplyTarget(pending) {
+  return pending.filter(m => !m.isSender && !m.isDeleted && !m.isHidden
+    && m.type === 'TEXT' && plainText(m.text) && !isSyntheticMessage(m)).sort(compare).at(-1);
+}
+export function hasSendFailure(message) {
+  return Boolean(message && (message.sendError || message.failed || message.isFailed
+    || message.sendFailed || /^(failed|error|send_failed)$/i.test(message.status || '')
+    || /^(failed|error|send_failed)$/i.test(message.sendStatus || '')));
+}
 const timestamp = m => Date.parse(m.timestamp);
 const compare = (a, b) => timestamp(a) - timestamp(b)
   || (BigInt(/^\d+$/.test(a.sortKey) ? a.sortKey : '0') > BigInt(/^\d+$/.test(b.sortKey) ? b.sortKey : '0') ? 1
@@ -232,7 +247,7 @@ export async function runOnce(options = {}) {
         const lastSelf = all.findLast(m => m.isSender);
         if (prior?.status === 'sending') {
           const found = all.find(m => m.isSender && plainText(m.text) === prior.content && timestamp(m) >= timestamp(prior));
-          if (found) {
+          if (found && !hasSendFailure(found)) {
             state.chats[chat.id] = { ...prior, status: 'sent', replyId: found.id };
             await recordSentReply(home, {
               where: 'dm',
@@ -257,7 +272,7 @@ export async function runOnce(options = {}) {
           result.skipped++; continue;
         }
         link = messageLink(chat, latest);
-        const pending = all.filter(m => !m.isSender && (!lastSelf || compare(m, lastSelf) > 0)
+        const pending = all.filter(m => !m.isSender && !isSyntheticMessage(m) && (!lastSelf || compare(m, lastSelf) > 0)
           && (!prior?.timestamp || prior.status === 'skipped' || compare(m, prior) > 0));
         question = pending.map(m => {
           let text = `${m.senderName || ''}: ${plainText(m.text)}`;
@@ -267,6 +282,8 @@ export async function runOnce(options = {}) {
           }
           return text;
         }).join('\n');
+        // 返信すべき本物メッセージがない（合成メッセージのみなど）場合はスキップ
+        if (pending.length === 0) { result.skipped++; continue; }
         if (prior?.status !== 'skipped' && (prior?.id === latest.id || (prior?.timestamp && compare(latest, prior) <= 0))) { result.skipped++; continue; }
         if (isMessageRequest(chat)) { await decide('メッセージリクエスト・未承認'); continue; }
         if (!addressedToKim(chat, pending, all, selfIDs)) { result.skipped++; continue; }
@@ -309,7 +326,7 @@ export async function runOnce(options = {}) {
           } catch { return []; }
         };
         const classifyInput = {
-          channelName: chat.title, context: all.slice(-25).map(m => ({ author: m.senderName, content: plainText(m.text), isSelf: m.isSender })),
+          channelName: chat.title, context: all.filter(m => !isSyntheticMessage(m)).slice(-25).map(m => ({ author: m.senderName, content: plainText(m.text), isSelf: m.isSender })),
           message: { content: question },
           knowledge: read(path.join(home, '.claude', 'discord-autoreply', 'knowledge.md')),
           rules: read(path.join(home, '.claude', 'discord-autoreply', 'rules.md')),
@@ -405,9 +422,13 @@ export async function runOnce(options = {}) {
         attempts++; save();
 
         let sent;
-        try { sent = await api.sendMessage(chat.id, content, { replyToMessageID: latest.id }); }
+        // 返信先は pending の最新（本物メッセージ）、合成メッセージは避ける
+        const replyTarget = selectReplyTarget(pending);
+        try { sent = await api.sendMessage(chat.id, content, replyTarget ? { replyToMessageID: replyTarget.id } : {}); }
         catch { await decide('送信結果が不明。再送せず Discord で確認してください', 'uncertain'); continue; }
         if (sent?.chatID && sent.chatID !== chat.id) { await decide('送信結果の会話IDが一致しません', 'uncertain'); continue; }
+
+        if (hasSendFailure(sent)) { await decide('送信失敗の印を検出。再送せず Discord で確認してください', 'uncertain'); continue; }
 
         let found;
         try {
@@ -422,6 +443,8 @@ export async function runOnce(options = {}) {
           }
         } catch { /* Receipt is uncertain; never resend. */ }
         if (!found) { await decide('送信後の本文読み戻しに失敗。再送せず Discord で確認してください', 'uncertain'); continue; }
+
+        if (hasSendFailure(found)) { await decide('送信失敗の印を検出。再送せず Discord で確認してください', 'uncertain'); continue; }
 
         state.chats[chat.id] = { ...mark(latest), status: 'sent', replyId: found.id, content };
         await recordSentReply(home, {
