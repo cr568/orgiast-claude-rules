@@ -7,6 +7,7 @@ import { main, extractBatch, candidateRow, evidencedDue, runDetect, askProvider,
 import { seatCheck } from './lib/deadline-seat.mjs';
 import { collectGmail, collectDrive, readDriveText, collectLine, collectDiscord, wantsBody, trimBytes, sourceLoaders } from './lib/deadline-sources.mjs';
 import { DEFAULT_CONFIG, saveJson, dataPath } from './deadline-ledger.mjs';
+import { createSheetsClient } from './lib/sheets-dwd.mjs';
 const document = { source: 'Gmail', sourceRef: 'mail:test', date: '2026-11-03T23:00:00Z', text: '明日までに回答してください。', mailbox: 'kim@orgiast.jp', threadId: 'thread' };
 const item = { sourceRef: document.sourceRef, title: '回答', due: '2026-11-05', kind: '回答・返信', action: '返信', assignee: 'kim', confidence: 0.9, quote: document.text };
 const now = new Date('2026-11-04T02:00:00Z');
@@ -59,6 +60,36 @@ test('途中で抽出失敗した源の透かしは保持し、他源だけ進�
   assert.equal(result.added, 1); assert.equal(result.errors.length, 1); assert.equal(state.sources.broken.watermark, 'old'); assert.equal(state.sources.good.watermark, 'new');
   rows[0].status = '完了';
   assert.equal((await runDetect({ ...params, ask: async () => assert.fail('closed source repeated') })).added, 0);
+});
+
+test('応答しないfetchはAbortSignalでrejectされハングしない', async t => {
+  // AbortSignal.timeout() does not keep Node's event loop alive. Keep this
+  // isolated test alive until the abort fires, as the real scheduled process
+  // has other active handles while a request is in flight.
+  const keepAlive = setTimeout(() => {}, 1000);
+  t.after(() => clearTimeout(keepAlive));
+  const started = Date.now();
+  const fetchImpl = (_url, { signal }) => new Promise((_resolve, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+  const sheets = createSheetsClient({ fetchImpl, getToken: async () => 'token', timeoutMs: 25 });
+  await assert.rejects(sheets.get('sheet', 'A1'), /fetch failed.*aborted|fetch failed.*timeout/i);
+  assert.ok(Date.now() - started < 1000);
+});
+
+test('Gmail quota 403は2回再試行後にsourceをスキップして続行', async t => {
+  const home = homeFor(t), state = {}, delays = [], stages = [];
+  const quota = Object.assign(new Error('Gmail API 403: rateLimitExceeded Quota exceeded'), { status: 403 });
+  let attempts = 0;
+  const sources = [
+    { key: 'gmail', load: async () => { attempts++; throw quota; } },
+    { key: 'discord', load: async () => ({ documents: [], next: { watermark: 'done' } }) },
+  ];
+  const ledger = { read: async () => [], append: async () => assert.fail('no rows') };
+  const result = await runDetect({ home, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, ledger, state, sources, now, dryRun: false, ask: async () => assert.fail('no LLM'), notify: async () => {}, sleepImpl: async ms => delays.push(ms), stage: value => stages.push(value) });
+  assert.equal(attempts, 3); assert.deepEqual(delays, [500, 1000]);
+  assert.equal(result.errors.length, 0); assert.match(result.skipped[0].reason, /quota retry exhausted/);
+  assert.deepEqual(state.sources.discord, { watermark: 'done' });
 });
 
 test('Gmailは本文取得対象だけを上限に数えページカーソルを保持', async () => {
@@ -168,6 +199,62 @@ test('Driveの1ファイルreadDriveText失敗でもrunDetectでskippedが積ま
   // next is saved in state (even though all files failed — the window advances)
   assert.ok(state.sources['drive:kim@orgiast.jp']);
   assert.equal(state.sources['drive:kim@orgiast.jp'].pageToken, 'next-token');
+});
+
+test('Driveは時間予算到達をpartial成功にし、次回は同じページの未処理分から再開', async () => {
+  const files = ['one', 'two'].map((id, i) => ({ id, name: `${id}.gdoc`, mimeType: 'application/vnd.google-apps.document', modifiedTime: `2026-11-04T0${i + 1}:00:00Z` }));
+  const read = [];
+  const request = async (url) => {
+    if (url.includes('drive/v3/files?')) return { files, nextPageToken: 'page-2' };
+    const id = url.match(/files\/([^/]+)\/export/)?.[1]; read.push(id); return `${id} text`;
+  };
+  const ticks = [0, 0, 10];
+  const first = await collectDrive({ user: 'kim@example.invalid', state: {}, now, request, budgetMs: 5, nowMs: () => ticks.shift() ?? 10 });
+  assert.equal(first.documents.length, 1); assert.equal(first.partial.reason, 'Drive時間予算到達');
+  assert.deepEqual(first.next.processedIds, ['one']); assert.equal(first.next.pageToken, undefined);
+  const second = await collectDrive({ user: 'kim@example.invalid', state: first.next, now, request, budgetMs: 100, nowMs: () => 0 });
+  assert.deepEqual(read, ['one', 'two']); assert.equal(second.documents.length, 1); assert.equal(second.documents[0].sourceRef, 'drive:two');
+  assert.equal(second.next.pageToken, 'page-2'); assert.equal(second.next.processedIds, undefined);
+});
+
+test('全体上限では残sourceをskipしてexit 0・heartbeat okにする', async t => {
+  const home = homeFor(t), output = [], heartbeats = [], ticks = [0, 0, 600_000];
+  const sources = [
+    { key: 'done', load: async () => ({ documents: [], next: { watermark: 'done' } }) },
+    { key: 'later', load: async () => assert.fail('全体上限後のsourceを開始しない') },
+  ];
+  const code = await main([], { home, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, ledger: { read: async () => [] }, sources, skipSeatCheck: true, nowMs: () => ticks.shift() ?? 600_000, stdout: value => output.push(value), heartbeat: async value => heartbeats.push(value), notify: async () => {} });
+  assert.equal(code, 0); const result = JSON.parse(output[0]);
+  assert.equal(result.partial.length, 1); assert.match(result.skipped[0].reason, /全体時間上限/);
+  assert.equal(heartbeats[0].ok, true); assert.match(heartbeats[0].summary, /partial=1 skipped=1/);
+});
+
+test('DEADLINE_TOTAL_BUDGET_MSで全体上限を設定できる', async t => {
+  const previous = process.env.DEADLINE_TOTAL_BUDGET_MS;
+  process.env.DEADLINE_TOTAL_BUDGET_MS = '40';
+  t.after(() => previous === undefined ? delete process.env.DEADLINE_TOTAL_BUDGET_MS : process.env.DEADLINE_TOTAL_BUDGET_MS = previous);
+  const home = homeFor(t), output = [];
+  const code = await main([], { home, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, ledger: { read: async () => [] },
+    sources: [{ key: 'hang', load: async () => new Promise(() => {}) }], skipSeatCheck: true,
+    stdout: value => output.push(JSON.parse(value)), heartbeat: async () => {}, notify: async () => {} });
+  assert.equal(code, 0); assert.match(output[0].skipped[0].reason, /全体時間上限/);
+});
+
+test('token取得不可で全体が成立しない場合はexit 1のまま', async t => {
+  const home = homeFor(t), heartbeats = [];
+  const code = await main([], { home, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, ledger: { read: async () => { throw new Error('token unavailable'); } }, sources: [], skipSeatCheck: true, stderr: () => {}, stdout: () => {}, heartbeat: async value => heartbeats.push(value) });
+  assert.equal(code, 1); assert.equal(heartbeats[0].ok, false); assert.match(heartbeats[0].summary, /token unavailable/);
+});
+
+test('Driveの50件上限とLINE/Discordの新規行を読み込む', async t => {
+  const result = await collectDrive({ user: 'kim@orgiast.jp', state: {}, now, limit: 50, request: async (url) => { assert.match(url, /pageSize=50/); return { files: [], nextPageToken: 'next' }; } });
+  assert.equal(result.next.pageToken, 'next'); assert.equal(result.next.watermark, undefined);
+  const line = await collectLine({ sheetId: 'sheet', state: { watermark: '2026-11-03T00:00:00Z' }, now, sheets: { get: async () => [['id','ts','text'], ['new', now.getTime()-1, '明日まで'], ['old', Date.parse('2026-11-02'), '過去']] } });
+  assert.equal(line.documents.length, 1); assert.match(line.documents[0].sourceRef, /new$/);
+  const home = homeFor(t); fs.mkdirSync(path.join(home, '.claude'));
+  fs.writeFileSync(path.join(home, '.claude/discord-inbox-state.json'), JSON.stringify({ cursor: 'x' }));
+  fs.writeFileSync(path.join(home, '.claude/pending-decisions.jsonl'), JSON.stringify({ id: 'd', source: 'discord-inbox', capturedAt: now.toISOString(), text: '期限は明日' }) + '\n');
+  assert.equal((await collectDiscord({ home, state: {}, now })).documents.length, 1);
 });
 
 test('Driveの既定150件上限とLINE/Discordの新規行を読み込む', async t => {
@@ -329,4 +416,123 @@ test('配列要素も「」引用符でパースされる', () => {
 test('壊れたJSONは従来どおり例外を投げる', () => {
   assert.throws(() => parseExtraction('not json at all'), SyntaxError);
   assert.throws(() => parseExtraction('{"items":['), SyntaxError);
+});
+
+test('partial Driveもmainでexit 0・heartbeatへ件数と理由を残す', async t => {
+  const home = homeFor(t), heartbeats = [];
+  const code = await main([], { home, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, skipSeatCheck: true,
+    ledger: { read: async () => [] }, sources: [{ key: 'drive', load: async () => ({ documents: [], next: { processedIds: ['one'] }, partial: { reason: 'Drive時間予算到達', processed: 1, remaining: 2 }, skipped: [{ reason: 'file timeout' }] }) }],
+    stdout: () => {}, stage: () => {}, heartbeat: async value => heartbeats.push(value) });
+  assert.equal(code, 0); assert.equal(heartbeats[0].ok, true);
+  assert.match(heartbeats[0].summary, /partial=1 skipped=1/);
+  assert.match(heartbeats[0].summary, /Drive時間予算到達/); assert.match(heartbeats[0].summary, /file timeout/);
+});
+
+test('per-file timeoutで応答しないファイルをskipし次のファイルへ進む', async t => {
+  const keepAlive = setTimeout(() => {}, 1000); t.after(() => clearTimeout(keepAlive));
+  const result = await collectDrive({ user: 'test', now, state: {}, perFileTimeoutMs: 30,
+    request: async url => {
+      if (url.includes('files?')) return { files: ['hang', 'ok'].map(id => ({ id, name: id, mimeType: 'application/vnd.google-apps.document' })) };
+      if (url.includes('/hang/')) return new Promise(() => {});
+      return 'text';
+    } });
+  assert.equal(result.skipped.length, 1); assert.equal(result.skipped[0].sourceRef, 'drive:hang');
+  assert.equal(result.documents[0].sourceRef, 'drive:ok'); assert.equal(result.next.used, 2);
+});
+
+test('Drive処理中の全体abortでも取得済みdocumentと未処理位置を返す', async () => {
+  const controller = new AbortController();
+  const result = await collectDrive({ user: 'test', now, state: {}, signal: controller.signal,
+    request: async url => {
+      if (url.includes('files?')) return { files: ['one', 'two'].map(id => ({ id, name: id, mimeType: 'application/vnd.google-apps.document' })) };
+      // Abort after the first file has returned, before the next file starts.
+      return 'text';
+    }, onStage: message => { if (message.endsWith('file one end')) controller.abort(new Error('process limit')); } });
+  assert.equal(result.documents.length, 1); assert.match(result.partial.reason, /全体時間上限/);
+  assert.deepEqual(result.next.processedIds, ['one']); assert.equal(result.next.used, 1);
+});
+
+test('partial再開で日次件数を二重計数せず次ページへ進める', async () => {
+  const result = await collectDrive({ user: 'test', now, state: { day: '2026-11-04', used: 1, processedIds: ['one'] },
+    request: async url => url.includes('files?') ? { files: ['one', 'two'].map(id => ({ id, name: id, mimeType: 'application/vnd.google-apps.document' })), nextPageToken: 'next' } : 'text' });
+  assert.equal(result.documents.length, 1); assert.equal(result.next.used, 2); assert.equal(result.next.pageToken, 'next');
+});
+
+test('待機中sourceを実時間の全体上限で止め残sourceをskipする', async t => {
+  const home = homeFor(t), heartbeats = [], output = [], started = Date.now();
+  const code = await main([], { home, processBudgetMs: 40, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, skipSeatCheck: true,
+    ledger: { read: async () => [] }, sources: [
+      { key: 'hang', load: async () => new Promise(() => {}) },
+      { key: 'later', load: () => assert.fail('must not start') },
+    ], stdout: value => output.push(JSON.parse(value)), stage: () => {}, heartbeat: async value => heartbeats.push(value) });
+  assert.equal(code, 0); assert.equal(heartbeats[0].ok, true); assert.equal(output[0].skipped.length, 2);
+  assert.ok(Date.now() - started < 1000);
+});
+
+test('LLM待機も全体上限で止め、保存本文を次回再利用して未処理batchから続く', async t => {
+  const home = homeFor(t), heartbeats = [], seen = [];
+  const docs = Array.from({ length: 11 }, (_, i) => ({ ...document, sourceRef: `doc:${i}` }));
+  let loads = 0;
+  const deps = { home, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, skipSeatCheck: true,
+    ledger: { read: async () => [] }, sources: [{ key: 'drive', load: async () => ({ documents: ++loads === 1 ? docs : [], next: { watermark: 'done' } }) }],
+    stdout: () => {}, stage: () => {}, heartbeat: async value => heartbeats.push(value) };
+  let batches = 0;
+  assert.equal(await main([], { ...deps, processBudgetMs: 60, ask: async (_provider, batch) => {
+    seen.push(batch.map(d => d.sourceRef)); return ++batches === 1 ? { items: [] } : new Promise(() => {});
+  } }), 0);
+  const saved = JSON.parse(fs.readFileSync(dataPath(home, 'state.json'), 'utf8'));
+  assert.equal(saved.pending.drive.documents.length, 1); assert.equal(saved.sources?.drive, undefined);
+  assert.equal(await main([], { ...deps, ask: async (_provider, batch) => { seen.push(batch.map(d => d.sourceRef)); return { items: [] }; } }), 0);
+  assert.deepEqual(seen.map(batch => batch.length), [10, 1, 1]); assert.equal(loads, 2);
+  const finished = JSON.parse(fs.readFileSync(dataPath(home, 'state.json'), 'utf8'));
+  assert.equal(finished.pending.drive, undefined); assert.equal(finished.sources.drive.watermark, 'done');
+  assert.ok(heartbeats.every(value => value.ok));
+});
+
+test('source失敗は他source成功時exit 0でも実際の理由をheartbeatに残す', async t => {
+  const home = homeFor(t), heartbeats = [];
+  const code = await main([], { home, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, skipSeatCheck: true,
+    ledger: { read: async () => [] }, sources: [
+      { key: 'broken', load: async () => { throw new Error('source offline'); } },
+      { key: 'good', load: async () => ({ documents: [], next: {} }) },
+    ], stdout: () => {}, stage: () => {}, heartbeat: async value => heartbeats.push(value) });
+  assert.equal(code, 0); assert.equal(heartbeats[0].ok, true); assert.match(heartbeats[0].summary, /broken: source offline/);
+});
+
+test('先行source成功後でも台帳書込失敗はexit 1・heartbeat false', async t => {
+  const home = homeFor(t), heartbeats = [];
+  const code = await main([], { home, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, skipSeatCheck: true,
+    ledger: { read: async () => [], append: async () => { throw new Error('append unavailable'); } },
+    sources: [{ key: 'good', load: async () => ({ documents: [], next: {} }) }, { key: 'write', load: async () => ({ documents: [document], next: {} }) }],
+    ask: async () => ({ items: [item] }), stdout: () => {}, stderr: () => {}, stage: () => {}, heartbeat: async value => heartbeats.push(value) });
+  assert.equal(code, 1); assert.equal(heartbeats[0].ok, false); assert.match(heartbeats[0].summary, /台帳書込失敗.*append unavailable/);
+});
+
+test('Sheets token取得が実際に拒否される場合はexit 1・heartbeat false', async t => {
+  const home = homeFor(t), heartbeats = [];
+  const sheets = createSheetsClient({ getToken: async () => { throw new Error('credentials unavailable'); }, fetchImpl: () => assert.fail('no token') });
+  const code = await main([], { home, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, skipSeatCheck: true, sheets, sources: [],
+    stdout: () => {}, stderr: () => {}, stage: () => {}, heartbeat: async value => heartbeats.push(value) });
+  assert.equal(code, 1); assert.equal(heartbeats[0].ok, false); assert.match(heartbeats[0].summary, /Sheets token failed.*credentials unavailable/);
+});
+
+test('全体上限のpartialは先行source失敗があってもexit 0で理由を保持', async t => {
+  const home = homeFor(t), heartbeats = [];
+  const code = await main([], { home, processBudgetMs: 40, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, skipSeatCheck: true,
+    ledger: { read: async () => [] }, sources: [
+      { key: 'broken', load: async () => { throw new Error('source unavailable'); } },
+      { key: 'hang', load: async () => new Promise(() => {}) },
+    ], stdout: () => {}, stage: () => {}, heartbeat: async value => heartbeats.push(value) });
+  assert.equal(code, 0); assert.equal(heartbeats[0].ok, true);
+  assert.match(heartbeats[0].summary, /source unavailable/); assert.match(heartbeats[0].summary, /全体時間上限/);
+});
+
+test('状態ファイル書込失敗はsource成功で隠さずexit 1', async t => {
+  const home = homeFor(t), heartbeats = [];
+  const code = await main([], { home, config: { ...DEFAULT_CONFIG, sheetId: 'test' }, skipSeatCheck: true,
+    ledger: { read: async () => [] }, sources: [{ key: 'drive', load: async () => {
+      fs.mkdirSync(dataPath(home, 'state.json'), { recursive: true });
+      return { documents: [], next: {} };
+    } }], stdout: () => {}, stderr: () => {}, stage: () => {}, heartbeat: async value => heartbeats.push(value) });
+  assert.equal(code, 1); assert.equal(heartbeats[0].ok, false); assert.match(heartbeats[0].summary, /状態書込失敗/);
 });
