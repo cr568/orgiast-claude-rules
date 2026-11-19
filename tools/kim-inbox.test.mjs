@@ -763,3 +763,72 @@ test('CLI --auto-close prints JSON of closed items', async t => {
   await main(['--auto-close'], { home, stdout: s => output.push(JSON.parse(s)) });
   assert.ok(Array.isArray(output[0]));
 });
+
+test('answer closes open asks for the same ledger row or dedupe key', async t => {
+  const home = seat(t);
+  const ts = '2026-11-18T00:00:00.000Z';
+  const sessionId = 'abcdef12-full-session';
+  const text = (days, time = ts) => `【要対応・kim の判断待ち ${days}日】確認（元の約束: 作業 / セッション abcdef12 / 台帳 ts ${time}）`;
+  const original = await addItem(home, { kind: 'ask', text: text(2), sessionId });
+  const sameRow = await addItem(home, { kind: 'ask', text: text(3) });
+  const sameKey = await addItem(home, { kind: 'ask', text: '旧形式', dedupeKey: `auto-progress-escalate:${sessionId}${ts}` });
+  const otherRow = await addItem(home, { kind: 'ask', text: text(2, '2026-11-17T00:00:00.000Z') });
+
+  const answered = answerItem(home, original.id, '承認');
+  const items = new Map(listItems(home).map(item => [item.id, item]));
+  for (const duplicate of [sameRow, sameKey]) {
+    const saved = items.get(duplicate.id);
+    assert.equal(saved.status, 'superseded');
+    assert.equal(saved.supersededInto, answered.id);
+    assert.equal(saved.answer, answered.answer);
+    assert.equal(saved.answeredAt, answered.answeredAt);
+  }
+  assert.equal(items.get(otherRow.id).status, 'open');
+});
+
+test('answer is persisted while the aggregation lock is held', async t => {
+  const home = seat(t);
+  const ask = await addItem(home, { kind: 'ask', text: '確認', dedupeKey: 'job:1' });
+  const lock = path.join(home, '.claude/kim-inbox/info-aggregation.lock');
+  fs.writeFileSync(lock, String(process.pid), { flag: 'wx' });
+  const waitSetting = 'ORGIAST_INBOX_GROUP_LOCK_WAIT_MS';
+  const previousWait = process.env[waitSetting];
+  process.env[waitSetting] = '0';
+  t.after(() => {
+    if (previousWait === undefined) delete process.env[waitSetting];
+    else process.env[waitSetting] = previousWait;
+  });
+  const log = t.mock.method(console, 'error', () => {});
+
+  const answered = answerItem(home, ask.id, '承認');
+
+  assert.equal(answered.status, 'answered');
+  assert.deepEqual(listItems(home, { status: 'answered' }), [answered]);
+  assert.equal(answered.answer, '承認');
+  assert.equal(fs.readFileSync(lock, 'utf8'), String(process.pid));
+  assert.equal(log.mock.callCount(), 1);
+  assert.match(log.mock.calls[0].arguments[0], /回答は記録済み.*台帳が使用中です/);
+});
+
+test('drop closes only open asks with the matching key for ordinary questions', async t => {
+  const home = seat(t);
+  const original = await addItem(home, { kind: 'ask', text: '確認', dedupeKey: 'job:1' });
+  const duplicate = await addItem(home, { kind: 'ask', text: '別文面' });
+  const sameText = await addItem(home, { kind: 'ask', text: original.text });
+  const info = await addItem(home, { kind: 'info', text: '報告', dedupeKey: 'job:2' });
+  for (const item of [duplicate, info]) {
+    const file = path.join(home, '.claude/kim-inbox', item.id + '.json');
+    fs.writeFileSync(file, JSON.stringify({ ...item, dedupeKey: original.dedupeKey }));
+  }
+
+  const dropped = dropItem(home, original.id, '不要');
+  const items = new Map(listItems(home).map(item => [item.id, item]));
+  const saved = items.get(duplicate.id);
+  assert.equal(saved.status, 'superseded');
+  assert.equal(saved.supersededInto, dropped.id);
+  assert.equal(saved.answer, '不要');
+  assert.ok(dropped.answeredAt);
+  assert.equal(saved.answeredAt, dropped.answeredAt);
+  assert.equal(items.get(sameText.id).status, 'open');
+  assert.equal(items.get(info.id).status, 'open');
+});
