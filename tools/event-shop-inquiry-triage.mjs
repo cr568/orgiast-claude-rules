@@ -40,6 +40,9 @@ export async function checkGmailDrafts(customerEmail, { fetchImpl = gwsFetch, ge
   return { found: false };
 }
 const bodyLines = message => String(message?.body ?? '').split(/\r?\n/).filter(line => !/^\s*>/.test(line)).map(line => line.trim()).filter(Boolean);
+const autoReplyBodyPattern = /自動返信|自動応答|auto-?reply|automatic\s*reply|out\s*of\s*(?:the\s*)?office/i;
+const autoReplySubjectPattern = /自動返信|自動応答|auto-?reply|automatic\s*reply|out\s*of\s*(?:the\s*)?office|不在/i;
+const isAutoReply = msg => Boolean(msg) && (autoReplySubjectPattern.test(msg.subject ?? '') || autoReplyBodyPattern.test(bodyLines(msg).join('\n')));
 export function deduplicateMessages(messages) {
   const seen = new Set();
   return [...messages].sort((a, b) => time(b.received_at) - time(a.received_at)).filter(m => {
@@ -50,7 +53,7 @@ export function deduplicateMessages(messages) {
 }
 export async function classifyLead(lead, messages, now = new Date(), deps = {}) {
   const unique = deduplicateMessages(messages);
-  const lastIn = unique.find(m => m.direction === 'inbound');
+  const lastIn = unique.find(m => m.direction === 'inbound' && !isAutoReply(m));
   const lastOut = unique.find(m => m.direction === 'outbound');
   const past = Boolean(lead.preferred_date && lead.preferred_date < dateKey(now));
   const body = bodyLines(lastIn).join('\n');
