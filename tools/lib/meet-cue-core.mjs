@@ -3,6 +3,8 @@
  * 純粋ロジック部（ブラウザ・ネットワークに触れない、テスト対象）
  */
 
+import { sameFleetPc } from '../fleet-pc-identity.mjs';
+
 /**
  * Formats a Date object or timestamp as JST string (UTC+9).
  */
@@ -61,7 +63,7 @@ export function sanitizeCardData(card, brief = '') {
   return copy;
 }
 
-export const DEFAULT_SEAT_HOSTNAMES = ['000KimPC', 'DESKTOP-2D0R4LI'];
+export const DEFAULT_SEAT_HOSTNAMES = ['kim-PC'];
 
 export function resolveSeatHostnames(config) {
   const configured = config.seatHostnames ?? config.seatHostname;
@@ -71,7 +73,7 @@ export function resolveSeatHostnames(config) {
 }
 
 export function matchesSeatHostname(hostnames, hostname) {
-  return hostnames.length === 0 || hostnames.some(name => name.toLowerCase() === hostname.toLowerCase());
+  return hostnames.length === 0 || hostnames.some(name => sameFleetPc(name, hostname));
 }
 
 export const MEET_SELECTORS = {
