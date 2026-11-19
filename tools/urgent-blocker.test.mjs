@@ -15,6 +15,39 @@ function home(t) {
   return h;
 }
 
+test('contextHook: 同一セッションで既出件数行を繰り返さない', t => {
+  const h = home(t);
+  addItem(h, { session: 'sess-A', title: 'blocked', ask: 'do something' });
+  const env = {};
+  // 別セッション初回 → fresh 表示
+  const first = contextHook(
+    { hook_event_name: 'UserPromptSubmit', session_id: 'sess-B', prompt: 'first' },
+    { home: h, now: () => 1000, env }
+  );
+  assert.ok(first);
+  assert.match(first.hookSpecificOutput.additionalContext, /🚨 割り込み/);
+  // 同一セッション2回目（fresh 0件）→ null
+  const second = contextHook(
+    { hook_event_name: 'UserPromptSubmit', session_id: 'sess-B', prompt: 'second' },
+    { home: h, now: () => 2000, env }
+  );
+  assert.equal(second, null);
+  // 別セッション初回 → 既出件数行
+  const third = contextHook(
+    { hook_event_name: 'UserPromptSubmit', session_id: 'sess-C', prompt: 'third' },
+    { home: h, now: () => 3000, env }
+  );
+  assert.ok(third);
+  assert.match(third.hookSpecificOutput.additionalContext, /既出 1 件/);
+  assert.doesNotMatch(third.hookSpecificOutput.additionalContext, /🚨 割り込み/);
+  // その別セッション2回目 → null
+  const fourth = contextHook(
+    { hook_event_name: 'UserPromptSubmit', session_id: 'sess-C', prompt: 'fourth' },
+    { home: h, now: () => 4000, env }
+  );
+  assert.equal(fourth, null);
+});
+
 test('登録→一覧→解決の基本経路', t => {
   const h = home(t);
   const item = addItem(h, { session: 'sess-A', title: 'LINEログイン画像認証待ち', ask: 'LINE公式アカウントにログイン（2分）', link: 'https://example.com/login' });
@@ -55,10 +88,10 @@ test('selectForInterrupt: 別セッションの open だけ選び、自セッシ
   assert.deepEqual(selected.map(i => i.id), ['ub-a']);
 });
 
-test('selectForInterrupt: 60分以内の再表示はしない・60分過ぎれば再表示', () => {
+test('selectForInterrupt: 旧表示時刻では除外せず共通ポリシーに委ねる', () => {
   const shown = Date.parse('2026-11-10T01:30:00Z');
   const items = [{ id: 'ub-a', session: 'sess-A', title: 't', ask: 'a', status: 'open', createdAt: '2026-11-10T00:00:00Z', shownSessions: { 'sess-B': '2026-11-10T01:30:00Z' } }];
-  assert.equal(selectForInterrupt(items, { sessionId: 'sess-B', now: shown + INTERRUPT_REPEAT_MS - 1 }).length, 0);
+  assert.equal(selectForInterrupt(items, { sessionId: 'sess-B', now: shown + INTERRUPT_REPEAT_MS - 1 }).length, 1);
   assert.equal(selectForInterrupt(items, { sessionId: 'sess-B', now: shown + INTERRUPT_REPEAT_MS }).length, 1);
 });
 
@@ -85,13 +118,14 @@ test('contextHook: 別セッションの blocker を割り込み表示し、同�
   assert.match(out.hookSpecificOutput.additionalContext, /🚨 割り込み/);
   assert.match(out.hookSpecificOutput.additionalContext, /LINEログイン画像認証待ち/);
   assert.match(out.hookSpecificOutput.additionalContext, /https:\/\/example.com\/login/);
+  assert.match(out.hookSpecificOutput.additionalContext, /【表示ルール】/);
   // 同セッションには出さない
   assert.equal(contextHook({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-A', prompt: 'x' }, { home: h, now: () => Date.now(), env: {} }), null);
   // headless には出さない
   assert.equal(contextHook({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-B', prompt: 'x' }, { home: h, now: () => Date.now(), env: { CLAUDE_HEADLESS: '1' } }), null);
 });
 
-test('contextHook: 一度表示した blocker は60分以内に同じセッションへ再表示しない', t => {
+test('contextHook: 一度表示した blocker は同じセッションへ再表��しない（INTERRUPT_REPEAT_MS 廃止）', t => {
   const h = home(t);
   addItem(h, { session: 'sess-A', title: 't', ask: 'a' });
   const env = {};
@@ -99,8 +133,12 @@ test('contextHook: 一度表示した blocker は60分以内に同じセッシ�
   assert.ok(first);
   const second = contextHook({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-B', prompt: 'x' }, { home: h, now: () => 1000 + 60_000, env });
   assert.equal(second, null);
+  // 60分超えても再表示しない（新ポリシー: 同セッションの既出は再掲しない）
   const third = contextHook({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-B', prompt: 'x' }, { home: h, now: () => 1000 + 61 * 60_000, env });
-  assert.ok(third);
+  assert.equal(third, null);
+  // 別セッションなら再表示（24h超経過）
+  const fourth = contextHook({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-C', prompt: 'x' }, { home: h, now: () => 1000 + 25 * 3600_000, env });
+  assert.ok(fourth);
 });
 
 test('CLI: --add / --list / --resolve の入出力', async t => {
@@ -129,4 +167,18 @@ test('markShown は対象 id の shownSessions だけを更新する', t => {
   const items = listItems(h);
   assert.ok(items.find(i => i.id === a.id).shownSessions['sess-B']);
   assert.deepEqual(items.find(i => i.id === b.id).shownSessions, {});
+});
+
+test('context: known count across sessions and changed ask becomes fresh', t => {
+  const h = home(t), env = {}, now = () => Date.now();
+  addItem(h, { session: 'origin', title: 'blocked', ask: 'first ask' });
+  const input = { session_id: 'viewer', prompt: 'first' };
+  const first = contextHook(input, { home: h, now, env });
+  assert.ok(first);
+  const known = contextHook({ ...input, session_id: 'other' }, { home: h, now, env });
+  assert.match(known.hookSpecificOutput.additionalContext, /既出 1 件/);
+  assert.doesNotMatch(known.hookSpecificOutput.additionalContext, /first ask|応答の冒頭/);
+  const file = path.join(h, '.claude', 'urgent-blocker.json');
+  const state = JSON.parse(fs.readFileSync(file)); state.items[0].ask = 'changed ask'; fs.writeFileSync(file, JSON.stringify(state));
+  assert.match(contextHook({ ...input, prompt: 'second' }, { home: h, now, env }).hookSpecificOutput.additionalContext, /changed ask/);
 });
