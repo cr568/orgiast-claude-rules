@@ -1292,6 +1292,7 @@ Bashは1呼出1コマンド、専用ツール・allow済み経路を使う。
 - bypass 移行後も Bash 規約は維持する（allow 不一致で止まらなくなっても、連結・パイプは Codex hang と読みにくさの原因）。
 
 1. `cd X && cmd` の連結は禁止。絶対パスか `git -C <path>` / ツールの `--cwd` を使う。
+   PreToolUse の `bash-cd-chain-guard` が先頭の `cd` と後続コマンドの連結を止める。
 2. `2>&1 | tail` / `| head` などのパイプ後処理を付けない（allowルール不一致とCodex hangの原因）。
 3. 使い捨てスクリプトはheredocで流さず、scratchpadにファイルとして書き `node <file>` で実行する。
 4. `until … sleep` ポーリングは禁止。`run_in_background` か Monitorを使う。
@@ -1345,6 +1346,7 @@ Stop ゲートは差し戻し後の書き直しも検査する（素通り禁止
 - 配布対象を手書きの一覧で持たない。新しいフォルダを足したら配布カバレッジのテストが落ちる形にする。
 - 全PC反映の完了報告は **`node tools/fleet-status.mjs`（各PCの converge ビーコン）の実データ**で出す。ビーコンの無い PC は「未確認」と書く。自分の PC で動いたことを全PC反映の証拠にしない。
 - 定期タスク（Orgiast*）は `nightly-bootstrap.ps1 -Target tools\<script>` 経由でだけ登録する。worktree・一時ブランチ・別クローンのパスを焼き込まない（一時回避で固定したら回避終了時に register-*.ps1 で戻す）。直したはずの不具合の再発や安いAIの 402 は、まずタスクの実行元ツリーの鮮度（`git log -1` が origin/main より古いか）を疑う。型: 実行元ツリー固着型（`protocols/INCIDENT-TYPES.md`）。
+- `New-ScheduledTaskSettingsSet` には `-Priority 4` 以上を必ず付ける。`scheduled-task-priority.test.mjs` が検査する。
 
 **C. Claude Code 間のやり取り（fleet-mail）**
 - 送信前に宛先の最終受信時刻（`--sent-status` や fleet-status）を確認する。長く受信が無い宛先には、先に Discord へ同報する。
