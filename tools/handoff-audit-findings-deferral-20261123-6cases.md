@@ -40,4 +40,3 @@ PR #2610 の元実装は commit `09a2a4e3` (`fix(handoff-audit): 委譲待機と
 | `node --test tools/permanent-fix-deferral-scan.test.mjs tools/handoff-audit-rescan.test.mjs tools/handoff-audit-nightly.test.mjs tools/handoff-audit-gate.test.mjs` | 0 | 146/146 pass（最終状態） |
 | `node --test tools/permanent-fix-deferral-scan.test.mjs` | 0 | 67/67 pass（元発話再評価実装後） |
 | `git diff --check` | 0 | 問題なし |
-
