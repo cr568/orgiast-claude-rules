@@ -7,7 +7,8 @@ import { addItem, listItems, answerItem, markSeen, dropItem, selectContext, inge
 import { notifyKim } from './notify-kim.mjs';
 import { loadAllowlist, discordAllowed } from './lib/kim-discord-allowlist.mjs';
 import { backfill } from './kim-inbox-dedupe-backfill.mjs';
-import { archiveClosed, lookupAnswers, inboxDedupeKey, spoolItem, drainSpool } from './kim-inbox.mjs';
+import { archiveClosed, lookupAnswers, inboxDedupeKey, spoolItem, drainSpool, __test } from './kim-inbox.mjs';
+import { looksLikeApprovalRequest } from './lib/kim-inbox-kind.mjs';
 import { redactSecrets } from './webhook-health.mjs';
 import { formatInboxBrief } from './lib/kim-inbox-relay-state.mjs';
 // The hook intentionally skips sdk-cli sessions; these tests exercise interactive delivery.
@@ -1150,4 +1151,127 @@ test('computeSweepInfoSummary: 全件が対象のとき残る = 0', () => {
   assert.equal(summary.total, 2);
   assert.equal(summary.toSeen, 2, '両方とも配信済み古い');
   assert.equal(summary.remaining, 0, '全件 seen になるので残りは0');
+});
+
+// ============================================================
+// looksLikeApprovalRequest のテスト
+// ============================================================
+test('looksLikeApprovalRequest: 「承認」を含む文は true', () => {
+  assert.equal(looksLikeApprovalRequest('この変更を承認してください'), true);
+});
+
+test('looksLikeApprovalRequest: 「判断」を含む文は true', () => {
+  assert.equal(looksLikeApprovalRequest('判断してください'), true);
+});
+
+test('looksLikeApprovalRequest: 「どちら」を含む文は true', () => {
+  assert.equal(looksLikeApprovalRequest('どちらにするか決めてください'), true);
+});
+
+test('looksLikeApprovalRequest: 「YES」を含む文は true', () => {
+  assert.equal(looksLikeApprovalRequest('YES で進めますか？'), true);
+});
+
+test('looksLikeApprovalRequest: 「決めて」を含む文は true', () => {
+  assert.equal(looksLikeApprovalRequest('決めてください'), true);
+});
+
+test('looksLikeApprovalRequest: 通常の完了通知は false', () => {
+  assert.equal(looksLikeApprovalRequest('PR #123 のテストが通りました'), false);
+});
+
+test('looksLikeApprovalRequest: 単なる進捗報告は false', () => {
+  assert.equal(looksLikeApprovalRequest('進捗: 設定の更新が完了しました'), false);
+});
+
+test('looksLikeApprovalRequest: 空文字は false', () => {
+  assert.equal(looksLikeApprovalRequest(''), false);
+});
+
+test('looksLikeApprovalRequest: null は false', () => {
+  assert.equal(looksLikeApprovalRequest(null), false);
+});
+
+// ============================================================
+// --add の kind 自動昇格のテスト
+// ============================================================
+test('--add --kind info で承認要求の本文 → kind が ask に昇格し kindPromotedFrom が info', async t => {
+  const home = seat(t), output = [], errors = [];
+  const body = path.join(home, 'body.txt');
+  fs.writeFileSync(body, 'この対応を承認してください');
+  assert.equal(await main(['--add', '--kind', 'info', '--body-file', body], { home, stdout: v => output.push(JSON.parse(v)), stderr: v => errors.push(v) }), 0);
+  const item = listItems(home)[0];
+  assert.equal(item.kind, 'ask', 'kind が ask に昇格');
+  assert.equal(item.kindPromotedFrom, 'info', 'kindPromotedFrom が info');
+  assert.match(errors[0], /ask に昇格/);
+});
+
+test('--add info（位置引数）で承認要求の本文 → kind が ask に昇格', async t => {
+  const home = seat(t), output = [];
+  const infoBody = '判断してください: リリース可否';
+  const body = path.join(home, 'info-body.txt');
+  fs.writeFileSync(body, infoBody);
+  assert.equal(await main(['--add', 'info', '--body-file', body], { home, stdout: v => output.push(JSON.parse(v)) }), 0);
+  const item = listItems(home)[0];
+  assert.equal(item.kind, 'ask');
+  assert.equal(item.kindPromotedFrom, 'info');
+  assert.equal(item.text.includes('判断してください'), true);
+});
+
+test('--add info --force-kind で承認要求の本文 → kind が info のまま', async t => {
+  const home = seat(t), output = [], errors = [];
+  const body = path.join(home, 'force-body.txt');
+  fs.writeFileSync(body, '承認してください');
+  assert.equal(await main(['--add', '--kind', 'info', '--force-kind', '--body-file', body], { home, stdout: v => output.push(JSON.parse(v)), stderr: v => errors.push(v) }), 0);
+  const item = listItems(home)[0];
+  assert.equal(item.kind, 'info', 'force-kind で info のまま');
+  assert.equal(item.kindPromotedFrom, undefined, 'kindPromotedFrom は無し');
+  assert.equal(errors.length, 0, '昇格警告は出ない');
+});
+
+test('--add --kind ask で承認要求の本文 → kind は ask のまま、kindPromotedFrom は無し', async t => {
+  const home = seat(t), output = [];
+  const body = path.join(home, 'ask-body.txt');
+  fs.writeFileSync(body, '承認してください');
+  assert.equal(await main(['--add', '--kind', 'ask', '--body-file', body], { home, stdout: v => output.push(JSON.parse(v)) }), 0);
+  const item = listItems(home)[0];
+  assert.equal(item.kind, 'ask');
+  assert.equal(item.kindPromotedFrom, undefined, '最初から ask なので kindPromotedFrom 無し');
+});
+
+test('--add --kind info で通常の完了本文 → kind は info のまま、昇格しない', async t => {
+  const home = seat(t), output = [];
+  const body = path.join(home, 'info-body.txt');
+  fs.writeFileSync(body, '自動チェックが完了しました: 全テスト passed');
+  assert.equal(await main(['--add', '--kind', 'info', '--body-file', body], { home, stdout: v => output.push(JSON.parse(v)) }), 0);
+  const item = listItems(home)[0];
+  assert.equal(item.kind, 'info', '通常の完了通知は info のまま');
+  assert.equal(item.kindPromotedFrom, undefined);
+});
+
+// ============================================================
+// sweepInfoCandidates の判定が切り出し前後で同じことを確認（回帰テスト）
+// ============================================================
+test('looksLikeApprovalRequest と sweepInfoCandidates の承認キーワード判定が一致する', () => {
+  const cases = [
+    { text: '承認してください', expectSweepExclude: true },
+    { text: '判断してください', expectSweepExclude: true },
+    { text: 'どちらかに決定', expectSweepExclude: true },
+    { text: 'YES で OK', expectSweepExclude: true },
+    { text: '決めてください', expectSweepExclude: true },
+    { text: '完了しました', expectSweepExclude: false },
+    { text: 'PR #123 の結果', expectSweepExclude: false },
+    { text: '設定の更新', expectSweepExclude: false },
+  ];
+  for (const { text, expectSweepExclude } of cases) {
+    const item = makeItem({ id: `tc-${text.slice(0, 4)}`, kind: 'info', text, deliveredToKim: true });
+    const { targetIds } = sweepInfoCandidates([item]);
+    if (expectSweepExclude) {
+      assert.equal(targetIds.has(item.id), false, `sweepInfoCandidates: "${text}" は対象外になるべき`);
+      assert.equal(looksLikeApprovalRequest(text), true, `looksLikeApprovalRequest("${text}") は true`);
+    } else {
+      assert.equal(targetIds.has(item.id), true, `sweepInfoCandidates: "${text}" は対象になるべき`);
+      assert.equal(looksLikeApprovalRequest(text), false, `looksLikeApprovalRequest("${text}") は false`);
+    }
+  }
 });
