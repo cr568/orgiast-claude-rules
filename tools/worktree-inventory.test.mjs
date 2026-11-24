@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { classifyWorktree, inspectWorktree, resolveWorktreePaths } from './worktree-inventory.mjs';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const now = Date.parse('2026-11-21T12:00:00Z');
+const normalizePath = (value) => value.replaceAll('\\', '/').toLowerCase();
 const base = {
   path: '/tmp/worktree',
   branch: 'feat/example',
@@ -54,8 +56,8 @@ for (const [name, overrides, expected] of fixtures) {
 }
 
 test('相対 gitdir と逆参照を確認できる作業ツリーを keep-repair にする', (t) => {
-  const temp = mkdtempSync(path.join(tmpdir(), 'wt-inventory-'));
-  t.after(() => rmSync(temp, { recursive: true, force: true }));
+  const tempRoot = realpathSync.native(path.resolve(tmpdir()));
+  const temp = mkdtempSync(path.join(tempRoot, 'wt-inventory-'));
   const root = realpathSync.native(temp);
   const downloads = path.join(root, 'Downloads');
   const repo = path.join(downloads, 'repo');
@@ -63,6 +65,14 @@ test('相対 gitdir と逆参照を確認できる作業ツリーを keep-repair
   const worktree = path.join(downloads, 'linked');
   const displayPath = path.join(root, 'linked');
   const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+  t.after(() => {
+    if (path.isAbsolute(worktree)) {
+      spawnSync('git', ['-C', repo, 'worktree', 'remove', '--force', worktree], { encoding: 'utf8' });
+    }
+    rmSync(temp, { recursive: true, force: true });
+  });
+  assert.equal(path.isAbsolute(root), true);
+  assert.equal(path.relative(tempRoot, root).startsWith(`..${path.sep}`), false);
   mkdirSync(repo, { recursive: true });
   git('init', '-q');
   git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
@@ -89,8 +99,8 @@ test('相対 gitdir と逆参照を確認できる作業ツリーを keep-repair
   for (const prunable of [false, true]) {
     const row = inspect({ ...listed, prunable });
     assert.equal(row.category, 'keep-repair');
-    assert.equal(row.path, displayPath);
-    assert.equal(row.resolvedPath, worktree);
+    assert.equal(normalizePath(row.path), normalizePath(displayPath));
+    assert.equal(normalizePath(row.resolvedPath), normalizePath(worktree));
   }
 
   const [healthy] = resolveWorktreePaths(repoAlias, commonDir, [{ path: worktree }]);
@@ -101,4 +111,27 @@ test('相対 gitdir と逆参照を確認できる作業ツリーを keep-repair
   assert.equal(inspect(listed).category, 'keep-repair');
   rmSync(dotGit);
   assert.equal(inspect(listed).category, 'prune');
+});
+
+test('git リポジトリでない対象をスキップして他の対象を棚卸しする', (t) => {
+  const temp = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'wt-inventory-repos-')));
+  t.after(() => rmSync(temp, { recursive: true, force: true }));
+  const invalid = path.join(temp, 'deployed-copy');
+  const repo = path.join(temp, 'repo');
+  mkdirSync(path.join(invalid, '.git'), { recursive: true });
+  mkdirSync(repo);
+  execFileSync('git', ['-C', repo, 'init', '-q']);
+  execFileSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+    '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Initial', '--allow-empty']);
+
+  const result = spawnSync(process.execPath, [
+    fileURLToPath(new URL('./worktree-inventory.mjs', import.meta.url)),
+    '--repo', invalid,
+    '--repo', repo,
+  ], { encoding: 'utf8' });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr.trim(), `skipped: ${invalid} (not a git repository)`);
+  assert.match(result.stdout, /keep-main: 1/);
+  assert.equal(normalizePath(result.stdout).includes(normalizePath(repo)), true);
 });
